@@ -56,7 +56,7 @@ class SpecLoop {
  private:
   // The accept graph (width_select -> switch { accept + rollback + publish }) for this sampling setup.
   void prepare_accept(const Sampling& sampling);
-  void generate_tp(std::int32_t token, int max_new_tokens, const Sampling& sampling, kernels::head::SamplerRng& rng,
+  void generate_host_verified(std::int32_t token, int max_new_tokens, const Sampling& sampling, kernels::head::SamplerRng& rng,
                    std::span<const std::int32_t> stop_ids,
                    const std::function<bool(std::span<const std::int32_t>)>& on_tokens,
                    GenerateStats& stats, std::vector<std::int32_t>& tokens_in_state);
@@ -65,7 +65,9 @@ class SpecLoop {
   Drafter* drafter_;
   DFlash2* dflash2_;
   DFlash2Head* dflash2_head_;
-  DeviceBuffer proposal_, tp_accept_;
+  bool host_verify_;
+  DeviceBuffer proposal_, host_accept_;
+  DeviceBuffer target_tokens_;
   PinnedHostBuffer proposal_host_{sizeof(VerifyProposal)};
   Drafter::Draft draft_{};             // the drafter's fixed output buffers
   DeviceBuffer width_;                 // int32: the verify width chosen on the device

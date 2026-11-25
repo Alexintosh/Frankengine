@@ -78,9 +78,9 @@ class EngineGenerator final : public Generator {
       throw std::invalid_argument("dflash2_max_ctx must be positive");
     if (!(options.hybrid_dflash2_threshold >= 0.f && options.hybrid_dflash2_threshold <= 1.f))
       throw std::invalid_argument("dflash2-threshold must be in [0, 1]");
-    if (use_dflash2 && (!options.spec || !rt_.tp()))
-      throw std::invalid_argument("DFlash2 requires speculative TP=2");
-    if (use_dflash2 && options.head_nvfp4 && !dflash2_full_head())
+    if (use_dflash2 && !options.spec)
+      throw std::invalid_argument("DFlash2 requires speculative decoding");
+    if (use_dflash2 && options.head_nvfp4 && rt_.tp() && !dflash2_full_head())
       dflash2_head_ = std::make_unique<DFlash2Head>(*rt_.tp(), rt_.weights().unembed_nvfp4, rt_.stream());
     if (use_dflash2 && options.tp.rank == 0) {
       auto dir = options.dflash2_dir;
@@ -92,6 +92,8 @@ class EngineGenerator final : public Generator {
       const auto* embed_norm = ptr<const float>(rt_.weights().embed_norm);
       if (dflash2_head_) {
         dflash2_->bind_sharded_head(*dflash2_head_, embed, embed_norm);
+      } else if (!rt_.tp() && options.head_nvfp4) {
+        dflash2_->bind_head(rt_.weights().unembed_nvfp4, embed, embed_norm);
       } else {
         const auto head = load_head(options.model_dir, false, true, rt_.stream(), dflash2_head_storage_);
         dflash2_->bind_head(head.nvfp4, embed, embed_norm);

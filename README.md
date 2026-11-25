@@ -36,24 +36,33 @@ Each DGX Spark (`GB10`) has **128 GB LPDDR5X unified memory** with **`231.38 GB/
 - **Strict-lossless verified:** `52,815,312`-byte FP32 target logit dump is **SHA-256 byte-identical** to baseline; all 28 target GEMV kernels and decode RoCE collectives match stock SASS byte-for-byte.
 - **Physical DRAM saturation on GB10:** `NVFP4 MoE W13` ~96%, `FP8 Full Attn (32K–128K)` 94–101%, `FP8 Wproj` 90–91%, `NVFP4 LM Head` ~90%.
 
+### Single-GPU `TP=1` Benchmarks (`1× NVIDIA DGX Spark`, `256K` Context, Zero-Copy NVFP4 Head)
+| Workload (`1× GB10`) | `TP=1` DSpark Control | **`TP=1` Frankengine (`hybrid`)** | vs. Control / SOTA |
+|---|---:|---:|---|
+| **Live Short Code (greedy, `DFlash 2`)** | `123.8 tok/s` (`397 ms` TTFT) | **`155.35 tok/s`** (`207 ms` TTFT) | **`+25.5%`** vs DSpark · **`+33.3%`** over TensorFold (`116.5 tok/s`) |
+| **CLI Built-in Chat / Code** (6-run median) | `79.1 / 84.2 tok/s` | **`86.8 / 95.5 tok/s`** | **`+9.7% / +13.4%`** |
+| **CLI `2K / 32K / 128K` Decode** | `105.3 / 94.6 / 64.4 tok/s` | **`104.8 / 94.7 / 64.8 tok/s`** | Exact parity (`768/768`, `512/512`) |
+| **CLI `2K / 32K / 128K` Cold Prefill** | `2,904 / 2,747 / 2,318 tok/s` | **`2,889 / 2,770 / 2,329 tok/s`** | Zero RoCE overhead |
+| **Live `65.5K / 121.6K` Needles @ `256K`** | — | **100% Exact Passkey** (`25.1 / 51.5 s` TTFT) | **`26.1 GiB`** (`26,733 MiB`) peak NVML (`0 MB` extra head) |
+
 ---
 
 ## Repository Layout
 
 ```text
 Frankengine/
-├── engine/         # C++/CUDA Blackwell engine (ingine-tp: TP=2 + TP=1, NVFP4/FP8/MXFP8, DSpark + DFlash 2)
+├── engine/         # C++/CUDA Blackwell engine (TP=2 + TP=1, NVFP4/FP8/MXFP8, DSpark + DFlash 2)
 ├── tp_comm/        # Custom dual-rail RoCE UMA RDMA backend (48-CTA bulk FP32 AllReduce + 32-CTA 6.3x gather)
-├── scripts/        # Generic TP=2 CLI & server launchers (config.sh, local.sh.example, run_tp2.sh, serve_tp2.sh, llmstat)
+├── scripts/        # Generic TP=1 & TP=2 launchers (config.sh, local.sh.example, serve_tp1.sh, serve_tp2.sh, run_tp2.sh, llmstat)
 ├── docs/           # Engineering roadmap, TP=2 architecture, B200/GB200 Megakernel scaling audit, infographic
-├── reports/        # Full interleaved qualification & ablation reports
+├── reports/        # Full interleaved qualification & ablation reports (TP=2 + TP=1)
 ├── LICENSE         # Apache-2.0
 └── NOTICE          # Full upstream and third-party copyright & license attributions
 ```
 
 ---
 
-## Quickstart (`2× DGX Spark`, `sm_121a`)
+## Quickstart (`DGX Spark` `sm_121a` · `TP=1` or `TP=2`)
 
 ### 1. Build Engine & `tp_comm`
 ```bash
@@ -69,14 +78,18 @@ cmake --build engine/native/build-gb10-tp -j 12 \
   --target ingine-serve ingine-bench ingine-validate
 ```
 
-### 2. Configure Your Cluster Nodes (Gitignored Local Override)
+### 2. Configure Your Node Paths (Gitignored Local Override)
 ```bash
 cp scripts/local.sh.example scripts/local.sh
-# Edit scripts/local.sh with your worker SSH alias, model paths, and RoCE rendezvous IP
+# Edit scripts/local.sh with your model paths (and worker SSH alias / RoCE IP for TP=2)
 ```
 
 ### 3. Serve Live (`256K` Context + Hybrid `DFlash 2` / `DSpark`)
 ```bash
+# Single-GPU (TP=1):
+./scripts/serve_tp1.sh
+
+# Dual-Node Tensor Parallel (TP=2):
 ./scripts/serve_tp2.sh
 ```
 Measure live TTFT, prefill, and decode throughput from any `curl` command using the bundled [`scripts/llmstat`](scripts/llmstat):
@@ -97,10 +110,11 @@ curl -sSN http://127.0.0.1:8834/v1/chat/completions \
 ---
 
 ## Key Documentation
-- [**`docs/OPTIMIZATION_ROADMAP.md`**](docs/OPTIMIZATION_ROADMAP.md) — Living experiment ledger (`EXP-001`–`EXP-023`), byte-level roofline audits, dead-end registry, and optimization roadmap.
+- [**`docs/OPTIMIZATION_ROADMAP.md`**](docs/OPTIMIZATION_ROADMAP.md) — Living experiment ledger (`EXP-001`–`EXP-024`), byte-level roofline audits, dead-end registry, and optimization roadmap.
 - [**`docs/hardware_scaling_and_megakernel_audit.md`**](docs/hardware_scaling_and_megakernel_audit.md) — Calibrated hardware scaling projections (`RTX 5090/PRO 6000` → `1×/8× B200` → `GB200 NVL72` → `Vera Rubin`) and microsecond-by-microsecond Megakernel engineering verdict.
 - [**`docs/tp2_architecture.md`**](docs/tp2_architecture.md) — Tensor-parallel sharding and RoCE collective design.
-- [**`reports/phase_c_tp2_unified_qualification.md`**](reports/phase_c_tp2_unified_qualification.md) — Final interleaved CLI, live SSE, SASS parity, and 65K/122K needle qualification report.
+- [**`reports/phase_c_tp2_unified_qualification.md`**](reports/phase_c_tp2_unified_qualification.md) — Final Dual-Spark `TP=2` CLI, live SSE, SASS parity, and 65K/122K needle qualification report.
+- [**`reports/track1_tp1_frankengine.md`**](reports/track1_tp1_frankengine.md) — Single-Spark `TP=1` Frankengine qualification report (`155.35 tok/s` live short code, `256K` live needles).
 
 ---
 

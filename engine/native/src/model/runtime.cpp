@@ -23,9 +23,9 @@ TpLayout runtime_layout(const RuntimeOptions& options) {
     throw std::invalid_argument("TP=2 speculation requires the distributed greedy head");
   if (options.spec_verify_width) {
     const auto widths = verify_width_grid(options.spec_widths);
-    if (options.tp.size != 2 || !options.spec || options.spec_widths == SpecWidths::Coarse ||
+    if ((options.tp.size != 2 && options.draft_type != "dflash2") || !options.spec || options.spec_widths == SpecWidths::Coarse ||
         std::find(widths.begin(), widths.end(), options.spec_verify_width) == widths.end())
-      throw std::invalid_argument("fixed verify width must belong to the selected TP=2 speculation width grid");
+      throw std::invalid_argument("fixed verify width must belong to the selected speculation width grid");
   }
   if (options.tp.size == 2 && (options.prefill_chunk < 1 || options.prefill_chunk > 3072))
     throw std::invalid_argument("TP=2 prefill chunk must be in 1..3072");

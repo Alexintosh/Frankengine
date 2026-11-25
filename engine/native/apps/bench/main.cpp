@@ -182,7 +182,7 @@ int main(int argc, char** argv) {
   ap.flag("--draft-nvfp4", "Use packed NVFP4 for the DSpark MLPs", &draft_nvfp4);
   ap.option("--spec-threshold", "", "verify the leading drafts whose draft probability exceeds this (0 = always all 7)",
             &spec_threshold);
-  ap.option("--spec-verify-width", "", "force a width from the selected grid in TP=2 teacher replay", &spec_verify_width);
+  ap.option("--spec-verify-width", "", "Force a width from the selected grid for DFlash2 or TP=2 teacher replay", &spec_verify_width);
   ap.option("--temperature", "", "", &temperature);
   ap.option("--long-prompt", "", "also time prefill of a synthetic prompt of N tokens", &long_prompt);
   ap.option("--forced", "", "teacher-forced replay of the outputs in FILE (JSON lines {name, prompt, output})",
