@@ -297,8 +297,8 @@ def make_code_haystack(target_tokens: int, *, needle: str | None = None, depth_f
     """Deterministic realistic Python codebase haystack (~target_tokens tokens).
     Avoids trivial repetition so speculative acceptance and attention stay realistic.
     """
-    # Each generated module block is ~115 tokens.
-    n_blocks = max(4, int(target_tokens / 115))
+    # Calibrated on Inkling-2-Mini tokenizer: each generated module block is ~152 tokens.
+    n_blocks = max(4, int(target_tokens / 152))
     needle_idx = max(1, min(n_blocks - 1, int(n_blocks * depth_frac))) if needle else -1
     subsystems = [
         "scheduler", "allocator", "router", "tokenizer", "dispatcher",
@@ -507,14 +507,22 @@ def main():
             continue
         haystack = make_code_haystack(target_ctx)
         # Step A: Cold prefill (16 tokens, thinking=off -> clean TTFT & prefill tok/s, populates prefix cache)
-        q_cold = haystack + "\n\nRespond with exactly one word: ACK"
-        cold = track(stream_chat(args.url, model, [{"role": "user", "content": q_cold}], temperature=0.0, max_tokens=16, enable_thinking=False, api_key=args.api_key))
-        # Step B: Warm greedy decode at this context (256 tokens)
-        q_warm_g = haystack + "\n\nWrite a concise Python helper function that validates endpoint watermarks across these workers."
-        warm_g = track(stream_chat(args.url, model, [{"role": "user", "content": q_warm_g}], temperature=0.0, max_tokens=256, enable_thinking=False, api_key=args.api_key))
-        # Step C: Warm sampled decode (temp=0.7) at this context (256 tokens)
-        q_warm_s = haystack + "\n\nWrite a concise Python health-check loop that retries failed worker dispatches."
-        warm_s = track(stream_chat(args.url, model, [{"role": "user", "content": q_warm_s}], temperature=0.7, top_p=0.9, max_tokens=256, enable_thinking=False, seed=42, api_key=args.api_key))
+        turn1_user = {"role": "user", "content": haystack + "\n\nRespond with exactly one word: ACK"}
+        cold = track(stream_chat(args.url, model, [turn1_user], temperature=0.0, max_tokens=16, enable_thinking=False, api_key=args.api_key))
+        turn1_asst = {"role": "assistant", "content": cold.get("content") or "ACK"}
+        # Step B: Warm greedy decode at this context (256 tokens, reuses turn 1 prefix cache!)
+        warm_g_msgs = [
+            turn1_user,
+            turn1_asst,
+            {"role": "user", "content": "Write a concise Python helper function that validates endpoint watermarks across these workers."},
+        ]
+        warm_g = track(stream_chat(args.url, model, warm_g_msgs, temperature=0.0, max_tokens=256, enable_thinking=False, api_key=args.api_key))
+        # Step C: Warm sampled decode (temp=0.7) at this context (256 tokens, Turn 3 extends Turn 2 prefix cache!)
+        warm_s_msgs = warm_g_msgs + [
+            {"role": "assistant", "content": warm_g.get("content") or "OK"},
+            {"role": "user", "content": "Now write a concise Python health-check loop that retries failed worker dispatches."},
+        ]
+        warm_s = track(stream_chat(args.url, model, warm_s_msgs, temperature=0.7, top_p=0.9, max_tokens=256, enable_thinking=False, seed=42, api_key=args.api_key))
 
         entry = {
             "target_ctx": target_ctx,
