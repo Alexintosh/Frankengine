@@ -507,20 +507,20 @@ def main():
             continue
         haystack = make_code_haystack(target_ctx)
         # Step A: Cold prefill (16 tokens, thinking=off -> clean TTFT & prefill tok/s, populates prefix cache)
-        turn1_user = {"role": "user", "content": haystack + "\n\nRespond with exactly one word: ACK"}
+        turn1_user = {"role": "user", "content": haystack + "\n\nConfirm you have read the repository snapshot in one short sentence."}
         cold = track(stream_chat(args.url, model, [turn1_user], temperature=0.0, max_tokens=16, enable_thinking=False, api_key=args.api_key))
-        turn1_asst = {"role": "assistant", "content": cold.get("content") or "ACK"}
+        turn1_asst = {"role": "assistant", "content": cold.get("content") or "I have read the repository snapshot."}
         # Step B: Warm greedy decode at this context (256 tokens, reuses turn 1 prefix cache!)
         warm_g_msgs = [
             turn1_user,
             turn1_asst,
-            {"role": "user", "content": "Write a concise Python helper function that validates endpoint watermarks across these workers."},
+            {"role": "user", "content": "Write a complete, production-ready Python module (at least 45 lines) implementing a ClusterPoolManager class that tracks worker capacities, validates watermarks, and routes batches across these workers."},
         ]
         warm_g = track(stream_chat(args.url, model, warm_g_msgs, temperature=0.0, max_tokens=256, enable_thinking=False, api_key=args.api_key))
         # Step C: Warm sampled decode (temp=0.7) at this context (256 tokens, Turn 3 extends Turn 2 prefix cache!)
         warm_s_msgs = warm_g_msgs + [
-            {"role": "assistant", "content": warm_g.get("content") or "OK"},
-            {"role": "user", "content": "Now write a concise Python health-check loop that retries failed worker dispatches."},
+            {"role": "assistant", "content": warm_g.get("content") or "class ClusterPoolManager:\n    pass"},
+            {"role": "user", "content": "Now write a complete 45-line Python async health-check and retry controller class with exponential backoff and circuit breaker metrics for failed worker dispatches."},
         ]
         warm_s = track(stream_chat(args.url, model, warm_s_msgs, temperature=0.7, top_p=0.9, max_tokens=256, enable_thinking=False, seed=42, api_key=args.api_key))
 
