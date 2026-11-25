@@ -1,0 +1,29 @@
+# Copy to scripts/local.sh (gitignored) to configure your cluster nodes and model paths.
+
+# SSH hostname or IP of rank-1 worker node
+# WORKER=worker-node
+
+# Local bind address and port for OpenAI-compatible HTTP server
+# HOST=127.0.0.1
+# PORT=8834
+# SERVED_NAME=inkling-2-mini
+
+# Context window and prefix-cache park budget
+# MAX_CTX=262144
+# PARK_MB=2048
+
+# Speculative decoding mode: hybrid (DFlash2 short greedy + DSpark long/sampled), dspark, or dflash2
+# DRAFT_TYPE=hybrid
+# DFLASH2_DIR="$REPO_ROOT/models/Inkling-2-Mini-DFlash2"
+# DFLASH2_MAX_CTX=1536
+# DFLASH2_THRESHOLD=0.50
+
+# Model paths on rank 0 (head) and rank 1 (worker)
+# HEAD_MODEL_DIR="/path/to/Inkling-2-Mini"
+# WORKER_MODEL_DIR="/path/to/Inkling-2-Mini"
+
+# Direct RoCE rendezvous address & port between rank 0 and rank 1
+# ROCE_RAILS=2
+# COMM_RENDEZVOUS_IP="10.42.101.1"
+# COMM_PORT=29620
+# PROXY_CPU=14

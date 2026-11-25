@@ -1,0 +1,203 @@
+#!/usr/bin/env python3
+"""Measure TTFT, prefill tok/s, decode tok/s, and e2e tok/s from piped OpenAI-compatible responses.
+
+Usage:
+  curl -sSN https://.../v1/chat/completions -H 'Content-Type: application/json' \
+    -d '{"model":"...","stream":true,"stream_options":{"include_usage":true},...}' | llmstat
+
+Flags:
+  -t, --text   Stream response text to stdout live; print stats to stderr
+  -j, --json   Emit stats as JSON
+  -q, --quiet  Single-line compact summary
+"""
+import argparse
+import json
+import sys
+import time
+
+
+def parse_args():
+    p = argparse.ArgumentParser(
+        prog="llmstat",
+        description="Pipe OpenAI-compatible SSE or JSON completions to measure TTFT, prefill, and decode tok/s.",
+    )
+    p.add_argument("-t", "--text", action="store_true", help="Stream generated text to stdout (stats go to stderr)")
+    p.add_argument("-j", "--json", action="store_true", help="Print stats as JSON")
+    p.add_argument("-q", "--quiet", action="store_true", help="Print a compact single-line summary")
+    return p.parse_args()
+
+
+def main():
+    args = parse_args()
+    t0 = time.monotonic()
+    t_first = None
+    is_sse = False
+    raw_lines = []
+    usage = {}
+    model = None
+    finish_reason = None
+    chunk_tokens = 0
+    saw_reasoning = False
+    saw_content = False
+
+    for line in sys.stdin:
+        if line.startswith("data: "):
+            is_sse = True
+            payload = line[6:].strip()
+            if not payload or payload == "[DONE]":
+                if payload == "[DONE]":
+                    break
+                continue
+            try:
+                obj = json.loads(payload)
+            except json.JSONDecodeError:
+                continue
+            if "error" in obj:
+                print(f"llmstat: API error: {obj['error']}", file=sys.stderr)
+                sys.exit(1)
+            if not model and obj.get("model"):
+                model = obj["model"]
+            if obj.get("usage"):
+                usage = obj["usage"]
+            for choice in obj.get("choices") or ():
+                if choice.get("finish_reason"):
+                    finish_reason = choice["finish_reason"]
+                delta = choice.get("delta") or {}
+                r_txt = delta.get("reasoning_content")
+                c_txt = delta.get("content")
+                if r_txt:
+                    if t_first is None:
+                        t_first = time.monotonic()
+                    chunk_tokens += 1
+                    if args.text:
+                        if not saw_reasoning:
+                            sys.stdout.write("[thinking]\n")
+                            saw_reasoning = True
+                        sys.stdout.write(r_txt)
+                        sys.stdout.flush()
+                if c_txt:
+                    if t_first is None:
+                        t_first = time.monotonic()
+                    chunk_tokens += 1
+                    if args.text:
+                        if saw_reasoning and not saw_content:
+                            sys.stdout.write("\n[/thinking]\n")
+                        saw_content = True
+                        sys.stdout.write(c_txt)
+                        sys.stdout.flush()
+        else:
+            raw_lines.append(line)
+
+    t_end = time.monotonic()
+    total_s = max(1e-6, t_end - t0)
+
+    if not is_sse:
+        body = "".join(raw_lines).strip()
+        if not body:
+            print("llmstat: empty stdin", file=sys.stderr)
+            sys.exit(1)
+        try:
+            obj = json.loads(body)
+        except json.JSONDecodeError as exc:
+            print(f"llmstat: invalid JSON on stdin ({exc}): {body[:200]}", file=sys.stderr)
+            sys.exit(1)
+        if "error" in obj:
+            print(f"llmstat: API error: {obj['error']}", file=sys.stderr)
+            sys.exit(1)
+        model = obj.get("model")
+        usage = obj.get("usage") or {}
+        choices = obj.get("choices") or []
+        if choices:
+            finish_reason = choices[0].get("finish_reason")
+            msg = choices[0].get("message") or {}
+            if args.text:
+                if msg.get("reasoning_content"):
+                    sys.stdout.write(f"[thinking]\n{msg['reasoning_content']}\n[/thinking]\n")
+                if msg.get("content"):
+                    sys.stdout.write(msg["content"])
+                sys.stdout.write("\n")
+                sys.stdout.flush()
+    elif args.text:
+        sys.stdout.write("\n")
+        sys.stdout.flush()
+
+    prompt_tok = int(usage.get("prompt_tokens") or 0)
+    comp_tok = int(usage.get("completion_tokens") or 0)
+    cached_tok = int((usage.get("prompt_tokens_details") or {}).get("cached_tokens") or 0)
+    estimated_comp = False
+    if comp_tok == 0 and chunk_tokens > 0:
+        comp_tok = chunk_tokens
+        estimated_comp = True
+
+    uncached_tok = max(0, prompt_tok - cached_tok)
+    e2e_tps = comp_tok / total_s if comp_tok else 0.0
+
+    if is_sse and t_first is not None:
+        ttft_s = max(1e-6, t_first - t0)
+        decode_s = max(1e-6, t_end - t_first)
+        decode_tps = (max(comp_tok - 1, 0) / decode_s) if comp_tok > 1 else (comp_tok / decode_s)
+        prefill_tps = (uncached_tok / ttft_s) if uncached_tok > 0 else None
+    else:
+        ttft_s = None
+        decode_s = None
+        decode_tps = None
+        prefill_tps = None
+
+    stats = {
+        "model": model,
+        "stream": is_sse,
+        "prompt_tokens": prompt_tok,
+        "cached_tokens": cached_tok,
+        "completion_tokens": comp_tok,
+        "completion_estimated": estimated_comp,
+        "finish_reason": finish_reason,
+        "ttft_s": round(ttft_s, 4) if ttft_s is not None else None,
+        "decode_s": round(decode_s, 4) if decode_s is not None else None,
+        "total_s": round(total_s, 4),
+        "prefill_tok_s": round(prefill_tps, 1) if prefill_tps is not None else None,
+        "decode_tok_s": round(decode_tps, 1) if decode_tps is not None else None,
+        "e2e_tok_s": round(e2e_tps, 1),
+    }
+
+    out = sys.stderr if args.text else sys.stdout
+    if args.json:
+        print(json.dumps(stats), file=out)
+        return
+
+    comp_label = f"{comp_tok}~" if estimated_comp else f"{comp_tok}"
+    if is_sse and ttft_s is not None:
+        pf_str = f"{prefill_tps:.1f} tok/s" if prefill_tps is not None else "cached"
+        if args.quiet:
+            print(
+                f"ttft={ttft_s:.3f}s prefill={pf_str} decode={decode_tps:.1f} tok/s "
+                f"e2e={e2e_tps:.1f} tok/s total={total_s:.3f}s prompt={prompt_tok} cached={cached_tok} comp={comp_label}",
+                file=out,
+            )
+        else:
+            header = f"{model} · " if model else ""
+            fin = f" · finish={finish_reason}" if finish_reason else ""
+            print(f"{header}prompt={prompt_tok} (cached={cached_tok}) · completion={comp_label}{fin}", file=out)
+            print(
+                f"TTFT={ttft_s:.3f}s · prefill={pf_str} · decode={decode_tps:.1f} tok/s · "
+                f"e2e={e2e_tps:.1f} tok/s · total={total_s:.3f}s",
+                file=out,
+            )
+    else:
+        if args.quiet:
+            print(
+                f"e2e={e2e_tps:.1f} tok/s total={total_s:.3f}s prompt={prompt_tok} cached={cached_tok} comp={comp_label} (non-stream)",
+                file=out,
+            )
+        else:
+            header = f"{model} · " if model else ""
+            fin = f" · finish={finish_reason}" if finish_reason else ""
+            print(f"{header}prompt={prompt_tok} (cached={cached_tok}) · completion={comp_label}{fin}", file=out)
+            print(
+                f"e2e={e2e_tps:.1f} tok/s · total={total_s:.3f}s "
+                "(add -N and \"stream\":true,\"stream_options\":{\"include_usage\":true} for TTFT/prefill/decode)",
+                file=out,
+            )
+
+
+if __name__ == "__main__":
+    main()
