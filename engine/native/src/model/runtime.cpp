@@ -99,9 +99,10 @@ Runtime::Runtime(const RuntimeOptions& options, Weights weights, Ablation ablati
 
 void Runtime::init() {
   const RuntimeOptions& options = options_;
-  if (options.max_batch < 1 || options.max_batch > kMaxWidth)
-    throw std::invalid_argument("max_batch must be in 1..8");
-  if (options.max_batch > 1 && options.tp.size > 1 && (!options.tp.serve || options.tp.profile))
+  const int batch_cap = options.batch_spec > 0 ? 128 : kMaxWidth;
+  if (options.max_batch < 1 || options.max_batch > batch_cap)
+    throw std::invalid_argument(options.batch_spec > 0 ? "max_batch must be in 1..128" : "max_batch must be in 1..8");
+  if (options.batch_spec == 0 && options.max_batch > 1 && options.tp.size > 1 && (!options.tp.serve || options.tp.profile))
     throw std::invalid_argument("TP batch graphs require unprofiled serving mode");
   const auto layout = runtime_layout(options);
   state_ = make_state(options.max_ctx, options.kv_fp8, layout);
@@ -154,7 +155,7 @@ void Runtime::init() {
     graphs_.swap(sampled_graphs_);
     tp_->full_logits = false;
   }
-  if (options.max_batch > 1) init_batch(layout);
+  if (options.max_batch > 1 && options.batch_spec == 0) init_batch(layout);
   CUDA_CHECK(cudaStreamSynchronize(stream_));
 }
 

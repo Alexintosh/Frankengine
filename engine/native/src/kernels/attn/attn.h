@@ -13,7 +13,8 @@
 namespace ingine::kernels::attn {
 
 struct DecodeArgs {
-  const float* proj = nullptr;  // fp32 [M, R]: R = (full ? 8664 : 8600) * hkv / 8, SEG order
+  const float* proj = nullptr;
+  const __nv_bfloat16* proj16 = nullptr;  // fp32 [M, R]: R = (full ? 8664 : 8600) * hkv / 8, SEG order
   int M = 1;                    // 1..8
   const float* q_scale = nullptr;   // fp32 [3*hkv, 128]
   const float* r_scale = nullptr;   // fp32 [3*hkv, 16]
@@ -22,6 +23,7 @@ struct DecodeArgs {
   const float* v_conv = nullptr;
   float* conv_k_state = nullptr;    // fp32 [3, hkv*128]
   float* conv_v_state = nullptr;
+  bool conv_write = true;
   void* k_cache = nullptr;          // [rows, hkv, 128] bf16, or float8_e4m3fn (full layers only)
   void* v_cache = nullptr;
   bool cache_fp8 = false;
@@ -34,12 +36,17 @@ struct DecodeArgs {
   std::size_t workspace_size = 0;
   __nv_bfloat16* out = nullptr;     // bf16 [M, 3 * hkv * 128]
   int hkv = 8;                      // local KV heads (8 or 4)
+  int batch = 1;
+  const std::int32_t* slots = nullptr;
+  std::int64_t cache_stride = 0, kpos_stride = 0, conv_stride = 0;
+  const std::int32_t* rows = nullptr;
 };
 
 // Bytes of workspace attn_decode needs for up to max_m tokens: a counter (zero the workspace once; the
 // kernel resets the counter itself) and the split partials. One workspace serves every layer of a
 // stream-ordered decode step.
 std::size_t workspace_bytes(int max_m, int hkv = 8);
+std::size_t workspace_bytes_batched(int max_m, int max_batch, int hkv = 8);
 
 // How many clusters of the selected size fit on the GPU at once for the full-head kernel.
 int max_active_clusters(int M, int window);

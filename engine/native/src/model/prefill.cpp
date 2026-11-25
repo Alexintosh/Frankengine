@@ -289,7 +289,7 @@ void Prefiller::run(State& st, const std::int32_t* tokens, int T, int pos0, floa
       auto* v_ring = static_cast<__nv_bfloat16*>(st.v_ring_at(ri).data);
       std::int64_t* ring_pos = st.ring_pos_at(ri);
       // keys = cat(ring, chunk) as model.prefill reads them, before the ring takes the chunk's last rows
-      pk::ring_gather(k_ring, v_ring, ring_pos, pos0, T, krows_, vrows_, kpos_, kpos_rows_, s, layout_.hkv_local);
+      pk::ring_gather(k_ring, v_ring, ring_pos, pos0, T, krows_, vrows_, kpos_, kpos_rows_, s, layout_.hkv_local, st.k_ring_at(ri).ne[2]);
       ap.k_out = krows_ + std::size_t(WINDOW) * kv, ap.v_out = vrows_ + std::size_t(WINDOW) * kv;
       ap.out_fp8 = false;
       pk::attn_prep(ap, s);

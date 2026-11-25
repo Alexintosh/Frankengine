@@ -2,7 +2,7 @@
 
 **High-throughput, strict-lossless C++/CUDA inference engine for `Inkling-2-Mini` (`30B-A3.6B` Looped MoE) on NVIDIA Blackwell GPUs (`GB10` DGX Spark `sm_121a`, `RTX 5090`/`PRO 6000` `sm_120`, and `B200`/`GB200` `sm_100a`).**
 
-Built on top of upstream [`ingine`](https://github.com/satellitedown/inkling-2-mini-abliterated-ingine), Frankengine adds a custom **dual-rail 200 GbE RoCE UMA RDMA collective backend (`tp_comm/`)**, **Tensor Parallel (`TP=2`)** execution, **true GPU step-level continuous batching (`--max-batch 1..8`)**, **sharded `NVFP4` LM head**, **eager-captured `FP8` Graph `DFlash 2` block-diffusion drafting**, **context-aware hybrid speculation (`DFlash 2` + global `DSpark`)**, and **256K live OpenAI-compatible serving**.
+Built on top of upstream [`ingine`](https://github.com/satellitedown/inkling-2-mini-abliterated-ingine) and [`ingine-batch`](https://github.com/satellitedown/ingine-batch), Frankengine adds a custom **dual-rail 200 GbE RoCE UMA RDMA collective backend (`tp_comm/`)**, **Tensor Parallel (`TP=2`)** execution, **batched speculative decoding (`--batch-spec 4`, `--max-batch 32..128`, `32K` per-slot context + `256K` solo fallback)**, **sharded `NVFP4` LM head**, **eager-captured `FP8` Graph `DFlash 2` block-diffusion drafting**, **context-aware hybrid speculation (`DFlash 2` + global `DSpark`)**, and **live OpenAI-compatible serving**.
 
 <p align="center">
   <img src="docs/assets/inkling2_dual_dgx_spark_infographic.png" alt="Inkling-2-Mini on 2× NVIDIA DGX Spark Infographic" width="680"/>
@@ -58,6 +58,30 @@ Step-level continuous batching with chunked prefill (`2048`-token chunks interle
 
 - **Peak NVML memory at `262K × 8` slots:** `29.21 GiB` (rank 0) / `27.01 GiB` (rank 1) on `TP=2` (`~92+ GiB` free per Spark); `53.74 GiB` on `TP=1`.
 - **4K context sampled (`c=1/4/8`):** `TP=2` `77.1 → 102.1 → 103.7 tok/s` agg (`29.0/stream` at `c=8`); `TP=1` `52.9 → 70.3 → 73.7 tok/s` agg.
+
+### Batched Speculative Decoding (`--batch-spec 4`, `TP=2` & `TP=1`, up to `c=128` / `4.19M` KV Pool)
+Ports `BatchDecoder` + `BatchDrafter` (`MXFP8`, `thr=0.50`, `min=2`) + grouped MoE + sharded Gumbel-max `head_sample` (`2.5 KB` RoCE exchange) to **Dual-Spark `TP=2`** (`ingine-batch-bench` & live `ingine-serve`). Production defaults to **`32 × 32K`** (`28.6 / 23.7 GiB` NVML) while preserving `256K` solo `DFlash 2` (`~250 tok/s`) with automatic mid-stream `solo → batch` KV promotion and `>32K` solo fallback.
+
+#### Standalone Batched Speculative Scaling (`ingine-batch-bench`, `spec=4`, FP8 KV)
+| Concurrency & Context | `1× Spark` (`TP=1`) Wall-Clock | **`2× Spark` (`TP=2`) Wall-Clock** | **`2× Spark` Steady-State Decode** | Step (`TP=2`) | VRAM / Node (`TP=2`) |
+|---|---:|---:|---:|---:|---:|
+| `c = 8` plain (`spec=0`, `640`) | `115.0 tok/s` | **`185.2 tok/s`** | `196.6 tok/s` (`24.6/str`) | `40.7 ms` | `11.2 GB` |
+| `c = 8` (`spec=4`, `640`) | `148.5 tok/s` | **`223.6 tok/s`** | `271.2 tok/s` (`33.9/str`) | `66.2 ms` | `12.4 GB` |
+| `c = 16` (`spec=4`, `640` / `8K`) | `236.1 / 235.1 tok/s` | **`359.1 / 347.2 tok/s`** | `424.5 / 414.4 tok/s` (`~26/str`) | `85.1 / 86.4 ms` | `13.0 / 14.8 GB` |
+| `c = 32` (`spec=4`, `640` / `8K`) | `378.4 tok/s` | **`521.9 / 525.9 tok/s`** | `667.7 / 674.3 tok/s` (`~21/str`) | `108.7 / 109.2 ms` | `14.2 / 17.9 GB` |
+| `c = 64` (`spec=4`, `T=0` / `T=1.0`) | `600.8 / 561.8 tok/s` | **`820.5 / 755.7 tok/s`** | `1,131.6 / 1,017.9 tok/s` (`17.7 / 15.9/str`) | `135.4 / 136.3 ms` | `16.7 GB` |
+| `c = 96` (`spec=4`, `640`, `512t`) | — | **`1,010.8 tok/s`** | **`1,425.4 tok/s`** (`14.8/str`) | `161.5 ms` | `19.3 GB` |
+| `c = 128` (`spec=4`, `640`, `512t`) | — | **`1,187.0 tok/s`** | **`1,614.2 tok/s`** (`12.6/str`) | `189.6 ms` | `21.8 GB` |
+| **`c = 128` (`spec=4`, `32K` ctx, `4.19M` KV)** | — | **`1,227.6 tok/s`** | **`1,504.3 tok/s`** (`11.8/str`) | **`191.7 ms`** | **`69.0 GB`** |
+
+#### Live Production OpenAI HTTP/SSE (`2× Spark TP=2`, `--max-batch 32 --batch-ctx 32768 --batch-spec 4`)
+| Live HTTP/SSE Workload | HTTP 200 | Peak Active | Aggregate Wall-Clock | Mean / Stream | TTFT p50 / p95 |
+|---|---:|---:|---:|---:|---:|
+| **`c = 8` greedy (`T=0`) / sampled (`T=1.0`)** | `8/8` | `8` | **`200.2 / 187.1 tok/s`** | **`33.3 / 30.9 tok/s`** | `0.70 / 0.70 s` |
+| **`c = 16` greedy (`T=0`)** | `16/16` | `16` | **`322.1 tok/s`** | **`27.6 tok/s`** | `1.36 / 1.36 s` |
+| **`c = 32` greedy (`T=0`) / sampled (`T=1.0`)** | `32/32` | `32` | **`479.7 / 426.2 tok/s`** | **`22.0 / 18.6 tok/s`** | `2.44 / 2.68 s` |
+| **`solo → batch` mid-stream handoff (5 streams)** | `5/5` | `5` | Zero seam corruption | — | Verified |
+| **Mixed `4K` prefill + client disconnects + `>32K` solo** | `100%` | — | Zero hang / RoCE timeout | — | `262K` fallback OK |
 
 ---
 

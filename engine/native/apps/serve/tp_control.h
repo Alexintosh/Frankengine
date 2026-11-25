@@ -128,6 +128,8 @@ class TpGenerator final : public model::Generator {
     return inner_->generate(prompt, max_new_tokens, sample, stops, emit);
   }
   int max_batch() const override { return inner_->max_batch(); }
+  int batch_max_ctx() const override { return inner_->batch_max_ctx(); }
+  int batch_spec() const override { return inner_->batch_spec(); }
   int reusable_prefix(int slot, std::span<const int32_t> prompt) const override {
     return inner_->reusable_prefix(slot, prompt);
   }
@@ -147,6 +149,19 @@ class TpGenerator final : public model::Generator {
       packed.push_back({row.slot, row.token, row.sampling->params.temperature});
     socket_->send_frame(nlohmann::json{{"op", "decode"}, {"rows", packed}}.dump());
     return inner_->decode_batch_step(rows);
+  }
+
+  std::vector<std::vector<int32_t>> decode_batch_step_multi(std::span<const model::BatchSlotStep> rows) override {
+    auto packed = nlohmann::json::array();
+    for (const auto& row : rows)
+      packed.push_back({row.slot, row.token, row.sampling->params.temperature});
+    socket_->send_frame(nlohmann::json{{"op", "decode_multi"}, {"rows", packed}}.dump());
+    return inner_->decode_batch_step_multi(rows);
+  }
+
+  bool promote_solo_to_batch(int slot, int32_t pending_token) override {
+    socket_->send_frame(nlohmann::json{{"op", "promote"}, {"slot", slot}, {"token", pending_token}}.dump());
+    return inner_->promote_solo_to_batch(slot, pending_token);
   }
 
   void release_slot(int slot) override {
@@ -180,6 +195,22 @@ inline void run_tp_worker(model::Generator& generator, TpControl& socket) {
     const auto op = request.value("op", "");
     if (op == "release") {
       generator.release_slot(request.at("slot").get<int>());
+      continue;
+    }
+    if (op == "promote") {
+      generator.promote_solo_to_batch(request.at("slot").get<int>(), request.at("token").get<int32_t>());
+      continue;
+    }
+    if (op == "decode_multi") {
+      const auto& packed = request.at("rows");
+      std::vector<model::BatchSampling> samples(packed.size());
+      std::vector<model::BatchSlotStep> rows;
+      for (std::size_t i = 0; i < packed.size(); ++i) {
+        const auto& row = packed.at(i);
+        samples[i].params.temperature = row.at(2).get<float>();
+        rows.push_back({row.at(0).get<int>(), row.at(1).get<int32_t>(), &samples[i]});
+      }
+      generator.decode_batch_step_multi(rows);
       continue;
     }
     if (op == "decode") {

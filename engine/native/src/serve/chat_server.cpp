@@ -190,7 +190,9 @@ void ChatServer::handle_get(const httplib::Request& req, httplib::Response& res)
                    {"running", st.running},
                    {"active", st.active},
                    {"max_batch", st.max_batch},
-                   {"max_queue", st.max_queue}});
+                   {"max_queue", st.max_queue},
+                   {"batch_ctx", st.batch_ctx},
+                   {"batch_spec", st.batch_spec}});
   } else if (path == "/v1/models") {
     send_json(res, 200, Json{{"object", "list"}, {"data", Json::array({model_card()})}});
   } else if (path == "/v1/models/" + model_id_) {

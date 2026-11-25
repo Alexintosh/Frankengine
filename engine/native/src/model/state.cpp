@@ -19,12 +19,12 @@ Tensor zeros(std::vector<DeviceBuffer>& storage, DType dt, std::initializer_list
 }  // namespace
 
 Tensor State::k_ring_at(int ring) const {
-  return rm(ptr<char>(k_ring) + std::size_t(ring) * WINDOW * k_ring.ne[1] * HEAD_DIM * 2, DType::BF16, {WINDOW, k_ring.ne[1], HEAD_DIM});
+  return rm(ptr<char>(k_ring) + std::size_t(ring) * ring_rows * k_ring.ne[1] * HEAD_DIM * 2, DType::BF16, {ring_rows, k_ring.ne[1], HEAD_DIM});
 }
 Tensor State::v_ring_at(int ring) const {
-  return rm(ptr<char>(v_ring) + std::size_t(ring) * WINDOW * v_ring.ne[1] * HEAD_DIM * 2, DType::BF16, {WINDOW, v_ring.ne[1], HEAD_DIM});
+  return rm(ptr<char>(v_ring) + std::size_t(ring) * ring_rows * v_ring.ne[1] * HEAD_DIM * 2, DType::BF16, {ring_rows, v_ring.ne[1], HEAD_DIM});
 }
-std::int64_t* State::ring_pos_at(int ring) const { return ptr<std::int64_t>(ring_pos) + std::size_t(ring) * WINDOW; }
+std::int64_t* State::ring_pos_at(int ring) const { return ptr<std::int64_t>(ring_pos) + std::size_t(ring) * ring_rows; }
 Tensor State::k_full_at(int full) const {
   const std::size_t es = kv_fp8 ? 1 : 2;
   return rm(ptr<char>(k_full) + std::size_t(full) * max_ctx * k_full.ne[1] * HEAD_DIM * es, k_full.dtype, {max_ctx, k_full.ne[1], HEAD_DIM});

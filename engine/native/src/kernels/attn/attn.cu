@@ -77,6 +77,7 @@
 // * Positions are int32 on the device (row offsets 64-bit); the host caps full caches at 2^30 rows.
 // Ported from engine/csrc/attn/attn.cu (kernel bodies unchanged; torch launcher -> raw pointers).
 #include "kernels/attn/attn.h"
+#include "kernels/attn/attn_batch.h"
 
 #include "kernels/common/l2.cuh"
 
@@ -480,6 +481,10 @@ int attn_cluster_size(int device) {
 
 }  // namespace
 
+std::size_t workspace_bytes_batched(int max_m, int max_batch, int hkv) {
+    return batched_workspace_bytes(max_m, max_batch, hkv);
+}
+
 std::size_t workspace_bytes(int max_m, int hkv) {
     require(hkv == 8 || hkv == 4, "hkv must be 8 or 4");
     require(max_m >= 1 && max_m <= MAXM, "max_m must be in 1..8");
@@ -503,6 +508,7 @@ int max_active_clusters(int M, int window) {
 }
 
 void attn_decode(const DecodeArgs& a, cudaStream_t stream) {
+    if (a.batch > 1 || a.proj16 || !a.conv_write) { attn_decode_batched(a, stream); return; }
     require(a.window == 0 || a.window == WIN, "window must be 0 (full layer) or 1024 (sliding layer)");
     const bool full = a.window == 0;
     const int M = a.M;

@@ -71,6 +71,8 @@ ingine::model::Sampling generation_defaults(const std::filesystem::path& model_d
 int main(int argc, char** argv) {
   std::string model_dir, host = "127.0.0.1", ablation, backend = "fast", model_id, log_level = "INFO";
   int port = 8003, max_ctx = 65536, max_queue = 4, max_batch = 1, max_model_len = 0, park_mb = -1;
+  int batch_ctx = 32768, batch_spec = 0, batch_spec_min = 2;
+  double batch_spec_threshold = 0.50;
   bool engine = false, fake = false, dense_fp8 = false, kv_fp8 = false, spec = false, no_vision = false;
   int image_max_tokens = 4096, max_images = 16, max_image_tokens = 32768;
   bool draft_nvfp4 = false, head_nvfp4 = false;
@@ -123,7 +125,12 @@ int main(int argc, char** argv) {
   ap.option("--max-image-tokens", "", "image tokens accepted in one request", &max_image_tokens);
   ap.option("--fake-delay", "", "seconds per fake token", &fake_delay);
   ap.option("--model-id", "", "model name reported by the API (default: generator.model_id)", &model_id);
-  ap.option("--max-batch", "", "maximum active requests (1..8)", &max_batch);
+  ap.option("--max-batch", "", "maximum active requests (1..8, or 1..128 with --batch-spec)", &max_batch);
+  ap.option("--batch-ctx", "", "context length per slot in --batch-spec mode (default 32768)", &batch_ctx);
+  ap.option("--batch-spec", "", "batched DSpark speculative drafts per step (0=off, 1..7)", &batch_spec);
+  ap.option("--batch-spec-threshold", "", "cumulative draft confidence threshold for --batch-spec (default 0.50)",
+            &batch_spec_threshold);
+  ap.option("--batch-spec-min", "", "minimum drafts verified per sequence in --batch-spec (default 2)", &batch_spec_min);
   ap.option("--max-queue", "", "requests allowed to wait behind the running one", &max_queue);
   ap.option("--max-model-len", "",
             "context limit (default: generator.max_model_len or tokenizer model_max_length)", &max_model_len);
@@ -140,8 +147,14 @@ int main(int argc, char** argv) {
             &tp_wire, {"fp32", "bf16", "bf16-moe"});
   ap.flag("--tp-profile", "Time TP collectives and speculative decisions", &tp_profile);
   ap.parse(argc, argv);
-  if (max_batch < 1 || max_batch > 8 || (fake && max_batch != 1)) {
-    std::cerr << "ingine-serve: --max-batch must be in [1, 8] and requires the model backend above 1\n";
+  const int batch_limit = batch_spec > 0 ? 128 : 8;
+  if (batch_spec < 0 || batch_spec > 7 || batch_spec_min < 0 || batch_spec_min > 7 ||
+      !(batch_spec_threshold >= 0.0 && batch_spec_threshold < 1.0)) {
+    std::cerr << "ingine-serve: invalid --batch-spec / --batch-spec-min / --batch-spec-threshold\n";
+    return 2;
+  }
+  if (max_batch < 1 || max_batch > batch_limit || (fake && max_batch != 1)) {
+    std::cerr << "ingine-serve: --max-batch must be in [1, " << batch_limit << "] and requires the model backend above 1\n";
     return 2;
   }
   if (image_max_tokens < 1 || image_max_tokens > ingine::image::MAX_TOKENS || max_images < 0 || max_image_tokens < 0) {
@@ -176,6 +189,10 @@ int main(int argc, char** argv) {
       options.ablation = ablation;
       options.max_ctx = max_ctx;
       options.max_batch = max_batch;
+      options.batch_ctx = batch_ctx;
+      options.batch_spec = batch_spec;
+      options.batch_spec_threshold = float(batch_spec_threshold);
+      options.batch_spec_min = batch_spec_min;
       options.dense_fp8 = dense_fp8;
       options.kv_fp8 = kv_fp8;
       options.spec = spec;

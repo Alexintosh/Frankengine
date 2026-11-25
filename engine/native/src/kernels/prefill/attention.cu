@@ -376,13 +376,16 @@ void launch(const AttnParams& p, cudaStream_t stream) {
 // ---- sliding-visit key rows
 
 __global__ void ring_gather_kernel(const uint4* __restrict__ k_ring, const uint4* __restrict__ v_ring,
-                                   const int64_t* __restrict__ ring_pos, int pos0, int T, uint4* __restrict__ k_rows,
-                                   uint4* __restrict__ v_rows, int* __restrict__ kpos, int kpos_rows) {
+                                   const int64_t* __restrict__ ring_pos, int ring_rows, int pos0, int T,
+                                   uint4* __restrict__ k_rows, uint4* __restrict__ v_rows, int* __restrict__ kpos,
+                                   int kpos_rows) {
   const int kRowVecs = blockDim.x;
-  const int i = blockIdx.x, slot = (pos0 + i) & (kRelExtent - 1);
-  k_rows[size_t(i) * kRowVecs + threadIdx.x] = k_ring[size_t(slot) * kRowVecs + threadIdx.x];
-  v_rows[size_t(i) * kRowVecs + threadIdx.x] = v_ring[size_t(slot) * kRowVecs + threadIdx.x];
-  if (threadIdx.x == 0) kpos[i] = int(ring_pos[slot]);
+  const int i = blockIdx.x;
+  const int slot = ring_rows == kRelExtent ? ((pos0 + i) & (kRelExtent - 1)) : i;
+  const bool has = slot < ring_rows;
+  k_rows[size_t(i) * kRowVecs + threadIdx.x] = has ? k_ring[size_t(slot) * kRowVecs + threadIdx.x] : make_uint4(0, 0, 0, 0);
+  v_rows[size_t(i) * kRowVecs + threadIdx.x] = has ? v_ring[size_t(slot) * kRowVecs + threadIdx.x] : make_uint4(0, 0, 0, 0);
+  if (threadIdx.x == 0) kpos[i] = has ? int(ring_pos[slot]) : -1;
   for (int r = kRelExtent + i * kRowVecs + threadIdx.x; r < kpos_rows; r += gridDim.x * kRowVecs)
     kpos[r] = r - kRelExtent < T ? pos0 + r - kRelExtent : -1;
 }
@@ -443,9 +446,9 @@ void attention(const AttnParams& p, cudaStream_t stream) {
 }
 
 void ring_gather(const __nv_bfloat16* k_ring, const __nv_bfloat16* v_ring, const int64_t* ring_pos, int pos0, int T,
-                 __nv_bfloat16* k_rows, __nv_bfloat16* v_rows, int* kpos, int kpos_rows, cudaStream_t stream, int hkv) {
+                 __nv_bfloat16* k_rows, __nv_bfloat16* v_rows, int* kpos, int kpos_rows, cudaStream_t stream, int hkv, int ring_rows) {
   ring_gather_kernel<<<kRelExtent, hkv * D / 8, 0, stream>>>(
-      reinterpret_cast<const uint4*>(k_ring), reinterpret_cast<const uint4*>(v_ring), ring_pos, pos0, T,
+      reinterpret_cast<const uint4*>(k_ring), reinterpret_cast<const uint4*>(v_ring), ring_pos, ring_rows, pos0, T,
       reinterpret_cast<uint4*>(k_rows), reinterpret_cast<uint4*>(v_rows), kpos, kpos_rows);
 }
 

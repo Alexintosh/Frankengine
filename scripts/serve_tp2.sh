@@ -30,6 +30,10 @@ ARGS=(
   --max-ctx "$MAX_CTX"
   --max-model-len "$MAX_CTX"
   --max-batch "$MAX_BATCH"
+  --batch-ctx "$BATCH_CTX"
+  --batch-spec "$BATCH_SPEC"
+  --batch-spec-threshold "$BATCH_SPEC_THRESHOLD"
+  --batch-spec-min "$BATCH_SPEC_MIN"
   --max-queue "$MAX_QUEUE"
   --park-mb "$PARK_MB"
   --no-vision

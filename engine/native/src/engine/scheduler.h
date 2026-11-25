@@ -75,6 +75,8 @@ struct SchedulerStats {
   int max_queue = 0;
   int active = 0;
   int max_batch = 1;
+  int batch_ctx = 0;
+  int batch_spec = 0;
 };
 
 class Scheduler {
@@ -103,7 +105,7 @@ class Scheduler {
     int offset = 0, emitted = 0;
     int32_t token = 0;
     model::BatchSampling sampling;
-    bool solo = false, done = false;
+    bool solo = false, force_solo = false, done = false;
   };
 
   model::Generator& generator_;

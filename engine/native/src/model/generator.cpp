@@ -8,7 +8,10 @@
 
 #include "core/arena.h"
 #include "core/device.h"
+#include "kernels/batch/batch.h"
 #include "kernels/head/head.h"
+#include "model/batch.h"
+#include "model/batch_drafter.h"
 #include "model/drafter.h"
 #include "model/dflash2.h"
 
@@ -36,6 +39,8 @@ namespace head = kernels::head;
 double seconds_since(std::chrono::steady_clock::time_point t) {
   return std::chrono::duration<double>(std::chrono::steady_clock::now() - t).count();
 }
+
+std::uint64_t batch_seed(std::uint64_t draw) { return draw * 0x9E3779B97F4A7C15ull + 0x2545F4914F6CDD1Dull; }
 
 const RuntimeOptions& without_spec(const RuntimeOptions& options) {
   if (options.spec) throw std::invalid_argument("make_generator over given weights: spec needs the model directory");
@@ -114,8 +119,41 @@ class EngineGenerator final : public Generator {
                                            rt_.tp() && rt_.tp()->profile);
       drafter_->capture();
     }
-    if (drafter_ || dflash2_)
+    if (drafter_ || dflash2_ || options.batch_spec > 0)
       taps_ = DeviceBuffer(std::size_t(options.prefill_chunk) * NUM_TAPS * HIDDEN * 2);
+    if (options.batch_spec > 0) {
+      if (options.batch_spec > BatchDrafter::GAMMA)
+        throw std::invalid_argument("batch_spec must be in 1..7");
+      if (options.batch_ctx < WINDOW || options.batch_ctx > options.max_ctx)
+        throw std::invalid_argument("batch_ctx must be in [1024, max_ctx]");
+      const TpLayout layout = rt_.tp() ? rt_.tp()->layout : TpLayout{};
+      const cudaStream_t stream = rt_.stream();
+      if (!rt_.weights().unembed.w.data || rt_.weights().unembed.fp8()) {
+        batch_unembed_ = load_head(options.model_dir, /*dense_fp8=*/false, /*head_nvfp4=*/false, stream,
+                                   batch_head_storage_, layout).dense;
+      }
+      batch_state_ = make_batch_state(options.max_batch, options.batch_ctx, options.kv_fp8, layout);
+      batch_dec_ = std::make_unique<BatchDecoder>(rt_.weights(), rt_.ablation(), batch_state_, options.max_batch,
+                                                  stream, 8, rt_.tp(),
+                                                  batch_unembed_.w.data ? &batch_unembed_ : nullptr);
+      if (!rt_.tp() || layout.tp_rank == 0) {
+        std::vector<DeviceBuffer> tmp_head;
+        Dense full_head;
+        if (rt_.tp() || !rt_.weights().unembed.w.data || rt_.weights().unembed.fp8())
+          full_head = load_head(options.model_dir, false, false, stream, tmp_head).dense;
+        batch_drafter_ = std::make_unique<BatchDrafter>(
+            options.model_dir, rt_.weights(), options.max_batch, options.batch_ctx, options.max_batch, stream,
+            BatchDrafter::Precision::MXFP8, full_head.w.data ? &full_head : nullptr);
+      }
+      constexpr int G = BatchDrafter::GAMMA;
+      constexpr int TAP_ROW = NUM_TAPS * HIDDEN;
+      batch_gathered_ = DeviceBuffer(std::size_t(options.max_batch) * 8 * TAP_ROW * 2);
+      batch_rows_ = DeviceBuffer(std::size_t(options.max_batch) * 8 * 4);
+      if (rt_.tp()) batch_draft_bcast_ = DeviceBuffer(std::size_t(options.max_batch) * G * 8);
+      batch_drafts_.assign(std::size_t(options.max_batch) * G, 0);
+      batch_conf_.assign(std::size_t(options.max_batch) * G, 0.f);
+      batch_spec_histories_.resize(std::size_t(options.max_batch));
+    }
     if (options.spec && options.draft_type != "dflash2")
       spec_ = std::make_unique<SpecLoop>(rt_, drafter_.get());
     if (use_dflash2)
@@ -248,30 +286,128 @@ class EngineGenerator final : public Generator {
 
  public:
   int max_batch() const override { return options_.max_batch; }
+  int batch_max_ctx() const override { return options_.batch_spec > 0 ? options_.batch_ctx : options_.max_ctx; }
+  int batch_spec() const override { return options_.batch_spec; }
 
   int reusable_prefix(int slot, std::span<const int32_t> prompt) const override {
     if (options_.cold_prefill) return 0;
-    const auto& history = slot_history(slot);
+    auto match = [&](const std::vector<int32_t>& h) {
+      return !h.empty() && h.size() < prompt.size() && std::equal(h.begin(), h.end(), prompt.begin()) ? int(h.size()) : 0;
+    };
+    if (options_.batch_spec > 0) {
+      const int bm = match(batch_spec_histories_.at(std::size_t(slot)));
+      return slot == 0 ? std::max(bm, match(tokens_in_state_)) : bm;
+    }
     // Precompute the final token's head even when a previous turn used a different head mode.
-    return !history.empty() && history.size() < prompt.size() &&
-                   std::equal(history.begin(), history.end(), prompt.begin())
-               ? int(history.size()) : 0;
+    return match(slot_history(slot));
+  }
+
+  bool promote_solo_to_batch(int slot, int32_t pending_token) override {
+    if (options_.batch_spec == 0) return true;
+    const int len = int(tokens_in_state_.size());
+    if (slot < 0 || slot >= options_.max_batch) return false;
+    if (len + options_.batch_spec + 2 >= options_.batch_ctx) return false;
+    const cudaStream_t stream = rt_.stream();
+    const State& src = rt_.state();
+    State dst = batch_state_.view(slot);
+    auto copy_same = [&](const Tensor& s_t, const Tensor& d_t) {
+      CUDA_CHECK(cudaMemcpyAsync(d_t.data, s_t.data, s_t.bytes(), cudaMemcpyDeviceToDevice, stream));
+    };
+    copy_same(src.k_ring, dst.k_ring);
+    copy_same(src.v_ring, dst.v_ring);
+    copy_same(src.ring_pos, dst.ring_pos);
+    copy_same(src.conv_k, dst.conv_k);
+    copy_same(src.conv_v, dst.conv_v);
+    copy_same(src.conv_attn, dst.conv_attn);
+    copy_same(src.conv_mlp, dst.conv_mlp);
+    if (len > 0) {
+      const std::size_t es = options_.kv_fp8 ? 1 : 2;
+      const std::size_t row_bytes = std::size_t(batch_state_.kv_dim_local) * es;
+      const std::size_t copy_bytes = std::size_t(len) * row_bytes;
+      for (int fi = 0; fi < NUM_FULL_VISITS; ++fi) {
+        CUDA_CHECK(cudaMemcpyAsync(dst.k_full_at(fi).data, src.k_full_at(fi).data, copy_bytes, cudaMemcpyDeviceToDevice, stream));
+        CUDA_CHECK(cudaMemcpyAsync(dst.v_full_at(fi).data, src.v_full_at(fi).data, copy_bytes, cudaMemcpyDeviceToDevice, stream));
+      }
+    }
+    batch_spec_histories_.at(std::size_t(slot)) = tokens_in_state_;
+    if (batch_drafter_) batch_drafter_->reset_slot(slot);
+    if (pending_token >= 0) {
+      const std::int32_t slot32 = slot;
+      const std::int64_t pos64 = len;
+      batch_draft_slots(1, &slot32, &pending_token, &pos64);
+    } else {
+      CUDA_CHECK(cudaStreamSynchronize(stream));
+    }
+    return true;
   }
 
   PrefillChunkResult prefill_slot_chunk(int slot, std::span<const int32_t> prompt, int offset,
                                        BatchSampling& sampling) override {
-    if (prompt.empty() || prompt.size() >= std::size_t(options_.max_ctx) ||
+    const int ctx_lim = options_.batch_spec > 0 ? options_.batch_ctx : options_.max_ctx;
+    if (prompt.empty() || int(prompt.size()) + options_.batch_spec + 1 >= ctx_lim ||
         std::any_of(prompt.begin(), prompt.end(), [](int32_t token) {
           return token < 0 || token >= UNPADDED_VOCAB;
         }))
       throw std::invalid_argument("invalid batch prompt");
+    const auto stream = rt_.stream();
+    auto* tp = rt_.tp();
+    if (options_.batch_spec > 0) {
+      State view = batch_state_.view(slot);
+      auto& history = batch_spec_histories_.at(std::size_t(slot));
+      int reused = 0;
+      if (offset == 0) {
+        if (!options_.cold_prefill && !history.empty() && history.size() < prompt.size() &&
+            std::equal(history.begin(), history.end(), prompt.begin())) {
+          reused = int(history.size());
+        }
+        if (tp && !tp->agree(reused, stream)) reused = 0;
+        offset = reused;
+        if (!offset) {
+          reset_slot(batch_state_, slot, stream);
+          if (batch_drafter_) batch_drafter_->reset_slot(slot);
+          history.clear();
+        }
+      }
+      const int count = std::min({2048, options_.prefill_chunk, int(prompt.size()) - offset});
+      const bool final = offset + count == int(prompt.size());
+      const bool sampled = sampling.params.temperature > 0;
+      if (tp) tp->full_logits = sampled;
+      CUDA_CHECK(cudaMemcpyAsync(chunk_tokens_.p, prompt.data() + offset, std::size_t(count) * sizeof(int32_t),
+                                 cudaMemcpyHostToDevice, stream));
+      Tensor taps;
+      if (batch_drafter_) taps = rm(taps_.p, DType::BF16, {count, NUM_TAPS, HIDDEN});
+      prefiller_.run(view, static_cast<const int32_t*>(chunk_tokens_.p), count, offset,
+                     !tp || (sampled && options_.tp.rank == 0) ? static_cast<float*>(logits_.p) : nullptr,
+                     batch_drafter_ ? &taps : nullptr, {},
+                     tp && !sampled ? static_cast<int32_t*>(logits_.p) : nullptr, final);
+      if (batch_drafter_) {
+        const std::int32_t slot32 = slot, count32 = count;
+        const std::int64_t start64 = offset;
+        batch_drafter_->commit(1, &slot32, &start64, &count32, static_cast<const __nv_bfloat16*>(taps_.p));
+      }
+      if (tp) tp->wait(stream);
+      else CUDA_CHECK(cudaStreamSynchronize(stream));
+      history.insert(history.end(), prompt.begin() + offset, prompt.begin() + offset + count);
+      PrefillChunkResult result{offset + count, reused, std::nullopt};
+      if (final) {
+        std::int32_t first_tok = 0;
+        if (options_.tp.rank == 0) {
+          first_tok = batch_token(logits_.p, tp && !sampled, sampling);
+          result.token = first_tok;
+        }
+        const std::int32_t slot32 = slot;
+        const std::int64_t pos64 = std::int64_t(prompt.size());
+        batch_draft_slots(1, &slot32, &first_tok, &pos64);
+      }
+      return result;
+    }
+
     auto& state = rt_.state_slot(slot);
     auto& history = slot_history(slot);
-    const auto stream = rt_.stream();
     int reused = 0;
     if (offset == 0) {
       reused = reusable_prefix(slot, prompt);
-      if (rt_.tp() && !rt_.tp()->agree(reused, stream)) reused = 0;
+      if (tp && !tp->agree(reused, stream)) reused = 0;
       if (slot == 0) {
         park_live();
         checkpoint_ids_.clear();
@@ -287,7 +423,6 @@ class EngineGenerator final : public Generator {
     const int count = std::min({2048, options_.prefill_chunk, int(prompt.size()) - offset});
     const bool final = offset + count == int(prompt.size());
     const bool sampled = sampling.params.temperature > 0;
-    auto* tp = rt_.tp();
     if (tp) tp->full_logits = sampled;
     CUDA_CHECK(cudaMemcpyAsync(chunk_tokens_.p, prompt.data() + offset, count * sizeof(int32_t),
                                cudaMemcpyHostToDevice, stream));
@@ -302,6 +437,82 @@ class EngineGenerator final : public Generator {
     if (final && options_.tp.rank == 0)
       result.token = batch_token(logits_.p, tp && !sampled, sampling);
     return result;
+  }
+
+  std::vector<std::vector<int32_t>> decode_batch_step_multi(std::span<const BatchSlotStep> slots) override {
+    if (options_.batch_spec == 0) return Generator::decode_batch_step_multi(slots);
+    const int n = int(slots.size());
+    const std::size_t ns = std::size_t(n);
+    std::vector<std::vector<int32_t>> emitted(ns);
+    if (n == 0) return emitted;
+    constexpr int G = BatchDrafter::GAMMA;
+    const float theta = std::max(0.05f, options_.batch_spec_threshold * float(n) / float(options_.max_batch));
+    std::vector<std::int32_t> m(ns), slot_ids(ns), tok;
+    std::vector<std::int64_t> pos(ns);
+    std::vector<float> temp(ns);
+    tok.reserve(std::size_t(n) * std::size_t(options_.batch_spec + 1));
+    for (int i = 0; i < n; ++i) {
+      const int s = slots[std::size_t(i)].slot;
+      const int p_cur = int(batch_spec_histories_.at(std::size_t(s)).size());
+      const int avail = std::max(0, options_.batch_ctx - 1 - p_cur);
+      const int k_max = std::min(options_.batch_spec, std::max(0, avail - 1));
+      const int k_min = std::min(options_.batch_spec_min, k_max);
+      int k = k_max;
+      if (options_.batch_spec_threshold > 0.f && k_max > 0) {
+        const float* c = batch_conf_.data() + std::size_t(s) * G;
+        float prod = 1.f;
+        k = 0;
+        while (k < k_max && ((prod *= c[k]) > theta || k < k_min)) ++k;
+      }
+      m[std::size_t(i)] = k + 1;
+      slot_ids[std::size_t(i)] = s;
+      pos[std::size_t(i)] = p_cur;
+      temp[std::size_t(i)] = slots[std::size_t(i)].sampling->params.temperature;
+      tok.push_back(slots[std::size_t(i)].token);
+      for (int d = 0; d < k; ++d) tok.push_back(batch_drafts_[std::size_t(s) * G + std::size_t(d)]);
+    }
+    const auto got = batch_dec_->step(n, m.data(), tok.data(), slot_ids.data(), pos.data(), temp.data(),
+                                      batch_seed(++batch_draws_));
+    std::vector<std::int32_t> off(ns + 1, 0), keep(ns);
+    for (int i = 0; i < n; ++i) off[std::size_t(i) + 1] = off[std::size_t(i)] + m[std::size_t(i)];
+    std::vector<std::int32_t> d_slots, d_anchors;
+    std::vector<std::int64_t> d_pos;
+    d_slots.reserve(std::size_t(n)), d_anchors.reserve(std::size_t(n)), d_pos.reserve(std::size_t(n));
+    for (int i = 0; i < n; ++i) {
+      const int K = m[std::size_t(i)] - 1;
+      const std::int32_t* row = tok.data() + off[std::size_t(i)];
+      const std::int32_t* out = got.data() + off[std::size_t(i)];
+      int a = 0;
+      while (a < K && row[1 + a] == out[a]) ++a;
+      emitted[std::size_t(i)].assign(row + 1, row + 1 + a);
+      emitted[std::size_t(i)].push_back(out[a]);
+      keep[std::size_t(i)] = a + 1;
+      auto& hist = batch_spec_histories_.at(std::size_t(slot_ids[std::size_t(i)]));
+      hist.insert(hist.end(), row, row + a + 1);
+      const std::int64_t np = pos[std::size_t(i)] + a + 1;
+      if (np + 1 < options_.batch_ctx) {
+        d_slots.push_back(slot_ids[std::size_t(i)]);
+        d_anchors.push_back(out[a]);
+        d_pos.push_back(np);
+      }
+    }
+    batch_dec_->accept(keep.data());
+    if (batch_drafter_) {
+      constexpr int TAP_ROW = NUM_TAPS * HIDDEN;
+      std::vector<std::int32_t> rows_h;
+      rows_h.reserve(tok.size());
+      for (int i = 0; i < n; ++i)
+        for (int r = 0; r < keep[std::size_t(i)]; ++r) rows_h.push_back(off[std::size_t(i)] + r);
+      CUDA_CHECK(cudaMemcpyAsync(batch_rows_.p, rows_h.data(), rows_h.size() * 4, cudaMemcpyHostToDevice, rt_.stream()));
+      kernels::batch::gather_rows(batch_dec_->taps(), TAP_ROW, static_cast<const std::int32_t*>(batch_rows_.p),
+                                  int(rows_h.size()), static_cast<__nv_bfloat16*>(batch_gathered_.p), rt_.stream());
+      batch_drafter_->commit(n, slot_ids.data(), pos.data(), keep.data(),
+                             static_cast<const __nv_bfloat16*>(batch_gathered_.p));
+    }
+    if (!d_slots.empty()) batch_draft_slots(int(d_slots.size()), d_slots.data(), d_anchors.data(), d_pos.data());
+    else if (rt_.tp()) rt_.tp()->wait(rt_.stream());
+    else CUDA_CHECK(cudaStreamSynchronize(rt_.stream()));
+    return emitted;
   }
 
   std::vector<int32_t> decode_batch_step(std::span<const BatchSlotStep> slots) override {
@@ -824,7 +1035,53 @@ class EngineGenerator final : public Generator {
     return token;
   }
 
+  void batch_draft_slots(int n, const std::int32_t* slots, const std::int32_t* anchors, const std::int64_t* next_pos) {
+    constexpr int G = BatchDrafter::GAMMA;
+    const std::size_t cnt = std::size_t(n) * G;
+    const cudaStream_t stream = rt_.stream();
+    std::vector<std::int32_t> dh(cnt);
+    std::vector<float> ch(cnt);
+    if (batch_drafter_) {
+      const BatchDrafter::Drafts d =
+          batch_drafter_->draft(n, slots, anchors, next_pos, 0.f, batch_seed(++batch_draws_), options_.batch_spec);
+      if (rt_.tp()) {
+        auto* base = static_cast<std::byte*>(batch_draft_bcast_.p);
+        CUDA_CHECK(cudaMemcpyAsync(base, d.tokens, cnt * 4, cudaMemcpyDeviceToDevice, stream));
+        CUDA_CHECK(cudaMemcpyAsync(base + cnt * 4, d.conf, cnt * 4, cudaMemcpyDeviceToDevice, stream));
+        rt_.tp()->broadcast_proposal(batch_draft_bcast_.p, cnt * 8, stream);
+        CUDA_CHECK(cudaMemcpyAsync(dh.data(), base, cnt * 4, cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaMemcpyAsync(ch.data(), base + cnt * 4, cnt * 4, cudaMemcpyDeviceToHost, stream));
+        rt_.tp()->wait(stream);
+      } else {
+        CUDA_CHECK(cudaMemcpyAsync(dh.data(), d.tokens, cnt * 4, cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaMemcpyAsync(ch.data(), d.conf, cnt * 4, cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+      }
+    } else if (rt_.tp()) {
+      ++batch_draws_;
+      auto* base = static_cast<std::byte*>(batch_draft_bcast_.p);
+      rt_.tp()->broadcast_proposal(batch_draft_bcast_.p, cnt * 8, stream);
+      CUDA_CHECK(cudaMemcpyAsync(dh.data(), base, cnt * 4, cudaMemcpyDeviceToHost, stream));
+      CUDA_CHECK(cudaMemcpyAsync(ch.data(), base + cnt * 4, cnt * 4, cudaMemcpyDeviceToHost, stream));
+      rt_.tp()->wait(stream);
+    }
+    for (int i = 0; i < n; ++i) {
+      std::copy_n(dh.begin() + std::ptrdiff_t(i) * G, G, batch_drafts_.begin() + std::ptrdiff_t(slots[i]) * G);
+      std::copy_n(ch.begin() + std::ptrdiff_t(i) * G, G, batch_conf_.begin() + std::ptrdiff_t(slots[i]) * G);
+    }
+  }
+
   std::array<std::vector<int32_t>, 7> batch_histories_;
+  std::vector<std::vector<int32_t>> batch_spec_histories_;
+  std::vector<DeviceBuffer> batch_head_storage_;
+  Dense batch_unembed_;
+  BatchState batch_state_;
+  std::unique_ptr<BatchDecoder> batch_dec_;
+  std::unique_ptr<BatchDrafter> batch_drafter_;
+  DeviceBuffer batch_gathered_, batch_rows_, batch_draft_bcast_;
+  std::vector<std::int32_t> batch_drafts_;
+  std::vector<float> batch_conf_;
+  std::uint64_t batch_draws_ = 0;
   RuntimeOptions options_;
   std::unique_ptr<Runtime> runtime_;
   Runtime& rt_;
