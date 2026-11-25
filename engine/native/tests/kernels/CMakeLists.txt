@@ -8,3 +8,6 @@ ingine_add_test(NAME kernels_bitlock SOURCES test_bitlock.cpp
   LIBS ingine_kernels_dense ingine_kernels_moe ingine_kernels_attn GPU TIMEOUT 600)
 
 ingine_add_test(NAME test_tp2_kernels SOURCES test_tp2_kernels.cu LIBS ingine_model GPU MODEL TIMEOUT 900)
+
+ingine_add_test(NAME kernels_batch SOURCES test_batch.cpp
+  LIBS ingine_kernels_dense ingine_kernels_attn GPU TIMEOUT 120)

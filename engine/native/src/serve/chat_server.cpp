@@ -153,7 +153,8 @@ ChatServer::ChatServer(model::Generator& generator, const text::ChatFormat& fmt,
       scheduler_(generator, fmt.stop_ids(), options.max_queue) {
   // A pool thread per connection, as ThreadingHTTPServer: the running request, the waiting ones, the ones
   // rejected with 503 and /health probes must all be served concurrently.
-  server_.new_task_queue = [] { return new httplib::ThreadPool(8, 1024); };
+  const auto threads = std::max<std::size_t>(16, std::size_t(std::max(0, options.max_queue)) + options.max_batch + 8);
+  server_.new_task_queue = [threads] { return new httplib::ThreadPool(threads, 1024); };
   server_.set_socket_options(configure_http_server_socket);
   register_routes();
 }
@@ -187,6 +188,8 @@ void ChatServer::handle_get(const httplib::Request& req, httplib::Response& res)
                    {"model", model_id_},
                    {"waiting", st.waiting},
                    {"running", st.running},
+                   {"active", st.active},
+                   {"max_batch", st.max_batch},
                    {"max_queue", st.max_queue}});
   } else if (path == "/v1/models") {
     send_json(res, 200, Json{{"object", "list"}, {"data", Json::array({model_card()})}});

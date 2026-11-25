@@ -19,6 +19,7 @@ ARGS=(
   --model-dir "$HEAD_MODEL_DIR"
   --max-ctx "$MAX_CTX"
   --max-model-len "$MAX_CTX"
+  --max-batch "$MAX_BATCH"
   --max-queue "$MAX_QUEUE"
   --park-mb "$PARK_MB"
   --no-vision

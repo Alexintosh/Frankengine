@@ -5,6 +5,7 @@
 
 #include "core/device.h"
 
+#include <cstring>
 #include <algorithm>
 #include <array>
 #include <stdexcept>
@@ -98,6 +99,10 @@ Runtime::Runtime(const RuntimeOptions& options, Weights weights, Ablation ablati
 
 void Runtime::init() {
   const RuntimeOptions& options = options_;
+  if (options.max_batch < 1 || options.max_batch > kMaxWidth)
+    throw std::invalid_argument("max_batch must be in 1..8");
+  if (options.max_batch > 1 && options.tp.size > 1 && (!options.tp.serve || options.tp.profile))
+    throw std::invalid_argument("TP batch graphs require unprofiled serving mode");
   const auto layout = runtime_layout(options);
   state_ = make_state(options.max_ctx, options.kv_fp8, layout);
   if (layout.tp_size > 1) tp_ = std::make_unique<TpRuntime>(options);
@@ -149,7 +154,101 @@ void Runtime::init() {
     graphs_.swap(sampled_graphs_);
     tp_->full_logits = false;
   }
+  if (options.max_batch > 1) init_batch(layout);
   CUDA_CHECK(cudaStreamSynchronize(stream_));
+}
+
+State& Runtime::state_slot(int slot) {
+  return slot == 0 ? state_ : extra_slots_.at(slot - 1);
+}
+
+void Runtime::set_batch_inputs(std::span<const BatchInput> rows) {
+  auto& table = *static_cast<BatchSlotTable*>(host_batch_table_.data());
+  unsigned used = 0;
+  for (std::size_t i = 0; i < rows.size(); ++i) {
+    const auto [slot, token] = rows[i];
+    if (slot < 0 || slot >= options_.max_batch || (used & (1u << slot)))
+      throw std::invalid_argument("batch slots must be distinct and in range");
+    used |= 1u << slot;
+    auto& state = state_slot(slot);
+    if (state.length < 0 || state.length >= state.max_ctx)
+      throw std::invalid_argument("batch slot position outside context");
+    if (token < 0 || token >= UNPADDED_VOCAB)
+      throw std::invalid_argument("batch token outside vocabulary");
+    table.tokens[i] = token;
+    for (int v = 0; v < NUM_VISITS; ++v) {
+      auto& entry = table.attn[v][i];
+      entry.position = state.length;
+      entry.conv_k_state = state.conv_k_at(v);
+      entry.conv_v_state = state.conv_v_at(v);
+      if (const int full = FULL_INDEX[v]; full >= 0) {
+        entry.k_cache = state.k_full_at(full).data;
+        entry.v_cache = state.v_full_at(full).data;
+        entry.kpos = nullptr;
+      } else {
+        const int ring = RING_INDEX[v];
+        entry.k_cache = state.k_ring_at(ring).data;
+        entry.v_cache = state.v_ring_at(ring).data;
+        entry.kpos = state.ring_pos_at(ring);
+      }
+      table.attn_conv[v][i] = state.conv_attn_at(v);
+      table.mlp_conv[v][i] = state.conv_mlp_at(v);
+    }
+  }
+  CUDA_CHECK(cudaMemcpyAsync(batch_table_.p, &table, sizeof(table), cudaMemcpyHostToDevice, stream_));
+}
+
+void Runtime::init_batch(const TpLayout& layout) {
+  decoder_->allocate_batch_workspace(options_.max_batch);
+  for (int i = 1; i < options_.max_batch; ++i)
+    extra_slots_.push_back(make_state(options_.max_ctx, options_.kv_fp8, layout));
+  batch_table_ = DeviceBuffer(sizeof(BatchSlotTable));
+  host_batch_table_ = MappedHostBuffer(sizeof(BatchSlotTable));
+  std::memset(host_batch_table_.data(), 0, sizeof(BatchSlotTable));
+  auto* table = static_cast<BatchSlotTable*>(batch_table_.p);
+  std::array<BatchInput, kMaxWidth> inputs{};
+  for (int i = 0; i < options_.max_batch; ++i) inputs[i] = {i, 0};
+  set_batch_inputs(std::span(inputs).first(options_.max_batch));
+  for (int width = 1; width <= options_.max_batch; ++width) {
+    auto& entry = batch_widths_[width];
+    entry.buffers = make_buffers(width, layout, true, bool(tp_));
+    entry.buffers.token = rm(table->tokens, DType::I64, {width});
+    auto capture = [&](bool full_logits) {
+      if (tp_) tp_->full_logits = full_logits;
+      decoder_->decode_batch(entry.buffers, table, stream_);
+      CUDA_CHECK(cudaStreamSynchronize(stream_));
+      if (tp_) tp_->check();
+      cudaGraph_t graph = nullptr;
+      CUDA_CHECK(cudaStreamBeginCapture(stream_, cudaStreamCaptureModeThreadLocal));
+      try {
+        decoder_->decode_batch(entry.buffers, table, stream_);
+      } catch (...) {
+        cudaStreamEndCapture(stream_, &graph);
+        if (graph) cudaGraphDestroy(graph);
+        throw;
+      }
+      CUDA_CHECK(cudaStreamEndCapture(stream_, &graph));
+      cudaGraphExec_t exec;
+      CUDA_CHECK(cudaGraphInstantiate(&exec, graph, 0));
+      CUDA_CHECK(cudaGraphDestroy(graph));
+      return GraphExec(exec);
+    };
+    entry.greedy = capture(false);
+    if (tp_) entry.sampled = capture(true);
+  }
+  if (tp_) tp_->full_logits = false;
+  for (int i = 0; i < options_.max_batch; ++i) reset_state(state_slot(i), stream_);
+}
+
+Buffers& Runtime::run_batch(std::span<const BatchInput> rows, bool full_logits) {
+  auto& entry = batch_widths_.at(int(rows.size()));
+  set_batch_inputs(rows);
+  if (tp_) tp_->full_logits = full_logits;
+  (tp_ && full_logits ? entry.sampled : entry.greedy).launch(stream_);
+  if (tp_) tp_->wait(stream_);
+  else CUDA_CHECK(cudaStreamSynchronize(stream_));
+  for (const auto& row : rows) ++state_slot(row.slot).length;
+  return entry.buffers;
 }
 
 Runtime::~Runtime() {
@@ -157,6 +256,7 @@ Runtime::~Runtime() {
   for (auto& [m, exec] : graphs_) cudaGraphExecDestroy(exec);
   graphs_.clear();
   for (auto& [m, exec] : sampled_graphs_) cudaGraphExecDestroy(exec);
+  batch_widths_.clear();
   decoder_.reset();
   for (cudaEvent_t e : chain_done_)
     if (e) cudaEventDestroy(e);

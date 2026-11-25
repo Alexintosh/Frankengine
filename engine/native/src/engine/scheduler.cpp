@@ -96,6 +96,7 @@ Scheduler::Scheduler(model::Generator& generator, std::vector<int32_t> stop_ids,
       stop_list_(std::move(stop_ids)),
       stop_ids_(stop_list_.begin(), stop_list_.end()),
       max_queue_(max_queue),
+      max_batch_(generator.max_batch()),
       thread_([this] { loop(); }) {}
 
 Scheduler::~Scheduler() { close(); }
@@ -103,7 +104,8 @@ Scheduler::~Scheduler() { close(); }
 bool Scheduler::submit(std::shared_ptr<Job> job) {
   {
     std::lock_guard lock(mutex_);
-    if (closed_ || int(waiting_.size()) + (active_ != nullptr) > max_queue_) return false;
+    const int active = max_batch_ == 1 ? int(active_ != nullptr) : int(slots_.size());
+    if (closed_ || int(waiting_.size()) + active >= max_queue_ + max_batch_) return false;
     waiting_.push_back(std::move(job));
   }
   cv_.notify_all();
@@ -119,7 +121,8 @@ void Scheduler::withdraw(const std::shared_ptr<Job>& job) {
 
 SchedulerStats Scheduler::stats() const {
   std::lock_guard lock(mutex_);
-  return {int(waiting_.size()), active_ != nullptr, max_queue_};
+  const int active = max_batch_ == 1 ? int(active_ != nullptr) : int(slots_.size());
+  return {int(waiting_.size()), active != 0, max_queue_, active, max_batch_};
 }
 
 void Scheduler::close() {
@@ -133,12 +136,17 @@ void Scheduler::close() {
     }
     waiting_.clear();
     if (active_) active_->cancel();
+    for (auto& slot : slots_) slot.job->cancel();
   }
   cv_.notify_all();
   if (thread_.joinable()) thread_.join();
 }
 
 void Scheduler::loop() {
+  if (max_batch_ > 1) {
+    batch_loop();
+    return;
+  }
   for (;;) {
     std::shared_ptr<Job> job;
     {
@@ -152,6 +160,127 @@ void Scheduler::loop() {
     job->finish();
     std::lock_guard lock(mutex_);
     active_ = nullptr;
+  }
+}
+
+void Scheduler::batch_loop() {
+  const auto emit = [&](ActiveSlot& slot, std::span<const int32_t> tokens) {
+    std::vector<int32_t> out;
+    const int limit = std::min(slot.job->max_new_tokens,
+                               generator_.max_model_len() - int(slot.job->prompt_ids.size()));
+    for (const int32_t token : tokens) {
+      if (slot.job->cancelled() || slot.done) break;
+      out.push_back(token);
+      slot.token = token;
+      slot.done = ++slot.emitted >= limit || stop_ids_.contains(token);
+    }
+    slot.job->push(out);
+  };
+  for (;;) {
+    {
+      std::unique_lock lock(mutex_);
+      cv_.wait(lock, [&] { return closed_ || !slots_.empty() || !waiting_.empty(); });
+      std::erase_if(slots_, [&](const auto& slot) {
+        if (!slot.done && !slot.job->cancelled()) return false;
+        try {
+          generator_.release_slot(slot.slot);
+        } catch (const std::exception& e) {
+          server_log().error("slot release failed: {}", e.what());
+        }
+        slot.job->finish();
+        return true;
+      });
+      if (closed_) return;
+      while (!waiting_.empty() && int(slots_.size()) < max_batch_) {
+        auto job = waiting_.front();
+        if (!job->images.empty() && !slots_.empty()) break;
+        waiting_.pop_front();
+        const bool idle = slots_.empty() && waiting_.empty();
+        int best = -1, prefix = -1;
+        for (int id = 0; id < max_batch_; ++id) {
+          if (std::any_of(slots_.begin(), slots_.end(), [&](const auto& s) { return s.slot == id; })) continue;
+          const int reuse = generator_.reusable_prefix(id, job->prompt_ids);
+          if (reuse > prefix) {
+            best = id;
+            prefix = reuse;
+          }
+        }
+        if (!job->images.empty()) best = 0;
+        auto& slot = slots_.emplace_back(ActiveSlot{job, best});
+        slot.sampling.params = job->sampling;
+        slot.sampling.seed = job->sampling.seed ? *job->sampling.seed
+            : (uint64_t(std::random_device{}()) << 32) ^ std::random_device{}();
+        slot.solo = !job->images.empty() || (idle && best == 0);
+        job->started();
+        if (!job->images.empty()) break;
+      }
+    }
+
+    if (slots_.empty()) continue;
+    auto& first = slots_.front();
+    if (first.solo) {
+      first.solo = false;
+      bool interrupted = false;
+      try {
+        const auto st = generator_.generate_interruptible(
+            {first.job->prompt_ids, first.job->images}, first.job->max_new_tokens, first.sampling, stop_list_,
+            [&](std::span<const int32_t> tokens) {
+              emit(first, tokens);
+              if (first.done || first.job->cancelled()) return false;
+              std::lock_guard lock(mutex_);
+              interrupted = !waiting_.empty() && first.job->images.empty() &&
+                            waiting_.front()->images.empty();
+              return !interrupted;
+            });
+        first.job->cached_tokens_.store(st.reused_tokens);
+        first.offset = st.interrupted_prefill_offset ? st.interrupted_prefill_offset : int(first.job->prompt_ids.size());
+        first.done = first.done || !interrupted;
+        server_log().info("{}: reuse={} reused={} spec_rounds={} drafter={} interrupted={}",
+                          first.job->id, model::to_string(st.reuse), st.reused_tokens, st.spec_rounds,
+                          st.used_dflash2 ? "dflash2" : "target/dspark", interrupted);
+      } catch (const std::exception& e) {
+        first.job->fail(e.what());
+        first.done = true;
+      }
+      continue;
+    }
+
+    std::vector<model::BatchSlotStep> rows;
+    std::vector<ActiveSlot*> decoding;
+    ActiveSlot* prefill = nullptr;
+    for (auto& slot : slots_) {
+      if (slot.job->cancelled()) continue;
+      if (slot.emitted) {
+        rows.push_back({slot.slot, slot.token, &slot.sampling});
+        decoding.push_back(&slot);
+      } else if (!prefill || slot.offset < prefill->offset) {
+        prefill = &slot;
+      }
+    }
+    if (prefill) {
+      auto& slot = *prefill;
+      try {
+        const auto result = generator_.prefill_slot_chunk(
+            slot.slot, slot.job->prompt_ids, slot.offset, slot.sampling);
+        if (!slot.offset) slot.job->cached_tokens_.store(result.reused_tokens);
+        slot.offset = result.offset;
+        if (result.token) emit(slot, std::span(&*result.token, 1));
+      } catch (const std::exception& e) {
+        slot.job->fail(e.what());
+        slot.done = true;
+      }
+    }
+    if (!rows.empty()) {
+      try {
+        const auto tokens = generator_.decode_batch_step(rows);
+        for (std::size_t i = 0; i < rows.size(); ++i) emit(*decoding[i], std::span(&tokens.at(i), 1));
+      } catch (const std::exception& e) {
+        for (auto* slot : decoding) {
+          slot->job->fail(e.what());
+          slot->done = true;
+        }
+      }
+    }
   }
 }
 

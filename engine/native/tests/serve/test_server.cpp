@@ -1,5 +1,6 @@
 // OpenAI-compatible server end to end against FakeGenerator (CPU only, real tokenizer/template): port of
 // engine/tests/test_server.py.
+#include "batch_generator.h"
 #include "engine/fake_generator.h"
 #include "serve/chat_server.h"
 #include "text/chat.h"
@@ -824,6 +825,46 @@ void test_images() {
   CHECK(chat(text_only->port(), Json::object()).status == 200);
 }
 
+void test_batch_stream_disconnect() {
+  BatchGenerator generator(100);
+  ingine::serve::ServerOptions options;
+  options.max_batch = 8;
+  options.max_queue = 32;
+  ChatServer server(generator, *g_fmt, options);
+  if (!server.bind("127.0.0.1", 0)) throw std::runtime_error("bind failed");
+  server.start();
+  std::vector<int> sockets;
+  for (int i = 0; i < 8; ++i) {
+    const int socket = raw_request(server.port(), {{"stream", true}, {"max_tokens", 96}});
+    timeval timeout{10, 0};
+    ::setsockopt(socket, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof timeout);
+    sockets.push_back(socket);
+  }
+  std::vector<std::string> responses(sockets.size());
+  wait_for([&] { return health(server.port())["active"] == 8; });
+  wait_for([&] { return generator.peak.load() == 8; });
+  for (std::size_t i = 0; i < sockets.size(); ++i) {
+    char buffer[4096];
+    const auto n = ::recv(sockets[i], buffer, sizeof buffer, 0);
+    CHECK(n > 0 && std::string_view(buffer, n).starts_with("HTTP/1.1 200"));
+    if (n > 0) responses[i].append(buffer, n);
+    if (i < 2) ::close(sockets[i]);
+  }
+  for (std::size_t i = 2; i < sockets.size(); ++i) {
+    auto& tail = responses[i];
+    char buffer[4096];
+    while (tail.find("data: [DONE]") == std::string::npos) {
+      const auto n = ::recv(sockets[i], buffer, sizeof buffer, 0);
+      if (n <= 0) break;
+      tail.append(buffer, n);
+    }
+    CHECK(tail.find("data: [DONE]") != std::string::npos);
+    ::close(sockets[i]);
+  }
+  wait_for([&] { return health(server.port())["active"] == 0; });
+  CHECK(generator.peak.load() == 8 && generator.released.load() == 8);
+}
+
 int main() {
   const char* env = std::getenv("INGINE_MODEL_DIR");
   const std::filesystem::path model_dir = env && *env ? env : INGINE_MODEL_DIR;
@@ -835,6 +876,7 @@ int main() {
   g_fmt = &fmt;
   const std::vector<std::pair<std::string, std::function<void()>>> tests = {
       {"models_and_health", test_models_and_health},
+      {"batch_stream_disconnect", test_batch_stream_disconnect},
       {"non_streaming", test_non_streaming},
       {"streaming_matches_non_streaming[False]", [] { test_streaming_matches_non_streaming(false); }},
       {"streaming_matches_non_streaming[True]", [] { test_streaming_matches_non_streaming(true); }},

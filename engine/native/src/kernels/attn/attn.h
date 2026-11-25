@@ -44,6 +44,18 @@ std::size_t workspace_bytes(int max_m, int hkv = 8);
 // How many clusters of the selected size fit on the GPU at once for the full-head kernel.
 int max_active_clusters(int M, int window);
 
+// Per-sequence state for one layer visit. The table lives on the device.
+struct BatchAttnSlot {
+  void* k_cache;
+  void* v_cache;
+  float* conv_k_state;
+  float* conv_v_state;
+  std::int64_t* kpos;
+  std::int64_t position;
+};
+
+void attn_decode_batch(const DecodeArgs& common, const BatchAttnSlot* slots, int batch, cudaStream_t stream);
+
 void attn_decode(const DecodeArgs& a, cudaStream_t stream);
 
 }  // namespace ingine::kernels::attn

@@ -79,6 +79,7 @@ struct DecodeTiming {
 
 struct GenerateStats {
   int prompt_tokens = 0, reused_tokens = 0, generated_tokens = 0;
+  int interrupted_prefill_offset = 0;
   bool used_dflash2 = false;
   Reuse reuse = Reuse::None;
   double prefill_seconds = 0, decode_seconds = 0;
@@ -121,6 +122,7 @@ struct TpOptions {
 TpOptions tp_options(std::optional<int> size = {}, std::optional<int> rank = {}, std::string wire = {});
 
 struct RuntimeOptions {
+  int max_batch = 1;
   std::filesystem::path model_dir, ablation;  // empty ablation: original model
   int max_ctx = 65536;
   // Tokens per prefill chunk. 3072 (the largest the sliding attention takes) reads a long prompt 6-10% faster
@@ -148,6 +150,23 @@ struct RuntimeOptions {
   bool head_nvfp4 = false;  // packed NVFP4 unembedding, independent of projection precision
 };
 
+struct BatchSampling {
+  Sampling params;
+  uint64_t seed = 0, counter = 0;
+};
+
+struct BatchSlotStep {
+  int slot;
+  int32_t token;
+  BatchSampling* sampling;
+};
+
+struct PrefillChunkResult {
+  int offset;
+  int reused_tokens;
+  std::optional<int32_t> token;
+};
+
 class Generator {
  public:
   virtual ~Generator() = default;
@@ -165,6 +184,22 @@ class Generator {
                                  const std::function<bool(std::span<const int32_t>)>& on_tokens) {
     if (!prompt.images.empty()) throw std::invalid_argument("this generator does not take images");
     return generate(prompt.ids, max_new_tokens, sampling, stop_ids, on_tokens);
+  }
+  virtual int max_batch() const { return 1; }
+  virtual int reusable_prefix(int, std::span<const int32_t>) const { return 0; }
+  virtual PrefillChunkResult prefill_slot_chunk(int, std::span<const int32_t>, int, BatchSampling&) {
+    throw std::logic_error("batch prefill unavailable");
+  }
+  virtual std::vector<int32_t> decode_batch_step(std::span<const BatchSlotStep>) {
+    throw std::logic_error("batch decode unavailable");
+  }
+  virtual void release_slot(int) {}
+  // The callback runs at every committed speculative emission boundary. Returning false leaves
+  // the last emitted token as the next decode input and transfers the request's sampler state.
+  virtual GenerateStats generate_interruptible(const Prompt& prompt, int limit, BatchSampling& sampling,
+                                               std::span<const int32_t> stops,
+                                               const std::function<bool(std::span<const int32_t>)>& emit) {
+    return generate(prompt, limit, sampling.params, stops, emit);
   }
   virtual bool supports_images() const { return false; }
 };

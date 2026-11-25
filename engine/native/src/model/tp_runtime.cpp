@@ -58,6 +58,10 @@ constexpr unsigned stage_event(VerifyStage stage, int occurrence, bool end) {
 }
 constexpr unsigned kEventCount = kStepEnd + 1 + kStageCount * kStageSlots * 2;
 constexpr std::size_t kVocabularyShard = UNPADDED_VOCAB / 2;
+
+int head_width(const RuntimeOptions& options) {
+  return std::max(options.max_batch, options.spec ? 8 : 1);
+}
 static_assert(sizeof(head::Candidate) == 8);
 
 std::uint64_t checkpoint_fingerprint(const RuntimeOptions& options) {
@@ -93,8 +97,10 @@ comm::CommPlan make_plan(const RuntimeOptions& options) {
   const std::uint64_t schedule = 0x4d34000000000000ull |
       (std::uint64_t(options.max_ctx) << 17) | (std::uint64_t(options.prefill_chunk) << 5) |
       (options.spec << 4) | (options.head_nvfp4 << 3) | (options.dense_fp8 << 2) | (options.kv_fp8 << 1) | options.tp.full_logits;
-  const std::uint64_t layout_hash = bf16 ? 0x200b : options.tp.wire == TpWire::Bf16Moe ? 0x200c : 0x200f;
-  return {std::max(bytes, kVocabularyShard * sizeof(float)), layout_hash, checkpoint_fingerprint(options),
+  const std::uint64_t wire_hash = bf16 ? 0x200b : options.tp.wire == TpWire::Bf16Moe ? 0x200c : 0x200f;
+  const std::uint64_t layout_hash = wire_hash | (std::uint64_t(options.max_batch - 1) << 16);
+  const auto gather_bytes = kVocabularyShard * sizeof(float) * options.max_batch;
+  return {std::max(bytes, gather_bytes), layout_hash, checkpoint_fingerprint(options),
           schedule | (std::uint64_t(options.draft_type != "dspark" &&
                     options.head_nvfp4 && !dflash2_full_head()) << 49) | (std::uint64_t(options.tp.serve) << 48) | (std::uint64_t(options.spec_widths) << 46)};
 }
@@ -131,12 +137,12 @@ struct TpRuntime::Impl {
 #ifdef INGINE_HAS_TP_COMM
   Impl(const RuntimeOptions& options)
       : backend(comm::make_comm_backend(make_plan(options), transport_options(options))),
-        logits(!options.head_nvfp4 || options.tp.full_logits || options.tp.serve ? kVocabularyShard * (options.spec ? 8 : 1) * sizeof(float) : 0),
-        local((options.spec ? 8 : 1) * sizeof(head::Candidate)),
+        logits(!options.head_nvfp4 || options.tp.full_logits || options.tp.serve ? kVocabularyShard * head_width(options) * sizeof(float) : 0),
+        local(head_width(options) * sizeof(head::Candidate)),
         candidates(2 * local.bytes),
-        index((options.spec ? 8 : 1) * sizeof(int32_t)),
+        index(head_width(options) * sizeof(int32_t)),
         head_scratch(options.head_nvfp4 && !options.tp.full_logits
-                         ? head::nvfp4_candidate_workspace(options.spec ? 8 : 1, int(kVocabularyShard)) : 0) {
+                         ? head::nvfp4_candidate_workspace(head_width(options), int(kVocabularyShard)) : 0) {
     CUDA_CHECK(cudaEventCreateWithFlags(&done, cudaEventDisableTiming));
     if (options.tp.profile) {
       events.resize(kEventCount);

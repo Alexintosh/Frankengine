@@ -1,9 +1,9 @@
-// The Generator (engine.Engine): one resident model, one request at a time. Prefill runs in chunks through
-// the Prefiller; plain decoding replays the width-1 graph per token, pipelined (each step's input token
-// stays on the device, the host launches the next step before it reads the current token); with
-// options.spec the speculative loop (SpecLoop) drafts with DSpark and verifies with the width-2/4/8 graphs.
-// A prompt that extends the tokens already in the state only prefills the new suffix; any other prompt
-// starts from an empty state.
+// The resident model supports full turns and step-level continuous batching.
+// In a full turn, Prefiller advances the prompt, then plain decode pipelines
+// width-one steps or SpecLoop verifies draft proposals.
+// Batched serving keeps a committed history for each slot and advances rows
+// whose next input token is ready. The solo path remains available on slot 0
+// and can hand its state back to the scheduler at a safe boundary.
 #include "ingine/generator.h"
 
 #include "core/arena.h"
@@ -151,6 +151,14 @@ class EngineGenerator final : public Generator {
   GenerateStats generate(const Prompt& full_prompt, int max_new_tokens, const Sampling& sampling,
                          std::span<const std::int32_t> stop_ids,
                          const std::function<bool(std::span<const std::int32_t>)>& on_tokens) override {
+    return generate_impl(full_prompt, max_new_tokens, sampling, stop_ids, on_tokens, nullptr);
+  }
+
+ private:
+  GenerateStats generate_impl(const Prompt& full_prompt, int max_new_tokens, const Sampling& sampling,
+                              std::span<const int32_t> stop_ids,
+                              const std::function<bool(std::span<const int32_t>)>& on_tokens,
+                              uint64_t* counter) {
     const std::span<const std::int32_t> prompt = full_prompt.ids;
     if (prompt.empty()) throw std::invalid_argument("prompt is empty");
     if (options_.draft_type == "dflash2" && sampling.temperature > 0 && sampling.forced.empty())
@@ -200,7 +208,8 @@ class EngineGenerator final : public Generator {
         checkpoint_ids_.clear();
       }
       previous_flash_ = flash;
-      prefill(prompt, full_prompt.images, stats, request, flash);
+      prefill(prompt, full_prompt.images, stats, request, flash, counter ? &on_tokens : nullptr);
+      if (stats.interrupted_prefill_offset) return stats;
       stats.prompt_tokens = n;
       stats.image_tokens = image_tokens;
       if (spec) {
@@ -232,8 +241,110 @@ class EngineGenerator final : public Generator {
       forget_state();
       throw;
     }
+    if (counter) *counter = rng.counter;
     stats.decode_seconds = seconds_since(t);
     return stats;
+  }
+
+ public:
+  int max_batch() const override { return options_.max_batch; }
+
+  int reusable_prefix(int slot, std::span<const int32_t> prompt) const override {
+    if (options_.cold_prefill) return 0;
+    const auto& history = slot_history(slot);
+    // Precompute the final token's head even when a previous turn used a different head mode.
+    return !history.empty() && history.size() < prompt.size() &&
+                   std::equal(history.begin(), history.end(), prompt.begin())
+               ? int(history.size()) : 0;
+  }
+
+  PrefillChunkResult prefill_slot_chunk(int slot, std::span<const int32_t> prompt, int offset,
+                                       BatchSampling& sampling) override {
+    if (prompt.empty() || prompt.size() >= std::size_t(options_.max_ctx) ||
+        std::any_of(prompt.begin(), prompt.end(), [](int32_t token) {
+          return token < 0 || token >= UNPADDED_VOCAB;
+        }))
+      throw std::invalid_argument("invalid batch prompt");
+    auto& state = rt_.state_slot(slot);
+    auto& history = slot_history(slot);
+    const auto stream = rt_.stream();
+    int reused = 0;
+    if (offset == 0) {
+      reused = reusable_prefix(slot, prompt);
+      if (rt_.tp() && !rt_.tp()->agree(reused, stream)) reused = 0;
+      if (slot == 0) {
+        park_live();
+        checkpoint_ids_.clear();
+        previous_flash_ = false;
+        if (drafter_) drafter_->reset();
+      }
+      offset = reused;
+      if (!offset) {
+        reset_state(state, stream);
+        history.clear();
+      }
+    }
+    const int count = std::min({2048, options_.prefill_chunk, int(prompt.size()) - offset});
+    const bool final = offset + count == int(prompt.size());
+    const bool sampled = sampling.params.temperature > 0;
+    auto* tp = rt_.tp();
+    if (tp) tp->full_logits = sampled;
+    CUDA_CHECK(cudaMemcpyAsync(chunk_tokens_.p, prompt.data() + offset, count * sizeof(int32_t),
+                               cudaMemcpyHostToDevice, stream));
+    prefiller_.run(state, static_cast<const int32_t*>(chunk_tokens_.p), count, offset,
+                   !tp || (sampled && options_.tp.rank == 0) ? static_cast<float*>(logits_.p) : nullptr,
+                   nullptr, {}, tp && !sampled ? static_cast<int32_t*>(logits_.p) : nullptr, final);
+    if (tp) tp->wait(stream);
+    else CUDA_CHECK(cudaStreamSynchronize(stream));
+    history.insert(history.end(), prompt.begin() + offset, prompt.begin() + offset + count);
+    state.length = offset + count;
+    PrefillChunkResult result{state.length, reused, std::nullopt};
+    if (final && options_.tp.rank == 0)
+      result.token = batch_token(logits_.p, tp && !sampled, sampling);
+    return result;
+  }
+
+  std::vector<int32_t> decode_batch_step(std::span<const BatchSlotStep> slots) override {
+    std::vector<Runtime::BatchInput> rows;
+    bool sampled = false;
+    for (const auto& slot : slots) {
+      rt_.state_slot(slot.slot).length = int(slot_history(slot.slot).size());
+      rows.push_back({slot.slot, slot.token});
+      sampled |= slot.sampling->params.temperature > 0;
+    }
+    if (rows.size() == 1 && rows.front().slot == 0) {
+      if (rt_.tp()) rt_.tp()->full_logits = sampled;
+      const int32_t input = rows.front().token;
+      rt_.set_inputs(std::span(&input, 1), int(tokens_in_state_.size()));
+      const float* logits = rt_.run_step(1);
+      tokens_in_state_.push_back(input);
+      if (rt_.tp()) rt_.tp()->wait(rt_.stream());
+      if (options_.tp.rank != 0) return {};
+      const bool greedy = rt_.tp() && !sampled;
+      const void* output = greedy ? rt_.buffers(1).greedy.data : logits;
+      return {batch_token(output, greedy, *slots.front().sampling)};
+    }
+    auto& buffers = rt_.run_batch(rows, sampled);
+    std::vector<int32_t> tokens;
+    const bool greedy_head = rt_.tp() && !sampled;
+    for (std::size_t i = 0; i < slots.size(); ++i) {
+      slot_history(slots[i].slot).push_back(slots[i].token);
+      if (options_.tp.rank == 0) {
+        const void* output = greedy_head
+            ? static_cast<const void*>(ptr<int32_t>(buffers.greedy) + i)
+            : static_cast<const void*>(ptr<float>(buffers.logits) + i * UNPADDED_VOCAB);
+        tokens.push_back(batch_token(output, greedy_head, *slots[i].sampling));
+      }
+    }
+    return tokens;
+  }
+
+  GenerateStats generate_interruptible(const Prompt& prompt, int limit, BatchSampling& sampling,
+                                       std::span<const int32_t> stops,
+                                       const std::function<bool(std::span<const int32_t>)>& emit) override {
+    auto params = sampling.params;
+    params.seed = sampling.seed;
+    return generate_impl(prompt, limit, params, stops, emit, &sampling.counter);
   }
 
   ~EngineGenerator() override {
@@ -377,7 +488,10 @@ class EngineGenerator final : public Generator {
       const std::int32_t out[1] = {token};
       const bool go_on = on_tokens(out);
       if (last || is_stop(token) || !go_on) {
-        if (!last) rt_.chain_undo(n + i);
+        if (!last) {
+          rt_.chain_undo(n + i);
+          if (sampling.temperature > 0) --rng.counter;
+        }
         break;
       }
       tokens_in_state_.push_back(token);
@@ -403,7 +517,8 @@ class EngineGenerator final : public Generator {
   // (images inside the reused prefix are not encoded again), and the Prefiller writes its rows over the
   // embeddings of its tokens; an image may span chunks.
   void prefill(std::span<const std::int32_t> ids, std::span<const PromptImage> images, GenerateStats& stats,
-               std::uint64_t request, bool flash) {
+               std::uint64_t request, bool flash,
+               const std::function<bool(std::span<const int32_t>)>* proceed = nullptr) {
     const bool cold = options_.cold_prefill || flash;
     const std::vector<std::int32_t>& prev = tokens_in_state_;
     const std::size_t n = ids.size();
@@ -455,7 +570,7 @@ class EngineGenerator final : public Generator {
       rt_.tp()->verify_request((request ^ start) * 1099511628211ull, stream);
     }
     st.length = int(start);  // decode steps advance the state without its host-side length
-    const std::size_t chunk = std::size_t(options_.prefill_chunk);
+    const std::size_t chunk = std::size_t(proceed ? std::min(2048, options_.prefill_chunk) : options_.prefill_chunk);
     struct Encoded {
       const PromptImage* image;
       DeviceBuffer rows;  // bf16 [>= tokens, HIDDEN]
@@ -496,12 +611,26 @@ class EngineGenerator final : public Generator {
       if (flash ? bool(dflash2_) : bool(drafter_)) taps = rm(taps_.p, DType::BF16, {T, NUM_TAPS, HIDDEN});
       prefiller_.run(st, static_cast<const int32_t*>(chunk_tokens_.p), T, int(s),
                      rt_.tp() && (!rt_.tp()->full_logits || options_.tp.rank != 0) ? nullptr : static_cast<float*>(logits_.p), (flash ? bool(dflash2_) : bool(drafter_)) ? &taps : nullptr, rows,
-                     rt_.tp() && !rt_.tp()->full_logits ? static_cast<int32_t*>(logits_.p) : nullptr, !rt_.tp() || s + T == n);
+                     rt_.tp() && !rt_.tp()->full_logits ? static_cast<int32_t*>(logits_.p) : nullptr, (!proceed && !rt_.tp()) || s + T == n);
       if (!flash && drafter_) {
         drafter_->note_tokens(ids.subspan(s, std::size_t(T)));  // the prompt's tokens join the drafter's shortlist
         drafter_->commit(taps, int(s));
       }
       if (flash && dflash2_) dflash2_->commit(ptr<const __nv_bfloat16>(taps), T, int(s));
+      if (proceed && s + T < n && images.empty()) {
+        const bool go_on = (*proceed)({});
+        const bool agreed = !rt_.tp() || rt_.tp()->agree(go_on, stream);
+        if (!agreed || !go_on) {
+          CUDA_CHECK(cudaStreamSynchronize(stream));
+          tokens_in_state_.assign(ids.begin(), ids.begin() + s + T);
+          if (!cold) park_live();
+          checkpoint_ids_.clear();
+          previous_flash_ = false;
+          stats.reused_tokens = int(start);
+          stats.interrupted_prefill_offset = int(s + T);
+          return;
+        }
+      }
     }
     if (!encoded.empty()) CUDA_CHECK(cudaStreamSynchronize(stream));  // queued chunks read the rows freed here
     tokens_in_state_.assign(ids.begin(), ids.end());
@@ -675,6 +804,27 @@ class EngineGenerator final : public Generator {
     return *static_cast<const std::int32_t*>(host_token_.data());
   }
 
+  const std::vector<int32_t>& slot_history(int slot) const {
+    return slot ? batch_histories_.at(slot - 1) : tokens_in_state_;
+  }
+
+  std::vector<int32_t>& slot_history(int slot) {
+    return slot ? batch_histories_.at(slot - 1) : tokens_in_state_;
+  }
+
+  int32_t batch_token(const void* output, bool greedy_head, BatchSampling& sampling) {
+    if (greedy_head) {
+      int32_t token;
+      CUDA_CHECK(cudaMemcpy(&token, output, sizeof(token), cudaMemcpyDeviceToHost));
+      return token;
+    }
+    head::SamplerRng rng{sampling.seed, sampling.counter};
+    const int32_t token = sample(static_cast<const float*>(output), sampling.params, rng);
+    sampling.counter = rng.counter;
+    return token;
+  }
+
+  std::array<std::vector<int32_t>, 7> batch_histories_;
   RuntimeOptions options_;
   std::unique_ptr<Runtime> runtime_;
   Runtime& rt_;

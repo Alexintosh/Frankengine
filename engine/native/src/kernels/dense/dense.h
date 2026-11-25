@@ -41,6 +41,11 @@ enum class ConvKind { Attention, Mlp };
 
 // Convolve the reduced [M, H]. Supply exactly one input; FP32 is rounded to BF16 before convolution.
 // State and optional history are FP32 arrays of BF16-rounded inputs, as in the fused kernels.
+// One independent lag state per row, addressed through a device pointer table.
+void conv_residual_epilogue_batch(const float* x, const __nv_bfloat16* x_bf16, int batch, ConvKind kind,
+                                  const float* conv_w, float* const* states, float* out,
+                                  bool pdl, cudaStream_t stream);
+
 void conv_residual_epilogue(const float* x, const __nv_bfloat16* x_bf16, int M, ConvKind kind,
                             const float* conv_w, float* conv_state, float* out, float* conv_hist,
                             bool pdl, cudaStream_t stream);

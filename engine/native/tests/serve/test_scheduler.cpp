@@ -2,6 +2,7 @@
 // the scheduler must cut a batch at a stop id, at max_new_tokens and on cancellation, run jobs in FIFO order,
 // bound the waiting list and report generator failures.
 #include "engine/scheduler.h"
+#include "batch_generator.h"
 
 #include <atomic>
 #include <chrono>
@@ -117,9 +118,29 @@ void test_failure_and_close() {
   CHECK(!s.submit(std::make_shared<Job>(std::vector<int32_t>{3}, 1, Sampling{})));
 }
 
+void test_batch_capacity_and_cancel() {
+  BatchGenerator gen(100);
+  Scheduler scheduler(gen, {}, 32);
+  std::vector<std::shared_ptr<Job>> jobs;
+  for (int i = 0; i < 40; ++i) {
+    jobs.push_back(std::make_shared<Job>(std::vector<int32_t>(i ? 1 : 4100, i + 1), 48, Sampling{}));
+    CHECK(scheduler.submit(jobs.back()));
+  }
+  CHECK(!scheduler.submit(std::make_shared<Job>(std::vector<int32_t>{41}, 48, Sampling{})));
+  const auto first = jobs[1]->take(std::chrono::seconds(5));
+  CHECK(!first.tokens.empty() && !first.end);
+  scheduler.withdraw(jobs[1]);
+  CHECK(drain(*jobs[1]).size() + first.tokens.size() < 48);
+  for (auto& job : jobs) {
+    if (job != jobs[1]) CHECK(drain(*job) == std::vector<int32_t>(48, 100));
+  }
+  CHECK(gen.peak.load() == 8 && gen.released.load() == 40);
+}
+
 }  // namespace
 
 int main() {
+  test_batch_capacity_and_cancel();
   test_cuts();
   test_cancel_fifo_bound();
   test_failure_and_close();

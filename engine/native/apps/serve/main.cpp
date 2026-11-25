@@ -70,7 +70,7 @@ ingine::model::Sampling generation_defaults(const std::filesystem::path& model_d
 
 int main(int argc, char** argv) {
   std::string model_dir, host = "127.0.0.1", ablation, backend = "fast", model_id, log_level = "INFO";
-  int port = 8003, max_ctx = 65536, max_queue = 4, max_model_len = 0, park_mb = -1;
+  int port = 8003, max_ctx = 65536, max_queue = 4, max_batch = 1, max_model_len = 0, park_mb = -1;
   bool engine = false, fake = false, dense_fp8 = false, kv_fp8 = false, spec = false, no_vision = false;
   int image_max_tokens = 4096, max_images = 16, max_image_tokens = 32768;
   bool draft_nvfp4 = false, head_nvfp4 = false;
@@ -123,6 +123,7 @@ int main(int argc, char** argv) {
   ap.option("--max-image-tokens", "", "image tokens accepted in one request", &max_image_tokens);
   ap.option("--fake-delay", "", "seconds per fake token", &fake_delay);
   ap.option("--model-id", "", "model name reported by the API (default: generator.model_id)", &model_id);
+  ap.option("--max-batch", "", "maximum active requests (1..8)", &max_batch);
   ap.option("--max-queue", "", "requests allowed to wait behind the running one", &max_queue);
   ap.option("--max-model-len", "",
             "context limit (default: generator.max_model_len or tokenizer model_max_length)", &max_model_len);
@@ -139,6 +140,10 @@ int main(int argc, char** argv) {
             &tp_wire, {"fp32", "bf16", "bf16-moe"});
   ap.flag("--tp-profile", "Time TP collectives and speculative decisions", &tp_profile);
   ap.parse(argc, argv);
+  if (max_batch < 1 || max_batch > 8 || (fake && max_batch != 1)) {
+    std::cerr << "ingine-serve: --max-batch must be in [1, 8] and requires the model backend above 1\n";
+    return 2;
+  }
   if (image_max_tokens < 1 || image_max_tokens > ingine::image::MAX_TOKENS || max_images < 0 || max_image_tokens < 0) {
     std::cerr << "ingine-serve: error: --image-max-tokens must be in [1, " << ingine::image::MAX_TOKENS
               << "] and --max-images, --max-image-tokens at least 0\n";
@@ -170,6 +175,7 @@ int main(int argc, char** argv) {
       options.model_dir = model_dir;
       options.ablation = ablation;
       options.max_ctx = max_ctx;
+      options.max_batch = max_batch;
       options.dense_fp8 = dense_fp8;
       options.kv_fp8 = kv_fp8;
       options.spec = spec;
@@ -221,6 +227,7 @@ int main(int argc, char** argv) {
     const auto& fmt = *format;
     ingine::serve::ServerOptions server_options;
     server_options.max_queue = max_queue;
+    server_options.max_batch = max_batch;
     server_options.max_model_len = max_model_len;
     server_options.model_id = model_id;
     server_options.sampling = generation_defaults(model_dir);

@@ -22,6 +22,7 @@
 #include "model/model_kernels.h"
 
 #include "core/host_memory.h"
+#include "kernels/attn/attn.h"
 
 #include "ingine/generator.h"
 
@@ -54,6 +55,15 @@ Buffers make_buffers(int m, const TpLayout& tp = TpLayout{}, bool full_logits = 
 // model.State.reset: ring_pos = -1, conv states = 0, length = 0 (caches keep their contents).
 void reset_state(State& state, cudaStream_t stream);
 
+// Device table indexed by visit, then by compact batch row. Slots may move
+// between rows on successive graph launches.
+struct BatchSlotTable {
+  std::int64_t tokens[8];
+  kernels::attn::BatchAttnSlot attn[NUM_VISITS][8];
+  float* attn_conv[NUM_VISITS][8];
+  float* mlp_conv[NUM_VISITS][8];
+};
+
 // ---- fast.FastDecoder
 class Decoder {
  public:
@@ -69,7 +79,12 @@ class Decoder {
   void decode(Buffers& b, const std::int64_t* pos, bool history, cudaStream_t stream,
               TpReduction reduction = TpReduction::Reconstruct);
 
+  void decode_batch(Buffers& b, const BatchSlotTable* slots, cudaStream_t stream);
+  void allocate_batch_workspace(int max_batch);
+
  private:
+  void decode_impl(Buffers& b, const std::int64_t* pos, bool history, cudaStream_t stream,
+                   TpReduction reduction, const BatchSlotTable* slots);
   const std::int64_t* block_table(const std::vector<const float*>& blocks);
 
   const Weights& w_;
@@ -79,6 +94,7 @@ class Decoder {
   TpSimulation* simulation_;
   TpRuntime* tp_;
   DeviceBuffer down_workspace_;  // sharded GB10 speculative W2 expert dots
+  DeviceBuffer batch_attn_ws_;
   DeviceBuffer attn_ws_;  // attn workspace for up to 8 rows (zeroed once)
   std::map<std::vector<const float*>, DeviceBuffer> tables_;  // device pointer tables for mix
   std::array<DeviceBuffer, 2> segments_;  // proj segment tables: [single-input sliding, three-input]
@@ -121,6 +137,14 @@ class Runtime {
   const Ablation& ablation() const { return ablation_; }
   State& state() { return state_; }
   const State& state() const { return state_; }
+
+  struct BatchInput {
+    int slot;
+    std::int32_t token;
+  };
+  State& state_slot(int slot);
+  // Advances each participating slot by one token. Outputs are in compact row order.
+  Buffers& run_batch(std::span<const BatchInput> rows, bool full_logits);
 
   // Call widths available: width 1 and the configured speculative widths.
   bool has_width(int m) const;
@@ -195,6 +219,8 @@ class Runtime {
  private:
   void init();
   void capture(int m, bool history);
+  void init_batch(const TpLayout& layout);
+  void set_batch_inputs(std::span<const BatchInput> rows);
   StatePtrs state_ptrs() const;
 
   RuntimeOptions options_;
@@ -205,6 +231,15 @@ class Runtime {
   std::unique_ptr<TpRuntime> tp_;
   std::unique_ptr<Decoder> decoder_;
   DeviceBuffer pos_, token_;
+  struct BatchWidth {
+    Buffers buffers;
+    GraphExec greedy;
+    GraphExec sampled;
+  };
+  std::vector<State> extra_slots_;
+  DeviceBuffer batch_table_;
+  MappedHostBuffer host_batch_table_;
+  std::map<int, BatchWidth> batch_widths_;
   std::map<int, Buffers> buffers_;
   std::map<int, bool> history_;
   std::map<int, cudaGraphExec_t> graphs_, sampled_graphs_;

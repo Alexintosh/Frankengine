@@ -4,6 +4,8 @@ ingine_add_test(NAME model_layer SOURCES test_layer.cpp LIBS ingine_model GPU MO
 # the decode runtime (graphs, verify widths, rollback, pipelined steps, device-selected verify) and the Generator's
 # stop/cancel/budget exactness on a synthetic model (< 2 GB of GPU memory)
 ingine_add_test(NAME model_runtime SOURCES test_runtime.cpp LIBS ingine_model GPU TIMEOUT 600)
+add_test(NAME model_runtime_batch COMMAND model_runtime --batch)
+set_tests_properties(model_runtime_batch PROPERTIES LABELS gpu RESOURCE_LOCK gpu SKIP_RETURN_CODE 77 TIMEOUT 120)
 # prompt checkpoints with speculative decoding on the full model (~22 GB of GPU memory)
 ingine_add_test(NAME model_reuse SOURCES test_reuse.cpp LIBS ingine_model GPU MODEL TIMEOUT 900)
 # full-model parity against the Python engine's goldens (tools/goldens_model.py); ~20 GB of GPU memory

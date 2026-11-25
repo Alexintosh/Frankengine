@@ -22,6 +22,7 @@
 namespace ingine::serve {
 
 struct ServerOptions {
+  int max_batch = 1;
   int max_queue = 4;      // requests allowed to wait behind the running one
   int max_model_len = 0;  // context limit; 0: generator.max_model_len()
   std::string model_id;   // model name reported by the API; empty: generator.model_id()

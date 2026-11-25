@@ -127,6 +127,46 @@ class TpGenerator final : public model::Generator {
     socket_->send_frame(request.dump());
     return inner_->generate(prompt, max_new_tokens, sample, stops, emit);
   }
+  int max_batch() const override { return inner_->max_batch(); }
+  int reusable_prefix(int slot, std::span<const int32_t> prompt) const override {
+    return inner_->reusable_prefix(slot, prompt);
+  }
+
+  model::PrefillChunkResult prefill_slot_chunk(int slot, std::span<const int32_t> prompt, int offset,
+                                              model::BatchSampling& sampling) override {
+    socket_->send_frame(nlohmann::json{
+        {"op", "prefill"}, {"slot", slot}, {"offset", offset},
+        {"prompt", std::vector<int32_t>(prompt.begin(), prompt.end())},
+        {"temperature", sampling.params.temperature}}.dump());
+    return inner_->prefill_slot_chunk(slot, prompt, offset, sampling);
+  }
+
+  std::vector<int32_t> decode_batch_step(std::span<const model::BatchSlotStep> rows) override {
+    auto packed = nlohmann::json::array();
+    for (const auto& row : rows)
+      packed.push_back({row.slot, row.token, row.sampling->params.temperature});
+    socket_->send_frame(nlohmann::json{{"op", "decode"}, {"rows", packed}}.dump());
+    return inner_->decode_batch_step(rows);
+  }
+
+  void release_slot(int slot) override {
+    socket_->send_frame(nlohmann::json{{"op", "release"}, {"slot", slot}}.dump());
+    inner_->release_slot(slot);
+  }
+
+  model::GenerateStats generate_interruptible(
+      const model::Prompt& prompt, int limit, model::BatchSampling& sampling,
+      std::span<const int32_t> stops,
+      const std::function<bool(std::span<const int32_t>)>& emit) override {
+    const auto& sample = sampling.params;
+    socket_->send_frame(nlohmann::json{
+        {"op", "solo"}, {"prompt", std::vector<int32_t>(prompt.ids.begin(), prompt.ids.end())},
+        {"limit", limit}, {"temperature", sample.temperature}, {"top_p", sample.top_p},
+        {"top_k", sample.top_k}, {"seed", sampling.seed},
+        {"stops", std::vector<int32_t>(stops.begin(), stops.end())}}.dump());
+    return inner_->generate_interruptible(prompt, limit, sampling, stops, emit);
+  }
+
  private:
   std::unique_ptr<model::Generator> inner_;
   std::unique_ptr<TpControl> socket_;
@@ -137,6 +177,35 @@ inline void run_tp_worker(model::Generator& generator, TpControl& socket) {
     const auto body = socket.receive_frame();
     if (body.empty()) return;
     const auto request = nlohmann::json::parse(body);
+    const auto op = request.value("op", "");
+    if (op == "release") {
+      generator.release_slot(request.at("slot").get<int>());
+      continue;
+    }
+    if (op == "decode") {
+      const auto& packed = request.at("rows");
+      std::vector<model::BatchSampling> samples(packed.size());
+      std::vector<model::BatchSlotStep> rows;
+      for (std::size_t i = 0; i < packed.size(); ++i) {
+        const auto& row = packed.at(i);
+        samples[i].params.temperature = row.at(2).get<float>();
+        rows.push_back({row.at(0).get<int>(), row.at(1).get<int32_t>(), &samples[i]});
+      }
+      generator.decode_batch_step(rows);
+      continue;
+    }
+    if (op == "prefill") {
+      model::BatchSampling sample;
+      sample.params.temperature = request.at("temperature").get<float>();
+      try {
+        generator.prefill_slot_chunk(request.at("slot").get<int>(),
+                                     request.at("prompt").get<std::vector<int32_t>>(),
+                                     request.at("offset").get<int>(), sample);
+      } catch (const std::invalid_argument&) {
+        // Rank 0 rejects the same invalid prompt before entering a collective.
+      }
+      continue;
+    }
     const auto prompt = request.at("prompt").get<std::vector<int32_t>>();
     const auto stops = request.at("stops").get<std::vector<int32_t>>();
     model::Sampling sampling;
@@ -145,7 +214,13 @@ inline void run_tp_worker(model::Generator& generator, TpControl& socket) {
     sampling.top_k = request.at("top_k").get<int>();
     if (request.contains("seed")) sampling.seed = request.at("seed").get<uint64_t>();
     try {
-      generator.generate(prompt, request.at("limit").get<int>(), sampling, stops, [](auto) { return true; });
+      const int limit = request.at("limit").get<int>();
+      if (op == "solo") {
+        model::BatchSampling state{sampling, *sampling.seed};
+        generator.generate_interruptible({prompt, {}}, limit, state, stops, [](auto) { return true; });
+      } else {
+        generator.generate(prompt, limit, sampling, stops, [](auto) { return true; });
+      }
     } catch (const std::invalid_argument&) {
       // Both generators apply the same context-limit checks before entering collectives.
     }

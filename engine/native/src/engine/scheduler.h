@@ -1,8 +1,8 @@
-// Request scheduler (mirror of engine/ingine/server.py Scheduler/Job): one worker thread runs jobs strictly one at
-// a time in FIFO order from a bounded waiting list. The worker only pulls token ids from Generator::generate and
-// pushes them to the job's output; detokenisation, parsing and HTTP writes happen on the request thread, so the
-// decode loop never waits on the client. Cancellation (client gone, stop string, shutdown) is checked between
-// the tokens the generator emits.
+// A bounded HTTP request scheduler. A single worker owns the model and can
+// interleave prefill and decode across independent request slots.
+// Client threads drain per-job token queues and handle formatting and HTTP writes.
+// The model worker never waits on a client. Cancellation is observed at generation
+// boundaries, after which other jobs can use the slot.
 #pragma once
 
 #include "ingine/generator.h"
@@ -73,6 +73,8 @@ struct SchedulerStats {
   int waiting = 0;
   bool running = false;
   int max_queue = 0;
+  int active = 0;
+  int max_batch = 1;
 };
 
 class Scheduler {
@@ -82,7 +84,7 @@ class Scheduler {
   Scheduler(const Scheduler&) = delete;
   Scheduler& operator=(const Scheduler&) = delete;
 
-  // False when closed or when max_queue jobs already wait (the running one counts as in server.py).
+  // False when closed or when the active and waiting capacity is exhausted.
   bool submit(std::shared_ptr<Job> job);
   // Cancels the job and drops it from the waiting list if it has not started.
   void withdraw(const std::shared_ptr<Job>& job);
@@ -93,15 +95,27 @@ class Scheduler {
  private:
   void loop();
   void run(Job& job);
+  void batch_loop();
+
+  struct ActiveSlot {
+    std::shared_ptr<Job> job;
+    int slot;
+    int offset = 0, emitted = 0;
+    int32_t token = 0;
+    model::BatchSampling sampling;
+    bool solo = false, done = false;
+  };
 
   model::Generator& generator_;
   const std::vector<int32_t> stop_list_;
   const std::unordered_set<int32_t> stop_ids_;
   const int max_queue_;
+  const int max_batch_;
   mutable std::mutex mutex_;
   std::condition_variable cv_;
   std::deque<std::shared_ptr<Job>> waiting_;
   std::shared_ptr<Job> active_;
+  std::vector<ActiveSlot> slots_;
   bool closed_ = false;
   std::thread thread_;
 };

@@ -66,6 +66,7 @@ struct Args {
   bool draft_nvfp4 = false;
   std::string spec_widths = "coarse";
   int generate_tokens = 0;
+  int max_batch = 1;
   fs::path generate_trace, greedy_witness, logits_dump;
   float spec_threshold = 0.8f;
   bool spec = false;  // --generate / --path with DSpark speculative decoding
@@ -80,7 +81,7 @@ struct Args {
 void usage() {
   std::printf(
       "usage: ingine-validate [--model-dir DIR] [--ablation FILE] [--golden DIR] [--cases SUBSTR] [--generate [--spec] [--generate-tokens N] [--generate-trace FILE]]\n"
-      "                       [--spec-widths coarse|fine|fine2] [--draft-nvfp4] [--path N [--spec] [--tie-margin X] [--max-gap-rate R]] [--max-kl X] [--max-mean-kl X]\n"
+      "                       [--max-batch 1..8] [--spec-widths coarse|fine|fine2] [--draft-nvfp4] [--path N [--spec] [--tie-margin X] [--max-gap-rate R]] [--max-kl X] [--max-mean-kl X]\n"
       "                       [--greedy-witness FILE] [--spec-threshold P]\n"
       "                       [--min-top1 F] [--dense-fp8] [--head-nvfp4] [--tp-size N] [--tp-rank N] [--tp-wire bf16|fp32|bf16-moe]\n"
       "--cases takes comma-separated name substrings; --ablation defaults to <golden>/ablation.safetensors, the\n"
@@ -199,6 +200,8 @@ void run_generate(const RuntimeOptions& opt, const std::vector<nlohmann::json>& 
   for (const auto& c : cases) {
     auto gen_options = opt;
     if (gen_options.tp.size == 2) gen_options.cold_prefill = true;
+    gen_options.max_batch = a.max_batch;
+    if (a.max_batch > 1 && gen_options.tp.size == 2) gen_options.tp.serve = true;
     auto gen = make_generator(gen_options);
     const std::string name = c.at("name");
     const std::vector<std::int32_t> ids = c.at("prompt_ids").get<std::vector<std::int32_t>>();
@@ -408,6 +411,7 @@ int main(int argc, char** argv) {
     else if (k == "--dense-fp8") a.dense_fp8 = true;
     else if (k == "--head-nvfp4") a.head_nvfp4 = true;
     else if (k == "--path") a.path_tokens = std::stoi(val());
+    else if (k == "--max-batch") a.max_batch = std::stoi(val());
     else if (k == "--tie-margin") a.tie_margin = std::stod(val());
     else if (k == "--max-gap-rate") a.max_gap_rate = std::stod(val());
     else if (k == "--max-kl") a.max_kl = std::stod(val());
@@ -420,6 +424,8 @@ int main(int argc, char** argv) {
   }
   if (a.ablation.empty()) a.ablation = a.golden / "ablation.safetensors";
   try {
+    if (a.max_batch < 1 || a.max_batch > 8 || (a.max_batch > 1 && !a.generate))
+      throw std::invalid_argument("--max-batch must be in [1, 8] and requires --generate above 1");
     auto tp = tp_options(a.tp_size, a.tp_rank, a.tp_wire);
     if (tp.size == 2 && a.path_tokens > 0)
       throw std::invalid_argument("TP=2 validation supports logits and greedy --generate");

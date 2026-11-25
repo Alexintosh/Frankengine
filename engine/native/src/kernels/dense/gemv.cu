@@ -163,6 +163,23 @@ __global__ void conv_epilogue_kernel(const float* x, const __nv_bfloat16* x_bf16
   state[2 * H + c] = d;
 }
 
+template <bool Mlp, bool BF16>
+__global__ void conv_epilogue_batch_kernel(const float* x, const __nv_bfloat16* x_bf16,
+                                          const float* conv_w, float* const* states, float* out) {
+  const int c = blockIdx.x * blockDim.x + threadIdx.x;
+  const float4 cw = __ldg(reinterpret_cast<const float4*>(conv_w) + c);
+  asm volatile("griddepcontrol.wait;" ::: "memory");
+  asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+  float* state = states[blockIdx.y];
+  const int i = blockIdx.y * H + c;
+  const float cur = BF16 ? __bfloat162float(x_bf16[i]) : round_bf16(x[i]);
+  const float ext[4] = {state[c], state[H + c], state[2 * H + c], cur};
+  out[i] = residual_conv<Mlp>(cw, ext);
+  state[c] = ext[1];
+  state[H + c] = ext[2];
+  state[2 * H + c] = ext[3];
+}
+
 template <int M>
 struct ConvEpi {
   static constexpr int kInputs = 1;
@@ -539,6 +556,17 @@ void conv_residual_epilogue(const float* x, const __nv_bfloat16* x_bf16, int M, 
       ? (x ? conv_epilogue_kernel<true, false> : conv_epilogue_kernel<true, true>)
       : (x ? conv_epilogue_kernel<false, false> : conv_epilogue_kernel<false, true>);
   launch_ex(kernel, dim3(H / 128), 128, 0, 1, pdl, stream, x, x_bf16, M, conv_w, conv_state, out, conv_hist);
+}
+
+void conv_residual_epilogue_batch(const float* x, const __nv_bfloat16* x_bf16, int batch, ConvKind kind,
+                                  const float* conv_w, float* const* states, float* out,
+                                  bool pdl, cudaStream_t stream) {
+  require(bool(x) != bool(x_bf16) && conv_w && states && out && batch >= 1 && batch <= 8,
+          "conv_residual_epilogue_batch: invalid arguments");
+  const auto kernel = kind == ConvKind::Mlp
+      ? (x ? conv_epilogue_batch_kernel<true, false> : conv_epilogue_batch_kernel<true, true>)
+      : (x ? conv_epilogue_batch_kernel<false, false> : conv_epilogue_batch_kernel<false, true>);
+  launch_ex(kernel, dim3(H / 128, batch), 128, 0, 1, pdl, stream, x, x_bf16, conv_w, states, out);
 }
 
 void head(const __nv_bfloat16* x, int M, Matrix w, float* out, bool pdl, cudaStream_t stream) {

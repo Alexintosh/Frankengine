@@ -20,10 +20,12 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstring>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -764,9 +766,86 @@ bool run_ablation_layouts() {
   return ok;
 }
 
+bool compare_batch_slots(Runtime& rt) {
+  const bool root = rt.options().tp.rank == 0;
+  auto best_token = [](const float* device) {
+    std::vector<float> row(UNPADDED_VOCAB);
+    INGINE_TEST_CUDA(cudaMemcpy(row.data(), device, row.size() * sizeof(float), cudaMemcpyDeviceToHost));
+    return int(std::max_element(row.begin(), row.end()) - row.begin());
+  };
+  auto greedy_token = [](const int32_t* device) {
+    int32_t token;
+    INGINE_TEST_CUDA(cudaMemcpy(&token, device, sizeof(token), cudaMemcpyDeviceToHost));
+    return token;
+  };
+  std::vector<std::vector<int>> reference(8);
+  for (int slot = 0; slot < 8; ++slot) {
+    reset_state(rt.state(), rt.stream());
+    for (int step = 0; step < 4; ++step) {
+      auto* logits = rt.decode_logits(123 + 19 * slot + step, step);
+      INGINE_TEST_CUDA(cudaStreamSynchronize(rt.stream()));
+      if (root) {
+        const int token = rt.tp() ? greedy_token(ptr<int32_t>(rt.buffers(1).greedy)) : best_token(logits);
+        reference[slot].push_back(token);
+      }
+    }
+  }
+  reset_state(rt.state(), rt.stream());
+  std::array<int, 8> positions{};
+  bool ok = true;
+  int pass = 0;
+  for (int width : {2, 4, 8, 8}) {
+    std::vector<Runtime::BatchInput> rows;
+    for (int row = 0; row < width; ++row) {
+      const int slot = (row + positions[0]) % 8;
+      rows.push_back({slot, 123 + 19 * slot + positions[slot]});
+    }
+    const bool full_logits = ++pass == 4;
+    const auto& buffers = rt.run_batch(rows, full_logits);
+    for (std::size_t r = 0; r < rows.size(); ++r) {
+      const int slot = rows[r].slot;
+      if (root) {
+        const int token = rt.tp() && !full_logits
+            ? greedy_token(ptr<int32_t>(buffers.greedy) + r)
+            : best_token(ptr<float>(buffers.logits) + r * UNPADDED_VOCAB);
+        ok &= token == reference[slot][positions[slot]];
+      }
+      ok &= rt.state_slot(slot).length == ++positions[slot];
+    }
+  }
+  return report(ok, "batch graph slot mapping and greedy parity with width 1");
+}
+
+bool run_batch_slots() {
+  RuntimeOptions options;
+  options.max_ctx = 128;
+  options.kv_fp8 = true;
+  options.max_batch = 8;
+  cudaStream_t setup;
+  INGINE_TEST_CUDA(cudaStreamCreate(&setup));
+  auto weights = synthetic_weights(setup);
+  INGINE_TEST_CUDA(cudaStreamDestroy(setup));
+  Runtime rt(options, std::move(weights), load_ablation({}));
+  return compare_batch_slots(rt);
+}
+
+bool run_tp_batch_slots(const char* model_dir) {
+  RuntimeOptions options;
+  options.model_dir = model_dir;
+  options.max_ctx = 128;
+  options.kv_fp8 = true;
+  options.head_nvfp4 = true;
+  options.max_batch = 8;
+  options.tp = tp_options();
+  if (options.tp.size != 2) throw std::invalid_argument("--batch-tp2 requires two ranks");
+  options.tp.serve = true;
+  Runtime rt(options);
+  return compare_batch_slots(rt);
+}
+
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
   if (ingine::test::skip_without_gpu()) return ingine::test::kSkip;
   std::size_t free = 0, total = 0;
   INGINE_TEST_CUDA(cudaMemGetInfo(&free, &total));
@@ -774,6 +853,8 @@ int main() {
     std::printf("skip: %.2f GB of GPU memory free, need 1.75\n", double(free) / (1 << 30));
     return ingine::test::kSkip;
   }
+  if (argc == 2 && std::string_view(argv[1]) == "--batch") return run_batch_slots() ? 0 : 1;
+  if (argc == 3 && std::string_view(argv[1]) == "--batch-tp2") return run_tp_batch_slots(argv[2]) ? 0 : 1;
   bool ok = run(false);
   ok &= run(true);
   ok &= run_generator();

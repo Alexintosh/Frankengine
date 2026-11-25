@@ -73,6 +73,25 @@ const std::int64_t* Decoder::block_table(const std::vector<const float*>& blocks
 }
 
 void Decoder::decode(Buffers& b, const std::int64_t* pos, bool history, cudaStream_t stream, TpReduction reduction) {
+  decode_impl(b, pos, history, stream, reduction, nullptr);
+}
+
+void Decoder::allocate_batch_workspace(int max_batch) {
+  if (simulation_ || max_batch < 2 || max_batch > 8)
+    throw std::invalid_argument("invalid batch workspace configuration");
+  const int hkv = tp_ ? tp_->layout.hkv_local : KV_HEADS;
+  batch_attn_ws_ = DeviceBuffer(max_batch * attn::workspace_bytes(1, hkv));
+  batch_attn_ws_.fill(0);
+}
+
+void Decoder::decode_batch(Buffers& b, const BatchSlotTable* slots, cudaStream_t stream) {
+  if (simulation_ || !slots || b.m < 1 || b.m > 8 || !batch_attn_ws_.p)
+    throw std::invalid_argument("invalid batch decode configuration");
+  decode_impl(b, nullptr, false, stream, TpReduction::Reconstruct, slots);
+}
+
+void Decoder::decode_impl(Buffers& b, const std::int64_t* pos, bool history, cudaStream_t stream,
+                          TpReduction reduction, const BatchSlotTable* slots) {
   const bool profile = tp_ && tp_->profile;
   auto stage = [&](VerifyStage kind, int occurrence, bool end) {
     if (profile) tp_->mark_stage(kind, occurrence, end, stream);
@@ -90,9 +109,14 @@ void Decoder::decode(Buffers& b, const std::int64_t* pos, bool history, cudaStre
   auto reduce_conv = [&](float* fp32, __nv_bfloat16* bf16, int visit, dense::ConvKind kind,
                          const Tensor& weights, float* state, float* out, float* hist) {
     const unsigned op = 2 * visit + (kind == dense::ConvKind::Mlp);
-    tp_->reduce(fp32, bf16, slab, TpSchedule::Decode, op, stream);
+    if (tp_) tp_->reduce(fp32, bf16, slab, TpSchedule::Decode, op, stream);
     stage(VerifyStage::Conv, op, false);
-    dense::conv_residual_epilogue(fp32, bf16, m, kind, f32p(weights), state, out, hist, pdl, stream);
+    if (slots) {
+      auto states = kind == dense::ConvKind::Mlp ? slots->mlp_conv[visit] : slots->attn_conv[visit];
+      dense::conv_residual_epilogue_batch(fp32, bf16, m, kind, f32p(weights), states, out, pdl, stream);
+    } else {
+      dense::conv_residual_epilogue(fp32, bf16, m, kind, f32p(weights), state, out, hist, pdl, stream);
+    }
     stage(VerifyStage::Conv, op, true);
   };
 
@@ -201,7 +225,7 @@ void Decoder::decode(Buffers& b, const std::int64_t* pos, bool history, cudaStre
       // b.hist_k/hist_v[v] (K and V segments of proj_out) are copied by the MLP-side mix below
       attn::DecodeArgs a;
       a.proj = f32p(proj_out);
-      a.M = m;
+      a.M = slots ? 1 : m;
       a.hkv = layout.hkv_local;
       a.q_scale = f32p(layer.q_scale);
       a.r_scale = f32p(layer.r_scale);
@@ -209,8 +233,9 @@ void Decoder::decode(Buffers& b, const std::int64_t* pos, bool history, cudaStre
       a.conv_k_state = st.conv_k_at(v);
       a.conv_v_state = st.conv_v_at(v);
       a.pos = pos;
-      a.workspace = attn_ws_.p;
-      a.workspace_size = attn_ws_.bytes;
+      auto& workspace = slots ? batch_attn_ws_ : attn_ws_;
+      a.workspace = workspace.p;
+      a.workspace_size = workspace.bytes;
       a.out = bf16m(b.attn_out);
       if (layer.full) {
         const int fi = FULL_INDEX[v];
@@ -236,12 +261,12 @@ void Decoder::decode(Buffers& b, const std::int64_t* pos, bool history, cudaStre
         a.log_scaling = false;
       }
       stage(VerifyStage::Attention, v, false);
-      attn::attn_decode(a, stream);
+      if (slots) attn::attn_decode_batch(a, slots->attn[v], m, stream);
+      else attn::attn_decode(a, stream);
       stage(VerifyStage::Attention, v, true);
       float* hist = history ? f32m(b.hist_attn) + std::size_t(v) * slab : nullptr;
-      if (tp_) {
-        // Reuse the output slab: the elementwise epilogue reads its channel before writing it.
-        const bool bf16 = tp_->bf16_wire(2 * v);
+      if (tp_ || slots) {
+        const bool bf16 = tp_ && tp_->bf16_wire(2 * v);
         float* raw = bf16 ? nullptr : f32m(b.y);
         auto* raw16 = bf16 ? bf16m(b.xf) : nullptr;
         stage(VerifyStage::Wo, v, false);
@@ -294,8 +319,8 @@ void Decoder::decode(Buffers& b, const std::int64_t* pos, bool history, cudaStre
                   f32p(ex.w13_factor), fmt, bf16m(b.act), pdl, stream, layout.I_local);
       stage(VerifyStage::MoeUp, v, true);
       float* hist = history ? f32m(b.hist_mlp) + std::size_t(v) * slab : nullptr;
-      if (tp_) {
-        const bool bf16 = tp_->bf16_wire(2 * v + 1);
+      if (tp_ || slots) {
+        const bool bf16 = tp_ && tp_->bf16_wire(2 * v + 1);
         float* raw = bf16 ? nullptr : f32m(b.y2);
         auto* raw16 = bf16 ? bf16m(b.xf) : nullptr;
         stage(VerifyStage::MoeDown, v, false);
