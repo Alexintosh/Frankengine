@@ -110,11 +110,13 @@ curl -sSN http://127.0.0.1:8834/v1/chat/completions \
 ---
 
 ## Key Documentation
-- [**`docs/OPTIMIZATION_ROADMAP.md`**](docs/OPTIMIZATION_ROADMAP.md) — Living experiment ledger (`EXP-001`–`EXP-024`), byte-level roofline audits, dead-end registry, and optimization roadmap.
+- [**`docs/RTX5090_AGENT_RUNBOOK.md`**](docs/RTX5090_AGENT_RUNBOOK.md) — **Autonomous agent runbook** for RTX 5090 / RTX PRO 6000 / single-GPU Blackwell (`sm_120a` build, pinned HF downloads, 256K launch, and turnkey `scripts/bench_matrix.py` suite).
+- [**`docs/OPTIMIZATION_ROADMAP.md`**](docs/OPTIMIZATION_ROADMAP.md) — Living experiment ledger (`EXP-001`–`EXP-026`), byte-level roofline audits, dead-end registry, and optimization roadmap.
 - [**`docs/hardware_scaling_and_megakernel_audit.md`**](docs/hardware_scaling_and_megakernel_audit.md) — Calibrated hardware scaling projections (`RTX 5090/PRO 6000` → `1×/8× B200` → `GB200 NVL72` → `Vera Rubin`) and microsecond-by-microsecond Megakernel engineering verdict.
 - [**`docs/tp2_architecture.md`**](docs/tp2_architecture.md) — Tensor-parallel sharding and RoCE collective design.
 - [**`reports/phase_c_tp2_unified_qualification.md`**](reports/phase_c_tp2_unified_qualification.md) — Final Dual-Spark `TP=2` CLI, live SSE, SASS parity, and 65K/122K needle qualification report.
 - [**`reports/track1_tp1_frankengine.md`**](reports/track1_tp1_frankengine.md) — Single-Spark `TP=1` Frankengine qualification report (`155.35 tok/s` live short code, `256K` live needles).
+- [**`reports/track2b_suffix_spec.md`**](reports/track2b_suffix_spec.md) & [**`reports/track2c_prefill_accel.md`**](reports/track2c_prefill_accel.md) — Suffix-copy speculation evaluation & Nsight 32K prefill roofline audit.
 
 ---
 
