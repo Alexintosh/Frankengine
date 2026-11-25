@@ -24,9 +24,12 @@ df -h .
 - **Driver / CUDA:** NVIDIA driver ≥ 580 + CUDA Toolkit **13.0+** (`nvcc` supporting `-gencode arch=compute_120a,code=sm_120a` for RTX 5090)
 - **Compiler & Build Tools:** GCC 12+ (`g++`), `cmake` ≥ 3.24, `ninja` (optional), `python3` ≥ 3.10, `git`
 - **Free Disk:** ≥ 28 GB (`~20.2 GB` base model + `~0.95 GB` DFlash 2 drafter + `~1.5 GB` build)
-- **Free VRAM:**
-  - **`≥ 27.5 GiB` free:** use full **`MAX_CTX=262144` (256K)** + `PARK_MB=2048` (exact match to our DGX Spark qualification; measured peak NVML residency is `26.1 GiB` / `26,733 MiB`).
-  - **`23–27 GiB` free** (e.g., 32 GB RTX 5090 also driving a desktop display): use **`MAX_CTX=131072` (128K)** + `PARK_MB=512` (~`22–23 GiB` peak VRAM). `scripts/bench_matrix.py` auto-detects `max_model_len` from `/v1/models` and adjusts its maximum context test automatically.
+- **Free VRAM (auto-selected in Step 4):**
+  - **`≥ 60 GiB` free (e.g., RTX PRO 6000 96 GB / B200 / DGX Spark 128 GB):** full **`MAX_CTX=262144` (256K solo `DFlash 2`) + `MAX_BATCH=32, BATCH_CTX=32768, BATCH_SPEC=4`** (~`50 GiB` peak VRAM on `TP=1`).
+  - **`27.5–59 GiB` free (e.g., dedicated 32 GB RTX 5090):**
+    - For single-stream `256K` qualification (`scripts/bench_matrix.py`): **`MAX_CTX=262144 MAX_BATCH=1 BATCH_SPEC=0 PARK_MB=2048`** (`26.1 GiB` peak NVML).
+    - For live multi-agent batched speculative serving on 32 GB: **`MAX_CTX=131072 MAX_BATCH=16 BATCH_CTX=4096 BATCH_SPEC=4 PARK_MB=0`** (or `MAX_BATCH=8 BATCH_CTX=8192`, ~`28–29 GiB`).
+  - **`23–27.4 GiB` free** (e.g., 32 GB RTX 5090 also driving a desktop display): **`MAX_CTX=131072 MAX_BATCH=1 BATCH_SPEC=0 PARK_MB=512`** (~`22–23 GiB` peak VRAM). `scripts/bench_matrix.py` auto-detects `max_model_len` from `/v1/models` and adjusts its maximum context test automatically.
 
 ---
 
@@ -102,13 +105,14 @@ cmake -S engine/native -B "engine/native/build-${ARCH}" \
   -DINGINE_BUILD_TESTS=OFF
 
 cmake --build "engine/native/build-${ARCH}" -j "$(nproc)" \
-  --target ingine-serve ingine-bench ingine-validate
+  --target ingine-serve ingine-bench ingine-batch-bench ingine-validate
 ```
 
 Verify the compiled binaries exist:
 ```bash
 ls -lh "engine/native/build-${ARCH}/apps/serve/ingine-serve" \
        "engine/native/build-${ARCH}/apps/bench/ingine-bench" \
+       "engine/native/build-${ARCH}/apps/batch/ingine-batch-bench" \
        "engine/native/build-${ARCH}/apps/validate/ingine-validate"
 ```
 
@@ -132,20 +136,36 @@ export HOST=127.0.0.1
 export PORT=8834
 export SERVED_NAME=inkling-2-mini
 
-# Check free VRAM on GPU 0 and choose 256K (preferred) or 128K fallback:
+# Auto-size solo context & Track 3 batched speculative pool for free VRAM on GPU 0:
+# (Note: scripts/config.sh defaults to Dual-Spark/96GB 32x32K; override on 32 GB GPUs to avoid OOM!)
 FREE_MIB=$(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits -i 0 | head -n 1 | tr -d ' ')
-if [ "${FREE_MIB:-0}" -ge 28000 ]; then
+if [ "${FREE_MIB:-0}" -ge 60000 ]; then
+  echo "Free VRAM is ${FREE_MIB} MiB (>=60 GiB, e.g. RTX PRO 6000 / B200 / Spark): enabling 256K solo + 32x32K batched spec."
   export MAX_CTX=262144
+  export MAX_BATCH=32
+  export BATCH_CTX=32768
+  export BATCH_SPEC=4
+  export MAX_QUEUE=64
+  export PARK_MB=2048
+elif [ "${FREE_MIB:-0}" -ge 28000 ]; then
+  echo "Free VRAM is ${FREE_MIB} MiB (32 GB RTX 5090 class): using 256K single-stream preset for bench_matrix.py."
+  export MAX_CTX=262144
+  export MAX_BATCH=1
+  export BATCH_SPEC=0
+  export MAX_QUEUE=16
   export PARK_MB=2048
 else
-  echo "Free VRAM is ${FREE_MIB} MiB (<28000 MiB); using 128K context preset."
+  echo "Free VRAM is ${FREE_MIB} MiB (<28000 MiB); using 128K single-stream preset."
   export MAX_CTX=131072
+  export MAX_BATCH=1
+  export BATCH_SPEC=0
+  export MAX_QUEUE=16
   export PARK_MB=512
 fi
 
 ./scripts/serve_tp1.sh > /tmp/frankengine_serve.log 2>&1 &
 SERVER_PID=$!
-echo "Started ingine-serve PID=$SERVER_PID (MAX_CTX=$MAX_CTX, PARK_MB=$PARK_MB)"
+echo "Started ingine-serve PID=$SERVER_PID (MAX_CTX=$MAX_CTX, MAX_BATCH=$MAX_BATCH, BATCH_CTX=${BATCH_CTX:-0}, BATCH_SPEC=$BATCH_SPEC)"
 ```
 
 Wait until `/v1/models` returns HTTP 200 (startup + eager CUDA-graph capture typically takes `15–45 s`):
@@ -214,6 +234,34 @@ python3 scripts/bench_matrix.py \
 
 ---
 
+## 5b. Batched Speculative Concurrency Roofline (`ingine-batch-bench`, Optional)
+
+Stop `ingine-serve` first (Step 6) so the GPU has full free VRAM, then run the standalone batched speculative benchmark (`DSpark MXFP8` drafter + FP8 KV):
+
+```bash
+BATCH_BIN="engine/native/build-${ARCH}/apps/batch/ingine-batch-bench"
+PROMPTS="engine/bench/prompts-short.json"
+
+# Fits on both 32 GB RTX 5090 (~29.1 GB @ c=64) and 96 GB RTX PRO 6000:
+for C in 8 16 32 64; do
+  "$BATCH_BIN" --model-dir models/Inkling-2-Mini --prompts "$PROMPTS" \
+    --seqs "$C" --ctx 640 --tokens 512 --kv-fp8 --temperature 0 \
+    --spec 4 --spec-threshold 0.5 --spec-min 2
+done
+
+# 96 GB RTX PRO 6000 / B200 / Spark only (high concurrency & long-context pool):
+if [ "${FREE_MIB:-0}" -ge 60000 ]; then
+  "$BATCH_BIN" --model-dir models/Inkling-2-Mini --prompts "$PROMPTS" \
+    --seqs 32 --ctx 8192 --tokens 256 --kv-fp8 --temperature 0 \
+    --spec 4 --spec-threshold 0.5 --spec-min 2
+  "$BATCH_BIN" --model-dir models/Inkling-2-Mini --prompts "$PROMPTS" \
+    --seqs 128 --ctx 640 --tokens 512 --kv-fp8 --temperature 0 \
+    --spec 4 --spec-threshold 0.5 --spec-min 2
+fi
+```
+
+---
+
 ## 6. Clean Shutdown & Share Results Back
 
 Stop the server cleanly once the benchmark completes and verify zero lingering GPU processes:
@@ -243,5 +291,7 @@ Package and share back **all three files** (e.g., `tar -czf bench_results_rtx509
 | **Short Code Greedy (`LRU cache`, 160 tok)** | `155.4 tok/s` | `243.1 tok/s` | `~800–1,050 tok/s` |
 | **32K Context Sampled Code (`T=0.7`, warm)** | `~77–95 tok/s` | `199.9 tok/s` (`9 ms` TTFT) | `~550–700 tok/s` |
 | **Cold Prefill (`4K–32K`)** | `2,770–2,889 tok/s` | `2,802–3,200 tok/s` | `~15,000–25,000 tok/s` |
-| **Peak Memory @ `256K` Context** | `26.1 GiB` (`1` GPU) | `27.2 GiB` (`2` GPUs) | `~26–27 GiB` |
+| **Peak Memory @ `256K` Context (`c=1`)** | `26.1 GiB` (`1` GPU) | `27.2 GiB` (`2` GPUs) | `~26–27 GiB` |
+| **Batched Spec `c=64` (`ctx=640`, `spec=4`)** | `600.8 tok/s` | `820.5 tok/s` (`1,132` SS) | `~4,100–4,500 tok/s` |
+| **Batched Spec `c=128` (`ctx=640` / `32K`)** | — | `1,187 / 1,228 tok/s` | `~5,000–6,500 tok/s` (PRO 6000 96 GB) |
 | **`65K` / `122K` Exact Needles** | `PASS` / `PASS` | `PASS` / `PASS` | `PASS` / `PASS` |
