@@ -248,16 +248,46 @@ class EngineGenerator final : public Generator {
                               uint64_t* counter) {
     const std::span<const std::int32_t> prompt = full_prompt.ids;
     if (prompt.empty()) throw std::invalid_argument("prompt is empty");
-    if (options_.draft_type == "dflash2" && sampling.temperature > 0 && sampling.forced.empty())
-      throw std::invalid_argument("DFlash2 currently supports greedy generation");
+    const bool allow_dflash2_sampled = [] {
+      const char* e = std::getenv("INGINE_DFLASH2_SAMPLED");
+      return !e || !*e || std::atoi(e) != 0;
+    }();
+    if (options_.draft_type == "dflash2" && sampling.temperature > 0 && sampling.forced.empty() && !allow_dflash2_sampled)
+      throw std::invalid_argument("DFlash2 sampled generation disabled by INGINE_DFLASH2_SAMPLED=0");
     if (rt_.tp() && !options_.tp.serve && sampling.temperature != 0)
       throw std::invalid_argument("TP=2 generator requires temperature 0");
     const int n = int(prompt.size());
-    const bool flash = options_.draft_type == "dflash2" ||
-        (options_.draft_type == "hybrid" && n <= options_.dflash2_max_ctx && sampling.temperature == 0);
-    auto* spec = flash ? dflash2_spec_.get() : spec_.get();
     const int image_tokens = check_images(full_prompt);
     if (!sampling.forced.empty()) max_new_tokens = std::min(max_new_tokens, int(sampling.forced.size()));
+    head::SamplerRng rng;
+    rng.seed = sampling.seed ? *sampling.seed : (std::uint64_t(std::random_device{}()) << 32) ^ std::random_device{}();
+    std::lock_guard<std::mutex> lock(mutex_);
+
+    if (rt_.tp() && options_.tp.serve) rt_.tp()->full_logits = sampling.temperature > 0;
+
+    bool flash = options_.draft_type == "dflash2";
+    if (!flash && options_.draft_type == "hybrid" && n <= options_.dflash2_max_ctx &&
+        (sampling.temperature <= 0.f || allow_dflash2_sampled)) {
+      // Preserve warm multi-turn Solo KV reuse (>= 512 tokens) instead of forcing a cold DFlash2 prefill.
+      constexpr std::size_t kMinHybridReuse = 512;
+      bool has_warm_reuse = false;
+      if (!options_.cold_prefill && !previous_flash_) {
+        const bool drafter_ok = !drafter_ || drafter_->length() == int(tokens_in_state_.size());
+        const bool sampled_head = rt_.tp() && rt_.tp()->full_logits;
+        const bool ext = drafter_ok && tokens_in_state_.size() >= kMinHybridReuse &&
+                         tokens_in_state_.size() < prompt.size() &&
+                         std::equal(tokens_in_state_.begin(), tokens_in_state_.end(), prompt.begin());
+        const bool ckpt = !ext && checkpoint_ids_.size() >= kMinHybridReuse &&
+                          checkpoint_ids_.size() <= prompt.size() &&
+                          (checkpoint_ids_.size() < prompt.size() || checkpoint_sampled_head_ == sampled_head) &&
+                          std::equal(checkpoint_ids_.begin(), checkpoint_ids_.end(), prompt.begin());
+        const bool parked = find_parked(prompt, kMinHybridReuse - 1) != nullptr;
+        has_warm_reuse = ext || ckpt || parked;
+      }
+      flash = !has_warm_reuse;
+      if (rt_.tp() && options_.tp.serve && !rt_.tp()->agree(uint64_t(flash), rt_.stream())) flash = false;
+    }
+    auto* spec = flash ? dflash2_spec_.get() : spec_.get();
     // a verify call writes up to max(verify widths) positions
     const int reserve = spec ? *std::max_element(rt_.verify_widths().begin(), rt_.verify_widths().end()) : 0;
     if (n + std::int64_t(max_new_tokens) + reserve > options_.max_ctx) {
@@ -268,11 +298,6 @@ class EngineGenerator final : public Generator {
     }
     GenerateStats stats;
     stats.used_dflash2 = flash;
-    head::SamplerRng rng;
-    rng.seed = sampling.seed ? *sampling.seed : (std::uint64_t(std::random_device{}()) << 32) ^ std::random_device{}();
-    std::lock_guard<std::mutex> lock(mutex_);
-
-    if (rt_.tp() && options_.tp.serve) rt_.tp()->full_logits = sampling.temperature > 0;
 
     auto t = std::chrono::steady_clock::now();
     try {

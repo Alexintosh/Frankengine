@@ -17,13 +17,15 @@ class BatchGenerator final : public ingine::model::Generator {
   int spec_ = 0;
 
   ingine::model::GenerateStats generate(
-      std::span<const int32_t>, int limit, const ingine::model::Sampling&, std::span<const int32_t>,
+      std::span<const int32_t> prompt, int limit, const ingine::model::Sampling&, std::span<const int32_t>,
       const std::function<bool(std::span<const int32_t>)>& emit) override {
+    ingine::model::GenerateStats st;
+    st.prompt_tokens = int(prompt.size());
     for (int i = 0; i < limit; ++i) {
       pause();
       if (!emit(std::span(&token_, 1))) break;
     }
-    return {};
+    return st;
   }
 
   int reusable_prefix(int slot, std::span<const int32_t> prompt) const override {
@@ -47,8 +49,10 @@ class BatchGenerator final : public ingine::model::Generator {
     }
     const int target = (stop_at > offset && stop_at < int(prompt.size())) ? stop_at : int(prompt.size());
     const int next = std::min(offset + 2048, target);
+    const int delta = next - offset;
     h.insert(h.end(), prompt.begin() + offset, prompt.begin() + next);
-    prefilled_tokens += (next - offset);
+    prefilled_tokens += delta;
+    if (delta > 0) chunk_sizes.push_back(delta);
     return {next, reused, next == int(prompt.size()) ? std::optional(token_) : std::nullopt};
   }
 
@@ -68,6 +72,7 @@ class BatchGenerator final : public ingine::model::Generator {
   void release_slot(int) override { ++released; }
 
   std::atomic<int> peak{0}, released{0}, cloned{0}, prefilled_tokens{0};
+  std::vector<int> chunk_sizes;
   std::vector<int32_t> histories_[8];
 
  private:

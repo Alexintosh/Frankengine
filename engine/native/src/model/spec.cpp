@@ -60,7 +60,7 @@ SpecLoop::SpecLoop(Runtime& rt, Drafter* drafter, DFlash2* dflash2, DFlash2Head*
   if (host_verify_) proposal_ = DeviceBuffer(sizeof(VerifyProposal));
   if (rt_.tp() || dflash2_)
     host_accept_ = DeviceBuffer(sizeof(kd::AcceptResult));
-  if (!rt_.tp() && dflash2_)
+  if (dflash2_ && (!rt_.tp() || rt_.options().tp.rank == 0))
     target_tokens_ = DeviceBuffer(kd::BLOCK * sizeof(std::int32_t));
   if (!host_verify_) {
     const float threshold = rt.options().spec_threshold;
@@ -413,6 +413,12 @@ void SpecLoop::generate_host_verified(std::int32_t token, int max_new_tokens, co
                              draft_.qstats, scratch.uniforms, scratch.ws, scratch.resid, result, stream);
           kh::sample_from_probs(scratch.resid, 1, V, V, rng, &result->next, stream);
         }
+      } else if (dflash2_ && (!tp || tp->layout.tp_rank == 0)) {
+        // Exact lossless target sampling (temperature / top_p / top_k) verified against DFlash2 drafts.
+        const kh::SamplingParams params{sampling.temperature, sampling.top_k, sampling.top_p};
+        auto* ids = static_cast<std::int32_t*>(target_tokens_.p);
+        kh::sample(logits, m, UNPADDED_VOCAB, UNPADDED_VOCAB, params, rng, ids, stream);
+        kd::greedy_accept(ids, proposal->drafts, eligible, result, stream);
       }
       if (tp) tp->broadcast_proposal(result, sizeof(*result), stream);
     } else {

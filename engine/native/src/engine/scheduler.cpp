@@ -241,6 +241,22 @@ void Scheduler::batch_loop() {
     }
     return std::min(3, max_batch_);
   }();
+  // When at least one batch lane is already streaming tokens, pace newly admitted cold prefills
+  // into smaller chunks interleaved with multiple decode steps so active streams never starve down
+  // to single-digit tok/s during 10K-20K concurrent prefill bursts.
+  const int active_prefill_chunk = [&] {
+    if (const char* e = std::getenv("INGINE_BATCH_PREFILL_CHUNK_WHILE_DECODING"); e && *e) {
+      return std::clamp(std::atoi(e), 64, 2048);
+    }
+    return 512;
+  }();
+  const int decode_steps_per_prefill = [&] {
+    if (const char* e = std::getenv("INGINE_BATCH_DECODE_STEPS_PER_PREFILL"); e && *e) {
+      return std::clamp(std::atoi(e), 1, 8);
+    }
+    return 2;
+  }();
+  int prefill_skip_steps = 0;
   const auto emit = [&](ActiveSlot& slot, std::span<const int32_t> tokens) {
     std::vector<int32_t> out;
     const int ctx_cap = (slot.solo || slot.force_solo) ? generator_.max_model_len() : generator_.batch_max_ctx();
@@ -366,7 +382,10 @@ void Scheduler::batch_loop() {
         const auto st = generator_.generate_interruptible(
             {first.job->prompt_ids, first.job->images}, first.job->max_new_tokens, first.sampling, stop_list_,
             [&](std::span<const int32_t> tokens) {
+              const int prev_emitted = first.emitted;
               emit(first, tokens);
+              const int delta_tok = first.emitted - prev_emitted;
+              if (delta_tok > 0) record_decode(delta_tok, 1, false);
               if (first.done || first.job->cancelled()) return false;
               std::lock_guard lock(mutex_);
               interrupted = !first.force_solo && 1 + int(waiting_.size()) >= min_batch_conc &&
@@ -376,6 +395,10 @@ void Scheduler::batch_loop() {
               return !interrupted;
             });
         first.job->cached_tokens_.store(st.reused_tokens);
+        const int solo_prefilled = st.interrupted_prefill_offset
+            ? std::max(0, st.interrupted_prefill_offset - st.reused_tokens)
+            : std::max(0, st.prompt_tokens - st.reused_tokens);
+        if (solo_prefilled > 0) total_prefill_tokens_.fetch_add(uint64_t(solo_prefilled), std::memory_order_relaxed);
         first.offset = st.interrupted_prefill_offset ? st.interrupted_prefill_offset : int(first.job->prompt_ids.size());
         first.done = first.done || !interrupted;
         if (interrupted && !first.done && !first.job->cancelled() && generator_.batch_spec() > 0) {
@@ -525,8 +548,16 @@ void Scheduler::batch_loop() {
       }
     }
 
-    int prefill_budget = generator_.batch_spec() > 0 ? 1024 : 1;
+    bool has_decoding = std::any_of(slots_.begin(), slots_.end(), [](const auto& s) {
+      return !s.job->cancelled() && !s.done && s.emitted > 0;
+    });
+    if (!has_decoding) prefill_skip_steps = 0;
+    int prefill_budget = (prefill_skip_steps > 0) ? 0 : (generator_.batch_spec() > 0 ? 1024 : 1);
+    if (prefill_skip_steps > 0) --prefill_skip_steps;
     while (prefill_budget > 0) {
+      has_decoding = std::any_of(slots_.begin(), slots_.end(), [](const auto& s) {
+        return !s.job->cancelled() && !s.done && s.emitted > 0;
+      });
       ActiveSlot* prefill = nullptr;
       if (generator_.batch_spec() > 0) {
         int best_peers = -1;
@@ -574,10 +605,22 @@ void Scheduler::batch_loop() {
           }
         }
       }
+      const int prompt_len = int(slot.job->prompt_ids.size());
+      int call_stop_at = fork_at;
+      bool paced_chunk = false;
+      if (generator_.batch_spec() > 0 && has_decoding && active_prefill_chunk > 0) {
+        const int est_off = slot.offset > 0 ? slot.offset : generator_.reusable_prefix(slot.slot, slot.job->prompt_ids);
+        const int goal = (fork_at > est_off) ? fork_at : prompt_len;
+        const int capped = std::min(goal, est_off + active_prefill_chunk);
+        if (capped < prompt_len && (call_stop_at == 0 || capped < call_stop_at)) {
+          call_stop_at = capped;
+          paced_chunk = true;
+        }
+      }
       const int before = slot.offset;
       try {
         const auto result = generator_.prefill_slot_chunk(
-            slot.slot, slot.job->prompt_ids, slot.offset, slot.sampling, fork_at);
+            slot.slot, slot.job->prompt_ids, slot.offset, slot.sampling, call_stop_at);
         if (!slot.offset) slot.job->cached_tokens_.store(result.reused_tokens);
         const int delta_prefill = std::max(0, result.offset - std::max(before, result.reused_tokens));
         if (delta_prefill > 0) total_prefill_tokens_.fetch_add(uint64_t(delta_prefill), std::memory_order_relaxed);
@@ -593,10 +636,14 @@ void Scheduler::batch_loop() {
       if (fork_at > 0 && slot.offset == fork_at && !slot.done && !slot.job->cancelled()) {
         const int cloned = fork_from(slot);
         if (cloned > 0 || anchor_boundary) save_anchor(slot);
-        continue;
+        if (!has_decoding) continue;
+      }
+      if (has_decoding && (paced_chunk || slot.offset < prompt_len)) {
+        prefill_skip_steps = std::max(0, decode_steps_per_prefill - 1);
+        break;
       }
       prefill_budget -= std::max(1, slot.offset - before);
-      if (generator_.batch_spec() == 0 || slot.offset < int(slot.job->prompt_ids.size())) break;
+      if (generator_.batch_spec() == 0 || slot.offset < prompt_len) break;
     }
     std::vector<model::BatchSlotStep> rows;
     std::vector<ActiveSlot*> decoding;

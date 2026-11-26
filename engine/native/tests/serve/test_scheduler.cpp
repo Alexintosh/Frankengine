@@ -291,6 +291,39 @@ void test_system_prompt_anchor_boundary() {
   CHECK(scheduler.stats().decoding == 0);
 }
 
+void test_solo_telemetry_and_prefill_pacing() {
+  BatchGenerator gen(100);
+  gen.spec_ = 4;
+  Scheduler scheduler(gen, {}, 16);
+
+  // 1) Solo request must increment total_decode_tokens and total_prefill_tokens.
+  auto solo = std::make_shared<Job>(std::vector<int32_t>(120, 7), 10, Sampling{});
+  CHECK(scheduler.submit(solo));
+  CHECK(drain(*solo) == std::vector<int32_t>(10, 100));
+  const auto st_solo = scheduler.stats();
+  CHECK(st_solo.total_decode_tokens == 10);
+  CHECK(st_solo.total_prefill_tokens == 120);
+  CHECK(st_solo.decoding == 0);
+
+  // 2) Prefill pacing: 2 short decoding lanes + 1 long 2048-tok lane arriving together.
+  // Once short lanes start decoding, remaining prefill chunks of the long lane must be paced <= 512 tokens.
+  gen.chunk_sizes.clear();
+  auto short1 = std::make_shared<Job>(std::vector<int32_t>(8, 11), 24, Sampling{});
+  auto short2 = std::make_shared<Job>(std::vector<int32_t>(8, 12), 24, Sampling{});
+  auto long3 = std::make_shared<Job>(std::vector<int32_t>(2048, 13), 4, Sampling{});
+  CHECK(scheduler.submit(short1));
+  CHECK(scheduler.submit(short2));
+  CHECK(scheduler.submit(long3));
+  CHECK(drain(*short1) == std::vector<int32_t>(24, 100));
+  CHECK(drain(*short2) == std::vector<int32_t>(24, 100));
+  CHECK(drain(*long3) == std::vector<int32_t>(4, 100));
+  int paced_512 = 0;
+  for (int sz : gen.chunk_sizes) {
+    if (sz == 512) ++paced_512;
+  }
+  CHECK(paced_512 >= 3);
+}
+
 }  // namespace
 
 int main() {
@@ -299,6 +332,7 @@ int main() {
   test_persistent_prefix_anchor_across_waves();
   test_prefix_anchor_eviction_at_full_capacity();
   test_system_prompt_anchor_boundary();
+  test_solo_telemetry_and_prefill_pacing();
   test_cuts();
   test_cancel_fifo_bound();
   test_failure_and_close();
