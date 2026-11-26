@@ -1,8 +1,14 @@
 # Frankengine
 
-**High-throughput, strict-lossless C++/CUDA inference engine for `Inkling-2-Mini` (`30B-A3.6B` Looped MoE) on NVIDIA Blackwell GPUs (`GB10` DGX Spark `sm_121a`, `RTX 5090`/`PRO 6000` `sm_120`, and `B200`/`GB200` `sm_100a`).**
+**High-throughput, strict-lossless C++/CUDA inference engine for `Inkling-2-Mini` (`30B-A3.6B` Looped MoE) on NVIDIA Blackwell GPUs (`GB10` DGX Spark `sm_121a`, `RTX 5090`/`RTX PRO 6000` `sm_120a`, and `B200`/`GB200` `sm_100a`).**
 
-Built on top of upstream [`ingine`](https://github.com/satellitedown/inkling-2-mini-abliterated-ingine) and [`ingine-batch`](https://github.com/satellitedown/ingine-batch), Frankengine adds a custom **dual-rail 200 GbE RoCE UMA RDMA collective backend (`tp_comm/`)**, **Tensor Parallel (`TP=2`)** execution, **batched speculative decoding (`--batch-spec 4`, `--max-batch 32..128`, `32K` per-slot context + `256K` solo fallback)**, **sharded `NVFP4` LM head**, **eager-captured `FP8` Graph `DFlash 2` block-diffusion drafting**, **context-aware hybrid speculation (`DFlash 2` + global `DSpark`)**, and **live OpenAI-compatible serving**.
+Built on top of upstream [`ingine`](https://github.com/satellitedown/inkling-2-mini-abliterated-ingine) and [`ingine-batch`](https://github.com/satellitedown/ingine-batch), Frankengine combines:
+- **Native Blackwell Kernels:** `mxf4nvf4`/`mxf8f6f4` Tensor Core prefill MoE, custom `mma.sync.m16n8k32` FP8 dense prefill GEMM (`149.4 TFLOP/s`, fused `OUTER_VEC_32F` epilogue), BF16 MMA `rel_logits`, and fused `NVFP4` LM head (`head_sample_nvfp4` / `head_topk16_nvfp4`).
+- **Dual-Rail 200 GbE RoCEv2 UMA Backend (`tp_comm/`):** 48-CTA FP32/BF16 AllReduce, CUDA-Graph-safe `K=4` pipelined bulk RDMA (`>=8 MiB`), `bf16-moe` wire (`Wo` stays FP32 for conv1d precision), and `6.3×` 32-CTA sampled gather.
+- **50/50 `TP=2` Sharded Solo `DFlash 2` + Hybrid Speculation:** Megatron-sharded 5-layer FP8/NVFP4 `DFlash 2` backbone (`-22.9%` draft latency, broadcast-free in-graph sharded NVFP4 head) paired with global `DSpark` (`--draft-type hybrid --dflash2-max-ctx 6144`).
+- **`BatchDFlash2` (`GAMMA=7`) & `c=32` CUDA Graphs:** 5-layer batched block-diffusion drafter (`MXFP8` + `FP8` KV rings = `1.545 GB` for 32 slots, WMMA GQA, auto-selected when `--dflash2-dir` and `--batch-spec >= 5`), `32 × 32K` continuous batching, and automatic `256K` solo fallback.
+- **GPU `clone_slot` Forking + Zero-VRAM Persistent Prefix Cache:** Automatic intra-wave shared-prefix slot cloning plus an LRU Prefix Anchor pool (detecting `<|end_message|>` / `<|im_end|>` boundaries) that cuts repeated system-prompt TTFT by up to **`19.9×`**.
+- **Live Observability & Parallel Agent Fan-Out:** Lock-free `GET /v1/telemetry` (JSON) & `GET /metrics` (Prometheus) endpoints + bundled [`.omp/extensions/frankengine-parallel.ts`](.omp/extensions/frankengine-parallel.ts) for single-chat multi-lane coding fan-out.
 
 <p align="center">
   <img src="docs/assets/inkling2_dual_dgx_spark_infographic.png" alt="Inkling-2-Mini on 2× NVIDIA DGX Spark Infographic" width="680"/>
@@ -10,78 +16,62 @@ Built on top of upstream [`ingine`](https://github.com/satellitedown/inkling-2-m
 
 ---
 
-## Verified Production Benchmarks (`2× NVIDIA DGX Spark`, GB10 `sm_121a`)
+## Verified Production Benchmarks (`1×` vs `2× NVIDIA DGX Spark`, GB10 `sm_121a`)
 
-Each DGX Spark (`GB10`) has **128 GB LPDDR5X unified memory** with **`231.38 GB/s` measured streaming DRAM bandwidth** (vs. `1,792 GB/s` RTX 5090 / `8,000 GB/s` NVIDIA B200), linked via dual-rail 200 GbE RoCE.
+Each DGX Spark (`GB10`) has **128 GB LPDDR5X unified memory** with **`231.38 GB/s` measured streaming DRAM bandwidth** (vs. `1,792 GB/s` RTX 5090 / `8,000 GB/s` NVIDIA B200), linked via dual-rail 200 GbE RoCEv2 (`bf16-moe` wire, `BATCH_SPEC=7`, `BATCH_SPEC_THRESHOLD=0.30`).
 
-### Live OpenAI HTTPS Serving (`256K` Context, `DRAFT_TYPE=hybrid`)
-| Workload | Prefill / TTFT | Decode Throughput | Notes |
+### 1. Single-Stream (`c = 1`) & Long-Context Comparison (`TP=1` vs `TP=2`)
+
+| Workload (`256K` Context, `DRAFT_TYPE=hybrid`) | `1× DGX Spark` (`TP=1`) | **`2× DGX Spark` (`TP=2` Live Prod)** | Notes / Speedup |
 |---|---:|---:|---|
-| **Short Code (greedy, `DFlash 2`)** | `88 ms` (`36` tok) | **`243.1 tok/s`** | `248.7 tok/s` warm (`2 ms` TTFT, `400` tok) |
-| **32K Context Sampled Code (`temp=0.7`)** | **`9 ms`** (prefix cache) | **`199.9 tok/s`** | Live OpenAI API, thinking off |
-| **Short Code Sampled (`temp=0.7`, thinking on)** | `141 ms` | **`161.8 tok/s`** | Exact TP=2 sampled head (`6.3×` 32-CTA gather) |
-| **Cold Prefill (`4K / 8K / 16K`)** | `1.39 / 2.76 / 5.43 s` | — | **`3,200 / 3,097 / 3,081 tok/s`** |
-| **Real Multi-Turn Coding Agent (`24K–27K` ctx)** | `86–208 ms` | **`125–220 tok/s`** | Prefix-cache `extend` hit every turn |
-| **Needle-in-a-Haystack (`65.5K` / `121.6K` live)** | `23.7 / 47.4 s` | **`181.6 / 129.2 tok/s`** | **100% exact passkey retrieval** (`27.2 GiB` / `256 GiB` used) |
+| **Short Code Greedy (`36t`, `DFlash 2`)** | `155.4 tok/s` (`207 ms`) | **`257.5 tok/s`** warm / **`247.9`** cold (`72 ms`) | **`1.66×`** `TP=2/TP=1` · **`2.21×`** vs TensorFold TP=1 (`116.5`) |
+| **File-Edit / Refactor (`1.5K`, `320` out)** | — | **`263.9 tok/s`** (`405 ms` TTFT) | Single-stream peak on live OpenAI API |
+| **8-Category Diversity Mean (`256t`, `T=0`)** | — | **`159.6 tok/s`** (`math 204`, `html 200`, `count 218`, `code 174`) | Full `bench_matrix.py` 8-domain average |
+| **Short Code Sampled (`T=0.7`, think ON / OFF)** | — | **`163.0 / 170.7 tok/s`** (`94 / 74 ms` TTFT) | Exact TP=2 sampled head (LRU warm peak **`191.9 tok/s`**, `3.3 ms`) |
+| **CLI Built-in Chat / Code** (`ingine-bench`) | `86.8 / 95.5 tok/s` | **`148.3 / 184.4 tok/s`** *(peak **`185.3`**)* | `50/50` sharded `DFlash 2` (`-22.9%` draft ms, `-490 MB` VRAM) |
+| **Cold Prefill (`2.8K / 4K / 11K / 16K / 32K`)** | `3,619` (`2K` FP8*) · `2,770` (`32K`) | **`3,637 / 3,761 / 3,732 / 3,606 / 3,579 tok/s`** | Live HTTP SSE (`4K TTFT 1.08s`, `11K 2.94s`, `32K 9.22s`) |
+| **Multi-Turn Coding Agent (`~5.6K`, `T=0.7`)** | — | **`132.8 → 221.6 / 189.8 / 171.6 tok/s`** | Turns 2–4 prefix-cache hit (`80–86 ms` TTFT) |
+| **Warm `16K` / `32K` Decode (`T=0` / `T=0.7`)** | `94.7 tok/s` (`32K`) | **`144.7 / 170.2`** (`16K`) · **`136.9 / 143.6`** (`32K`) | `88–99 ms` warm TTFT (`199.9 tok/s` code peak @ `32K`) |
+| **Needle-in-a-Haystack (`16K` / `65.5K` / `121.6K`)** | `PASS` (`25.1 / 51.5 s`, `26.1 GiB`) | **`PASS`** (`156.7 / 181.6 / 129.2 tok/s`, `31.3 GiB`) | **100% exact passkey retrieval** across full `256K` window |
 
-### Interleaved CLI Qualification (`M5 Baseline → Unified TP=2`)
-| Workload | M5 Baseline | Unified TP=2 (`hybrid`) | Delta | Parity |
-|---|---:|---:|---:|---|
-| **Built-in Chat** (6-run median) | `120.4 tok/s` | **`158.6 tok/s`** (`α+1=3.82`) | **`+31.7%`** | `33/33` golden in all modes |
-| **Built-in Code** (6-run median) | `124.9 tok/s` | **`135.1 tok/s`** (`α+1=3.00`) | **`+8.2%`** | `65/66` top-1, `KL 0.001927` |
-| **2K** (Cold Prefill / Decode) | `1,755` / `165.4 tok/s` | **`2,613` / `165.3 tok/s`** | **`+48.9%` prefill** | `768/768` exact IDs |
-| **32K** (Cold Prefill / Decode) | `1,841` / `153.6 tok/s` | **`2,802` / `153.1 tok/s`** | **`+52.2%` prefill** | `768/768` exact IDs |
-| **128K** (Cold Prefill / Decode) | `1,694` (`77.4s`) / `102.7` | **`2,471` (`53.0s`) / `102.3`** | **`+45.9%` (`-24.3s`)** | `512/512` exact IDs |
+*\*`TP=1` `3,619 tok/s` measured on `prefill_profile` `2048@0` with native FP8 dense GEMM + BF16 MMA `rel_logits` (`330/330` validate PASS, `KL mean 0.00565 < 0.00613` baseline).*
 
-- **Strict-lossless verified:** `52,815,312`-byte FP32 target logit dump is **SHA-256 byte-identical** to baseline; all 28 target GEMV kernels and decode RoCE collectives match stock SASS byte-for-byte.
-- **Physical DRAM saturation on GB10:** `NVFP4 MoE W13` ~96%, `FP8 Full Attn (32K–128K)` 94–101%, `FP8 Wproj` 90–91%, `NVFP4 LM Head` ~90%.
+---
 
-### Single-GPU `TP=1` Benchmarks (`1× NVIDIA DGX Spark`, `256K` Context, Zero-Copy NVFP4 Head)
-| Workload (`1× GB10`) | `TP=1` DSpark Control | **`TP=1` Frankengine (`hybrid`)** | vs. Control / SOTA |
-|---|---:|---:|---|
-| **Live Short Code (greedy, `DFlash 2`)** | `123.8 tok/s` (`397 ms` TTFT) | **`155.35 tok/s`** (`207 ms` TTFT) | **`+25.5%`** vs DSpark · **`+33.3%`** over TensorFold (`116.5 tok/s`) |
-| **CLI Built-in Chat / Code** (6-run median) | `79.1 / 84.2 tok/s` | **`86.8 / 95.5 tok/s`** | **`+9.7% / +13.4%`** |
-| **CLI `2K / 32K / 128K` Decode** | `105.3 / 94.6 / 64.4 tok/s` | **`104.8 / 94.7 / 64.8 tok/s`** | Exact parity (`768/768`, `512/512`) |
-| **CLI `2K / 32K / 128K` Cold Prefill** | `2,904 / 2,747 / 2,318 tok/s` | **`2,889 / 2,770 / 2,329 tok/s`** | Zero RoCE overhead |
-| **Live `65.5K / 121.6K` Needles @ `256K`** | — | **100% Exact Passkey** (`25.1 / 51.5 s` TTFT) | **`26.1 GiB`** (`26,733 MiB`) peak NVML (`0 MB` extra head) |
+### 2. Batched Speculative Decoding (`BatchDFlash2` `GAMMA=7` vs `DSpark` `spec=4`, `TP=1` vs `TP=2`)
 
-### True GPU Continuous Batching (`--max-batch 8`, `256K × 8`, `c=1..8` Live OpenAI HTTP/SSE)
-Step-level continuous batching with chunked prefill (`2048`-token chunks interleaved with active decode steps), per-slot prefix reuse, automatic solo-slot `DFlash 2`/`DSpark` interruption & resume, and zero `c=1` SASS/throughput regression (`TP=2` Short Code `250.73 tok/s`; `TP=1` `154.99 tok/s`).
+#### A. Live Production OpenAI HTTP/SSE (`2× Spark TP=2`, `--max-batch 32 --batch-ctx 32768 --batch-spec 7 --tp-wire bf16-moe`)
 
-| Concurrency | `TP=2` Short Greedy (`agg / stream`) | `TP=2` Short Sampled 256-tok (`agg / stream`) | `TP=1` Short Greedy (`agg / stream`) | `TP=1` Short Sampled 256-tok (`agg / stream`) | HTTP 200 |
-|---:|---:|---:|---:|---:|---:|
-| **`c = 1`** | `135.1 / 141.0 tok/s` | `173.2 / 239.4 tok/s` | `76.4 / 82.1 tok/s` | `156.4 / 182.5 tok/s` | `100%` |
-| **`c = 2`** | `126.4 / 65.2 tok/s` | `122.3 / 62.8 tok/s` | `79.4 / 40.8 tok/s` | `81.2 / 41.7 tok/s` | `100%` |
-| **`c = 4`** | `171.6 / 44.6 tok/s` | `182.6 / 47.4 tok/s` | `105.8 / 27.4 tok/s` | `118.0 / 30.6 tok/s` | `100%` |
-| **`c = 6`** | `205.3 / 35.8 tok/s` | `231.1 / 40.4 tok/s` | `125.0 / 21.8 tok/s` | `153.6 / 26.9 tok/s` | `100%` |
-| **`c = 8`** | **`226.5 / 29.9 tok/s`** | **`266.3 / 34.9 tok/s`** | **`138.3 / 18.2 tok/s`** | **`181.8 / 24.2 tok/s`** | **`100%` (`40/40` queued)** |
+| Live HTTP/SSE Concurrency Workload | Previous Prod (`479903e`, `spec=4`) | **Promoted All-Winners (`92ba1c6`, `BatchDFlash2`)** | Gain |
+|---|---:|---:|---:|
+| **Short Prompts (`~40t`, `256` out) `c = 8`** | `200.2 tok/s` wall (`TTFT 0.70s`) | **`246.1` wall / `340.1` sum** (`TTFT 0.34s`) | **`+22.9%` wall · `2.1×` TTFT** |
+| **Short Prompts (`~40t`, `256` out) `c = 16`** | `322.1 tok/s` wall (`TTFT 1.36s`) | **`363.2` wall / `508.4` sum** (`TTFT 0.65s`) | **`+12.8%` wall · `2.1×` TTFT** |
+| **Short Prompts (`~40t`, `256` out) `c = 32`** | `479.7 tok/s` wall (`TTFT 2.44s`) | **`585.1` wall / `830.2` sum** (`TTFT 1.25s`) | **`+22.0%` wall · `2.0×` TTFT** |
+| **Shared-Prefix Code (`3K–4.5K`) `c = 4 / c = 8`** | `132.4 / 178.3 tok/s` sum | **`264.5 / 417.7 tok/s` sum** (`190.6 / 301.5` wall) | **`2.00× / 2.34×`** |
+| **Shared-Prefix Code (`3K–4.5K`) `c = 16 / c = 32`** | `195.9 / 293.8 tok/s` sum | **`633.0 / 846.4 tok/s` sum** (`307.7 / 499.8` wall) | **`3.23× / 2.88×`** |
+| **Single-Session Fan-Out `32 × 4K`** (`160t`, `T=0.65`) | — | **`378.9` wall / `633.5` sum** (`31/32` cloned, `95.4%` cached) | `5,120` tok in `13.51s` |
+| **Single-Session Fan-Out `64 × 2K`** (`512t`, `T=0.65`) | `742.4 tok/s` sum (`64×4K`) | **`994.2 tok/s` sum** (`401.2` wall, `31,367` tok) | **`+33.9%` peak decode** |
 
-- **Peak NVML memory at `262K × 8` slots:** `29.21 GiB` (rank 0) / `27.01 GiB` (rank 1) on `TP=2` (`~92+ GiB` free per Spark); `53.74 GiB` on `TP=1`.
-- **4K context sampled (`c=1/4/8`):** `TP=2` `77.1 → 102.1 → 103.7 tok/s` agg (`29.0/stream` at `c=8`); `TP=1` `52.9 → 70.3 → 73.7 tok/s` agg.
+#### B. Standalone Batched Engine Scaling (`ingine-batch-bench`, `TP=1` vs `TP=2`)
 
-### Batched Speculative Decoding (`--batch-spec 4`, `TP=2` & `TP=1`, up to `c=128` / `4.19M` KV Pool)
-Ports `BatchDecoder` + `BatchDrafter` (`MXFP8`, `thr=0.50`, `min=2`) + grouped MoE + sharded Gumbel-max `head_sample` (`2.5 KB` RoCE exchange) to **Dual-Spark `TP=2`** (`ingine-batch-bench` & live `ingine-serve`). Production defaults to **`32 × 32K`** (`28.6 / 23.7 GiB` NVML) while preserving `256K` solo `DFlash 2` (`~250 tok/s`) with automatic mid-stream `solo → batch` KV promotion and `>32K` solo fallback.
+| Concurrency & Mode | `1× Spark` (`TP=1`) `spec=4` (`DSpark`) | **`1× Spark` (`TP=1`) `spec=7` (`BatchDFlash2`)** | **`2× Spark` (`TP=2`) `spec=4` Wall / Steady-State** | VRAM / Node (`TP=2`) |
+|---|---:|---:|---:|---:|
+| **`c = 1`** (`prompts-short`, `1K` ctx) | `55.0 tok/s` (`α+1=2.54`) | **`80.6 tok/s`** (`α+1=4.82`, **`+46.5%`**) | — | — |
+| **`c = 8`** (`640`–`1K` ctx) | `156.5 tok/s` | **`198.3 tok/s`** (`thr=0.30`, **`+26.7%`**) | `223.6 / 271.2 tok/s` | `12.4 GB` |
+| **`c = 16`** (`640`–`1K` ctx) | `240.8 tok/s` | **`305.0 tok/s`** (`thr=0.20`, **`+26.7%`**) | `359.1 / 424.5 tok/s` | `13.0 GB` |
+| **`c = 32`** (`640`–`1K` ctx) | `389.0 tok/s` | **`493.1 tok/s`** (`α+1=3.31`, **`+26.8%`**) | `521.9 / 667.7 tok/s` | `14.2 GB` |
+| **`c = 64`** (`640`, `T=0` / `T=1.0`) | `600.8 / 561.8 tok/s` | — | **`820.5 / 755.7`** (`1,131.6` SS) | `16.7 GB` |
+| **`c = 128`** (`640` / **`32K` ctx, `4.19M` KV**) | — | — | **`1,187.0 / 1,227.6`** (**`1,614 / 1,504` SS**) | `21.8 / 69.0 GB` |
 
-#### Standalone Batched Speculative Scaling (`ingine-batch-bench`, `spec=4`, FP8 KV)
-| Concurrency & Context | `1× Spark` (`TP=1`) Wall-Clock | **`2× Spark` (`TP=2`) Wall-Clock** | **`2× Spark` Steady-State Decode** | Step (`TP=2`) | VRAM / Node (`TP=2`) |
-|---|---:|---:|---:|---:|---:|
-| `c = 8` plain (`spec=0`, `640`) | `115.0 tok/s` | **`185.2 tok/s`** | `196.6 tok/s` (`24.6/str`) | `40.7 ms` | `11.2 GB` |
-| `c = 8` (`spec=4`, `640`) | `148.5 tok/s` | **`223.6 tok/s`** | `271.2 tok/s` (`33.9/str`) | `66.2 ms` | `12.4 GB` |
-| `c = 16` (`spec=4`, `640` / `8K`) | `236.1 / 235.1 tok/s` | **`359.1 / 347.2 tok/s`** | `424.5 / 414.4 tok/s` (`~26/str`) | `85.1 / 86.4 ms` | `13.0 / 14.8 GB` |
-| `c = 32` (`spec=4`, `640` / `8K`) | `378.4 tok/s` | **`521.9 / 525.9 tok/s`** | `667.7 / 674.3 tok/s` (`~21/str`) | `108.7 / 109.2 ms` | `14.2 / 17.9 GB` |
-| `c = 64` (`spec=4`, `T=0` / `T=1.0`) | `600.8 / 561.8 tok/s` | **`820.5 / 755.7 tok/s`** | `1,131.6 / 1,017.9 tok/s` (`17.7 / 15.9/str`) | `135.4 / 136.3 ms` | `16.7 GB` |
-| `c = 96` (`spec=4`, `640`, `512t`) | — | **`1,010.8 tok/s`** | **`1,425.4 tok/s`** (`14.8/str`) | `161.5 ms` | `19.3 GB` |
-| `c = 128` (`spec=4`, `640`, `512t`) | — | **`1,187.0 tok/s`** | **`1,614.2 tok/s`** (`12.6/str`) | `189.6 ms` | `21.8 GB` |
-| **`c = 128` (`spec=4`, `32K` ctx, `4.19M` KV)** | — | **`1,227.6 tok/s`** | **`1,504.3 tok/s`** (`11.8/str`) | **`191.7 ms`** | **`69.0 GB`** |
+---
 
-#### Live Production OpenAI HTTP/SSE (`2× Spark TP=2`, `--max-batch 32 --batch-ctx 32768 --batch-spec 4`)
-| Live HTTP/SSE Workload | HTTP 200 | Peak Active | Aggregate Wall-Clock | Mean / Stream | TTFT p50 / p95 |
-|---|---:|---:|---:|---:|---:|
-| **`c = 8` greedy (`T=0`) / sampled (`T=1.0`)** | `8/8` | `8` | **`200.2 / 187.1 tok/s`** | **`33.3 / 30.9 tok/s`** | `0.70 / 0.70 s` |
-| **`c = 16` greedy (`T=0`)** | `16/16` | `16` | **`322.1 tok/s`** | **`27.6 tok/s`** | `1.36 / 1.36 s` |
-| **`c = 32` greedy (`T=0`) / sampled (`T=1.0`)** | `32/32` | `32` | **`479.7 / 426.2 tok/s`** | **`22.0 / 18.6 tok/s`** | `2.44 / 2.68 s` |
-| **`solo → batch` mid-stream handoff (5 streams)** | `5/5` | `5` | Zero seam corruption | — | Verified |
-| **Mixed `4K` prefill + client disconnects + `>32K` solo** | `100%` | — | Zero hang / RoCE timeout | — | `262K` fallback OK |
+### 3. Persistent Prefix Anchor Cache (`6K` System Prompt, Zero Extra VRAM, `2× Spark TP=2`)
+
+| Cross-Wave Workload (`5,993`-tok system prompt) | Before (No Persistent Anchor) | **After (`feat/persistent-prefix-cache` Promoted)** | Speedup |
+|---|---:|---:|---:|
+| **Wave 2 (`c = 8`, new user suffixes)** | `TTFT 2.035s` · `wall 7.42s` (`103.5 tok/s`) | **`TTFT 0.465s` · `wall 3.61s`** (`8/8` cached `5,968t`, `212.5 tok/s`) | **`4.38×` TTFT · `2.06×` wall** |
+| **Wave 3 (`c = 8`, new user suffixes)** | `TTFT 2.028s` · `wall 7.66s` (`100.2 tok/s`) | **`TTFT 0.457s` · `wall 3.24s`** (`8/8` cached `5,968t`, `237.3 tok/s`) | **`4.44×` TTFT · `2.36×` wall** |
+| **Solo Follow-Up (`c = 1`, same system prompt)** | `TTFT 1.710s` · `0` cached · `wall 2.50s` | **`TTFT 0.086s` · `5,948` cached (`99.4%`) · `wall 1.23s`** | **`19.9×` TTFT · `2.03×` wall** |
 
 ---
 
@@ -89,10 +79,11 @@ Ports `BatchDecoder` + `BatchDrafter` (`MXFP8`, `thr=0.50`, `min=2`) + grouped M
 
 ```text
 Frankengine/
-├── engine/         # C++/CUDA Blackwell engine (TP=2 + TP=1, NVFP4/FP8/MXFP8, DSpark + DFlash 2)
-├── tp_comm/        # Custom dual-rail RoCE UMA RDMA backend (48-CTA bulk FP32 AllReduce + 32-CTA 6.3x gather)
-├── scripts/        # Generic TP=1 & TP=2 launchers (config.sh, local.sh.example, serve_tp1.sh, serve_tp2.sh, run_tp2.sh, llmstat)
-├── docs/           # Engineering roadmap, TP=2 architecture, B200/GB200 Megakernel scaling audit, infographic
+├── engine/         # C++/CUDA Blackwell engine (TP=2 + TP=1, FP8 dense prefill, NVFP4/MXFP8, Sharded DFlash2, BatchDFlash2, Prefix Anchors)
+├── tp_comm/        # Custom dual-rail RoCEv2 UMA RDMA backend (48-CTA FP32/BF16 + K=4 pipelined bulk RDMA + 32-CTA 6.3x gather)
+├── scripts/        # TP=1 & TP=2 launchers, bench_matrix.py, session_fanout_demo.py, inkling_swarm.py, parallel_builder.py, llmstat
+├── .omp/           # Single-chat parallel fan-out extension (frankengine-parallel.ts with live /v1/telemetry polling)
+├── docs/           # RTX 5090 agent runbook, OPTIMIZATION_ROADMAP.md (EXP-001..039), TP=2 architecture, B200/NVL72 scaling audit
 ├── reports/        # Full interleaved qualification & ablation reports (TP=2 + TP=1)
 ├── LICENSE         # Apache-2.0
 └── NOTICE          # Full upstream and third-party copyright & license attributions
@@ -100,10 +91,39 @@ Frankengine/
 
 ---
 
-## Quickstart (`DGX Spark` `sm_121a` · `TP=1` or `TP=2`)
+## Quickstart
 
-### 1. Build Engine & `tp_comm`
+### Option A — Single-GPU Blackwell (`RTX 5090` / `RTX PRO 6000` `sm_120a`, `DGX Spark` `sm_121a`, `B200` `sm_100a`)
+
+> **Full autonomous setup & benchmark guide for RTX 5090 / RTX PRO 6000:** see [**`docs/RTX5090_AGENT_RUNBOOK.md`**](docs/RTX5090_AGENT_RUNBOOK.md) (pinned HF downloads, VRAM auto-sizing for 32 GB vs 96 GB GPUs, `bench_matrix.py`, and `BatchDFlash2` `ingine-batch-bench`).
+
 ```bash
+# 1. Pick CUDA arch: 120a (RTX 5090 / PRO 6000), 121a (DGX Spark), or 100a (B200)
+export ARCH=120a
+
+# 2. Build TP=1 engine (no InfiniBand/RoCE headers required)
+cmake -S engine/native -B "engine/native/build-${ARCH}" \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_CUDA_COMPILER="$(command -v nvcc)" \
+  -DCMAKE_CUDA_ARCHITECTURES="$ARCH" \
+  -DINKLING_COMM_SOURCE_DIR="" \
+  -DINGINE_BUILD_TESTS=OFF
+
+cmake --build "engine/native/build-${ARCH}" -j "$(nproc)" \
+  --target ingine-serve ingine-bench ingine-batch-bench ingine-validate
+
+# 3. Serve live (32 GB RTX 5090 example — 256K solo DFlash2/DSpark; or add BATCH_SPEC=7 MAX_BATCH=16 BATCH_CTX=4096 PARK_MB=0 for multi-agent batching):
+BUILD_DIR="$(pwd)/engine/native/build-${ARCH}" \
+HEAD_MODEL_DIR="$(pwd)/models/Inkling-2-Mini" \
+DFLASH2_DIR="$(pwd)/models/Inkling-2-Mini-DFlash2" \
+MAX_CTX=262144 MAX_BATCH=1 BATCH_SPEC=0 PARK_MB=2048 \
+./scripts/serve_tp1.sh
+```
+
+### Option B — Dual-Node Tensor Parallel (`2× DGX Spark` `sm_121a`, `TP=2` RoCEv2)
+
+```bash
+# 1. Build Engine + dual-rail RoCEv2 tp_comm
 cmake -S engine/native -B engine/native/build-gb10-tp \
   -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc \
@@ -113,25 +133,23 @@ cmake -S engine/native -B engine/native/build-gb10-tp \
   -DINGINE_BUILD_TESTS=ON
 
 cmake --build engine/native/build-gb10-tp -j 12 \
-  --target ingine-serve ingine-bench ingine-validate
-```
+  --target ingine-serve ingine-bench ingine-batch-bench ingine-validate
 
-### 2. Configure Your Node Paths (Gitignored Local Override)
-```bash
+# 2. Configure node paths & worker SSH alias (ensure Inkling-2-Mini-DFlash2 is present on both ranks for 50/50 TP=2 sharding)
 cp scripts/local.sh.example scripts/local.sh
-# Edit scripts/local.sh with your model paths (and worker SSH alias / RoCE IP for TP=2)
-```
 
-### 3. Serve Live (`256K` Context + Hybrid `DFlash 2` / `DSpark`)
-```bash
-# Single-GPU (TP=1):
-./scripts/serve_tp1.sh
-
-# Dual-Node Tensor Parallel (TP=2):
+# 3. Serve live (defaults: 256K solo + 32x32K BatchDFlash2 spec=7, TP_WIRE=bf16-moe, Persistent Prefix Cache)
 ./scripts/serve_tp2.sh
 ```
-Measure live TTFT, prefill, and decode throughput from any `curl` command using the bundled [`scripts/llmstat`](scripts/llmstat):
+
+### Live Health, Telemetry & One-Shot Benchmark
+
 ```bash
+# Live GPU tok/s, avg_accept_len, and clone_slot savings (JSON & Prometheus):
+curl -s http://127.0.0.1:8834/v1/telemetry
+curl -s http://127.0.0.1:8834/metrics
+
+# Quick streaming test via bundled scripts/llmstat:
 curl -sSN http://127.0.0.1:8834/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{
@@ -139,22 +157,25 @@ curl -sSN http://127.0.0.1:8834/v1/chat/completions \
     "messages": [{"role": "user", "content": "Write a concise Python LRU cache class using OrderedDict with get and put methods."}],
     "temperature": 0,
     "max_tokens": 160,
-    "enable_thinking": false,
+    "chat_template_kwargs": {"enable_thinking": false},
     "stream": true,
     "stream_options": {"include_usage": true}
   }' | ./scripts/llmstat
+
+# Full cross-GPU benchmark suite (short code, 8-category diversity, 4K..240K curve, multi-turn agent, needles):
+python3 scripts/bench_matrix.py --url http://127.0.0.1:8834/v1 --tag dual-spark-tp2
 ```
 
 ---
 
 ## Key Documentation
-- [**`docs/RTX5090_AGENT_RUNBOOK.md`**](docs/RTX5090_AGENT_RUNBOOK.md) — **Autonomous agent runbook** for RTX 5090 / RTX PRO 6000 / single-GPU Blackwell (`sm_120a` build, pinned HF downloads, 256K launch, and turnkey `scripts/bench_matrix.py` suite).
-- [**`docs/OPTIMIZATION_ROADMAP.md`**](docs/OPTIMIZATION_ROADMAP.md) — Living experiment ledger (`EXP-001`–`EXP-027`), byte-level roofline audits, dead-end registry, and optimization roadmap.
-- [**`docs/hardware_scaling_and_megakernel_audit.md`**](docs/hardware_scaling_and_megakernel_audit.md) — Calibrated hardware scaling projections (`RTX 5090/PRO 6000` → `1×/8× B200` → `GB200 NVL72` → `Vera Rubin`) and microsecond-by-microsecond Megakernel engineering verdict.
-- [**`docs/tp2_architecture.md`**](docs/tp2_architecture.md) — Tensor-parallel sharding and RoCE collective design.
-- [**`reports/phase_c_tp2_unified_qualification.md`**](reports/phase_c_tp2_unified_qualification.md) — Final Dual-Spark `TP=2` CLI, live SSE, SASS parity, and 65K/122K needle qualification report.
+- [**`docs/RTX5090_AGENT_RUNBOOK.md`**](docs/RTX5090_AGENT_RUNBOOK.md) — **Autonomous agent runbook** for RTX 5090 / RTX PRO 6000 / single-GPU Blackwell (`sm_120a` build, pinned HF downloads, VRAM-aware 32 GB / 96 GB launch presets, `scripts/bench_matrix.py`, and `BatchDFlash2` `ingine-batch-bench`).
+- [**`docs/OPTIMIZATION_ROADMAP.md`**](docs/OPTIMIZATION_ROADMAP.md) — Living experiment ledger (`EXP-001`–`EXP-039`), byte-level roofline audits, dead-end registry, and optimization roadmap.
+- [**`docs/hardware_scaling_and_megakernel_audit.md`**](docs/hardware_scaling_and_megakernel_audit.md) — Calibrated hardware scaling projections (`RTX 5090/PRO 6000` → `1×/8× B200` → `GB200 NVL72` → `Vera Rubin`) and Megakernel engineering verdict.
+- [**`docs/tp2_architecture.md`**](docs/tp2_architecture.md) — Tensor-parallel sharding and RoCEv2 collective design.
+- [**`reports/phase_c_tp2_unified_qualification.md`**](reports/phase_c_tp2_unified_qualification.md) — Dual-Spark `TP=2` CLI, live SSE, SASS parity, and 65K/122K needle qualification report.
 - [**`reports/track1_tp1_frankengine.md`**](reports/track1_tp1_frankengine.md) — Single-Spark `TP=1` Frankengine qualification report (`155.35 tok/s` live short code, `256K` live needles).
-- [**`reports/track2a_continuous_batching.md`**](reports/track2a_continuous_batching.md) — True GPU continuous batching (`--max-batch 1..8`) qualification report (`266.3 tok/s` `TP=2` & `181.8 tok/s` `TP=1` at `c=8`, zero `c=1` SASS regression).
+- [**`reports/track2a_continuous_batching.md`**](reports/track2a_continuous_batching.md) — True GPU continuous batching (`--max-batch 1..8`) qualification report.
 - [**`reports/track2b_suffix_spec.md`**](reports/track2b_suffix_spec.md) & [**`reports/track2c_prefill_accel.md`**](reports/track2c_prefill_accel.md) — Suffix-copy speculation evaluation & Nsight 32K prefill roofline audit.
 
 ---
@@ -167,11 +188,11 @@ Frankengine stands on the shoulders of outstanding open-source work. All origina
 1. **[`Neroued/ninfer`](https://github.com/Neroued/ninfer) (NInfer)** — Foundational C++/CUDA inference engine design.
 2. **[`satellitedown/cinference`](https://github.com/satellitedown/cinference)** (commit `383e5db`) — C++ engine evolution derived from NInfer.
 3. **[`satellitedown/fngine`](https://github.com/satellitedown/fngine)** — CUDA-graph runtime, weight-loading, OpenAI HTTP server, and Jinja/tokenizer pipeline.
-4. **[`satellitedown/inkling-2-mini-abliterated-ingine`](https://github.com/satellitedown/inkling-2-mini-abliterated-ingine) (`ingine`, base commit `556acc7`)** — Single-GPU `sm_120a` Blackwell C++/CUDA engine for `Inkling-2-Mini` (NVFP4/MXFP8 MoE kernels, FP8 dense projections, prefill, DSpark speculative loop, and OpenAI server) from which Frankengine's `engine/` directory is forked and extended for `sm_121a`, `TP=2`, sharded NVFP4 head/drafter, and hybrid `DFlash 2`.
+4. **[`satellitedown/inkling-2-mini-abliterated-ingine`](https://github.com/satellitedown/inkling-2-mini-abliterated-ingine) (`ingine`, base commit `556acc7`)** — Single-GPU `sm_120a` Blackwell C++/CUDA engine for `Inkling-2-Mini` from which Frankengine's `engine/` directory is forked and extended for `sm_121a`, `TP=2`, native Blackwell prefill MMA, sharded `DFlash 2`, `BatchDFlash2`, persistent prefix caching, and live telemetry.
 
 ### Models & Speculative Drafters
 - **[`thinkingmachines/Inkling-2-Mini`](https://huggingface.co/thinkingmachines/Inkling-2-Mini)** (Thinking Machines, Apache-2.0) — Base `30B-A3.6B` looped MoE model and `DSpark` (`mtp.safetensors`) drafter.
-- **[`incoai/Inkling-2-Mini-DFlash2`](https://huggingface.co/incoai/Inkling-2-Mini-DFlash2)** (Inco AI, Apache-2.0) — 0.5B 5-layer parallel block-diffusion drafter weights and architecture implemented natively in Frankengine's FP8 CUDA-graph + TP=2 sharded NVFP4 head path.
+- **[`incoai/Inkling-2-Mini-DFlash2`](https://huggingface.co/incoai/Inkling-2-Mini-DFlash2)** (Inco AI, Apache-2.0) — 0.5B 5-layer parallel block-diffusion drafter weights and architecture implemented natively in Frankengine's FP8 CUDA-graph, 50/50 TP=2 sharded, and `BatchDFlash2` paths.
 
 ### Benchmarks, Architecture Cross-Checks & Methodology
 - **[`slatesys/lunomi-inkling`](https://github.com/slatesys/lunomi-inkling) (Basalt)** — Reference RTX 5090 Inkling-2-Mini engine comparisons and optimization insights.

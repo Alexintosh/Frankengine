@@ -25,10 +25,10 @@ df -h .
 - **Compiler & Build Tools:** GCC 12+ (`g++`), `cmake` ≥ 3.24, `ninja` (optional), `python3` ≥ 3.10, `git`
 - **Free Disk:** ≥ 28 GB (`~20.2 GB` base model + `~0.95 GB` DFlash 2 drafter + `~1.5 GB` build)
 - **Free VRAM (auto-selected in Step 4):**
-  - **`≥ 60 GiB` free (e.g., RTX PRO 6000 96 GB / B200 / DGX Spark 128 GB):** full **`MAX_CTX=262144` (256K solo `DFlash 2`) + `MAX_BATCH=32, BATCH_CTX=32768, BATCH_SPEC=4`** (~`50 GiB` peak VRAM on `TP=1`).
+  - **`≥ 60 GiB` free (e.g., RTX PRO 6000 96 GB / B200 / DGX Spark 128 GB):** full **`MAX_CTX=262144` (256K solo `DFlash 2`) + `MAX_BATCH=32, BATCH_CTX=32768, BATCH_SPEC=7, BATCH_SPEC_THRESHOLD=0.30`** (`BatchDFlash2` `hybrid` auto-selected when `--dflash2-dir` & `--batch-spec >= 5`; ~`52 GiB` peak VRAM on `TP=1`).
   - **`27.5–59 GiB` free (e.g., dedicated 32 GB RTX 5090):**
     - For single-stream `256K` qualification (`scripts/bench_matrix.py`): **`MAX_CTX=262144 MAX_BATCH=1 BATCH_SPEC=0 PARK_MB=2048`** (`26.1 GiB` peak NVML).
-    - For live multi-agent batched speculative serving on 32 GB: **`MAX_CTX=131072 MAX_BATCH=16 BATCH_CTX=4096 BATCH_SPEC=4 PARK_MB=0`** (or `MAX_BATCH=8 BATCH_CTX=8192`, ~`28–29 GiB`).
+    - For live multi-agent batched speculative serving on 32 GB (with `BatchDFlash2`, `~20 MiB/slot`, plus `clone_slot` & Persistent Prefix Anchors): **`MAX_CTX=131072 MAX_BATCH=16 BATCH_CTX=4096 BATCH_SPEC=7 BATCH_SPEC_THRESHOLD=0.30 PARK_MB=0`** (or `MAX_BATCH=8 BATCH_CTX=8192`, ~`28–29 GiB`).
   - **`23–27.4 GiB` free** (e.g., 32 GB RTX 5090 also driving a desktop display): **`MAX_CTX=131072 MAX_BATCH=1 BATCH_SPEC=0 PARK_MB=512`** (~`22–23 GiB` peak VRAM). `scripts/bench_matrix.py` auto-detects `max_model_len` from `/v1/models` and adjusts its maximum context test automatically.
 
 ---
@@ -121,9 +121,10 @@ ls -lh "engine/native/build-${ARCH}/apps/serve/ingine-serve" \
 ## 4. Launch the Live `TP=1` OpenAI Server
 
 Frankengine's production single-GPU settings:
-- **Precision:** `--dense-fp8 --kv-fp8 --head-nvfp4 --draft-nvfp4` (zero-copy NVFP4 LM head reused by DFlash 2)
-- **Speculative Decoding:** `--spec --spec-widths fine2 --spec-threshold 0.65 --draft-type hybrid --dflash2-adaptive --dflash2-threshold 0.50 --dflash2-max-ctx 1536`
-  - Uses eager-captured `FP8` CUDA-graph `DFlash 2` on short greedy prompts (`≤1,536` tokens) and global `DSpark` on longer contexts and sampled (`temperature > 0`) requests.
+- **Precision & Blackwell Kernels:** `--dense-fp8 --kv-fp8 --head-nvfp4 --draft-nvfp4` (native `mxf4nvf4`/`mxf8f6f4` prefill MoE, custom FP8 dense prefill `OUTER_VEC_32F` MMA, BF16 MMA `rel_logits`, and zero-copy NVFP4 LM head reused by DFlash 2)
+- **Speculative Decoding:** `--spec --spec-widths fine2 --spec-threshold 0.65 --draft-type hybrid --dflash2-adaptive --dflash2-threshold 0.50 --dflash2-max-ctx 6144`
+  - Uses eager-captured `FP8` CUDA-graph `DFlash 2` on short/medium prompts (`≤6,144` tokens) and global `DSpark` on longer contexts and sampled (`temperature > 0`) requests.
+- **Batched Speculation & Prefix Caching:** when `BATCH_SPEC=7` (`BATCH_SPEC_THRESHOLD=0.30`, `BATCH_SPEC_MIN=2`) is active, `ingine-serve` auto-selects `BatchDFlash2` (`hybrid`) + `c=32` CUDA Graphs + automatic GPU `clone_slot` + zero-VRAM Persistent Prefix Anchors (`<|end_message|>` / `<|im_end|>` boundary detection) and exposes live `GET /v1/telemetry` & `GET /metrics`.
 - **Context:** `MAX_CTX=262144` (256K) if `≥27.5 GiB` VRAM is free; otherwise set `MAX_CTX=131072 PARK_MB=512`.
 
 Start the server in the background and log to `/tmp/frankengine_serve.log`:
@@ -136,15 +137,17 @@ export HOST=127.0.0.1
 export PORT=8834
 export SERVED_NAME=inkling-2-mini
 
-# Auto-size solo context & Track 3 batched speculative pool for free VRAM on GPU 0:
-# (Note: scripts/config.sh defaults to Dual-Spark/96GB 32x32K; override on 32 GB GPUs to avoid OOM!)
+# Auto-size solo context & BatchDFlash2 speculative pool for free VRAM on GPU 0:
+# (Note: scripts/config.sh defaults to Dual-Spark/96GB 32x32K spec=7; override on 32 GB GPUs to avoid OOM!)
 FREE_MIB=$(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits -i 0 | head -n 1 | tr -d ' ')
 if [ "${FREE_MIB:-0}" -ge 60000 ]; then
-  echo "Free VRAM is ${FREE_MIB} MiB (>=60 GiB, e.g. RTX PRO 6000 / B200 / Spark): enabling 256K solo + 32x32K batched spec."
+  echo "Free VRAM is ${FREE_MIB} MiB (>=60 GiB, e.g. RTX PRO 6000 / B200 / Spark): enabling 256K solo + 32x32K BatchDFlash2 (spec=7)."
   export MAX_CTX=262144
   export MAX_BATCH=32
   export BATCH_CTX=32768
-  export BATCH_SPEC=4
+  export BATCH_SPEC=7
+  export BATCH_SPEC_THRESHOLD=0.30
+  export BATCH_SPEC_MIN=2
   export MAX_QUEUE=64
   export PARK_MB=2048
 elif [ "${FREE_MIB:-0}" -ge 28000 ]; then
@@ -187,7 +190,7 @@ for i in $(seq 1 90); do
 done
 ```
 
-Quick 1-shot sanity check using the bundled `scripts/llmstat`:
+Quick 1-shot sanity check + live telemetry check using the bundled `scripts/llmstat`:
 ```bash
 curl -sSN "http://127.0.0.1:${PORT}/v1/chat/completions" \
   -H 'Content-Type: application/json' \
@@ -196,10 +199,12 @@ curl -sSN "http://127.0.0.1:${PORT}/v1/chat/completions" \
     "messages": [{"role": "user", "content": "Write a concise Python LRU cache class using OrderedDict with get and put methods."}],
     "temperature": 0,
     "max_tokens": 160,
-    "enable_thinking": false,
+    "chat_template_kwargs": {"enable_thinking": false},
     "stream": true,
     "stream_options": {"include_usage": true}
   }' | ./scripts/llmstat
+
+curl -sS "http://127.0.0.1:${PORT}/v1/telemetry" && echo ""
 ```
 
 ---
@@ -236,27 +241,35 @@ python3 scripts/bench_matrix.py \
 
 ## 5b. Batched Speculative Concurrency Roofline (`ingine-batch-bench`, Optional)
 
-Stop `ingine-serve` first (Step 6) so the GPU has full free VRAM, then run the standalone batched speculative benchmark (`DSpark MXFP8` drafter + FP8 KV):
+Stop `ingine-serve` first (Step 6) so the GPU has full free VRAM, then run the standalone batched speculative benchmark with the fused `--head-nvfp4` unembed (`-922 MB` VRAM) — comparing `BatchDFlash2` (`--spec 7`) and `BatchDrafter` (`--spec 4`):
 
 ```bash
 BATCH_BIN="engine/native/build-${ARCH}/apps/batch/ingine-batch-bench"
 PROMPTS="engine/bench/prompts-short.json"
 
-# Fits on both 32 GB RTX 5090 (~29.1 GB @ c=64) and 96 GB RTX PRO 6000:
-for C in 8 16 32 64; do
+# 1. BatchDFlash2 (GAMMA=7, MXFP8 + FP8 KV rings, +27%..+46% over DSpark; fits 32 GB RTX 5090 up to c=32):
+for C in 1 8 16 32; do
   "$BATCH_BIN" --model-dir models/Inkling-2-Mini --prompts "$PROMPTS" \
-    --seqs "$C" --ctx 640 --tokens 512 --kv-fp8 --temperature 0 \
-    --spec 4 --spec-threshold 0.5 --spec-min 2
+    --seqs "$C" --ctx 1024 --tokens 256 --kv-fp8 --head-nvfp4 --temperature 0 \
+    --spec 7 --spec-threshold 0.30 --spec-min 2 \
+    --batch-draft-type dflash2 --dflash2-dir models/Inkling-2-Mini-DFlash2
 done
 
-# 96 GB RTX PRO 6000 / B200 / Spark only (high concurrency & long-context pool):
+# 2. High-concurrency BatchDrafter DSpark (fits 32 GB RTX 5090 up to c=64 @ ~28.2 GB with --head-nvfp4):
+for C in 8 16 32 64; do
+  "$BATCH_BIN" --model-dir models/Inkling-2-Mini --prompts "$PROMPTS" \
+    --seqs "$C" --ctx 640 --tokens 512 --kv-fp8 --head-nvfp4 --temperature 0 \
+    --spec 4 --spec-threshold 0.50 --spec-min 2
+done
+
+# 3. 96 GB RTX PRO 6000 / B200 / Spark only (high concurrency & long-context pool):
 if [ "${FREE_MIB:-0}" -ge 60000 ]; then
   "$BATCH_BIN" --model-dir models/Inkling-2-Mini --prompts "$PROMPTS" \
-    --seqs 32 --ctx 8192 --tokens 256 --kv-fp8 --temperature 0 \
-    --spec 4 --spec-threshold 0.5 --spec-min 2
+    --seqs 32 --ctx 8192 --tokens 256 --kv-fp8 --head-nvfp4 --temperature 0 \
+    --spec 4 --spec-threshold 0.50 --spec-min 2
   "$BATCH_BIN" --model-dir models/Inkling-2-Mini --prompts "$PROMPTS" \
-    --seqs 128 --ctx 640 --tokens 512 --kv-fp8 --temperature 0 \
-    --spec 4 --spec-threshold 0.5 --spec-min 2
+    --seqs 128 --ctx 640 --tokens 512 --kv-fp8 --head-nvfp4 --temperature 0 \
+    --spec 4 --spec-threshold 0.50 --spec-min 2
 fi
 ```
 
@@ -284,14 +297,18 @@ Package and share back **all three files** (e.g., `tar -czf bench_results_rtx509
 
 ---
 
-## Reference Baselines for Comparison (NVIDIA DGX Spark GB10, `231 GB/s` DRAM BW)
+## Reference Baselines for Comparison (NVIDIA DGX Spark GB10, `231 GB/s` DRAM BW, Promoted `main`)
 
-| Workload | `1× DGX Spark` (`TP=1`) | `2× DGX Spark` (`TP=2`) | Expected `1× RTX 5090` (`1,792 GB/s`) |
+| Workload | `1× DGX Spark` (`TP=1`) | `2× DGX Spark` (`TP=2` Promoted) | Expected `1× RTX 5090` (`1,792 GB/s`) |
 |---|---:|---:|---:|
-| **Short Code Greedy (`LRU cache`, 160 tok)** | `155.4 tok/s` | `243.1 tok/s` | `~800–1,050 tok/s` |
-| **32K Context Sampled Code (`T=0.7`, warm)** | `~77–95 tok/s` | `199.9 tok/s` (`9 ms` TTFT) | `~550–700 tok/s` |
-| **Cold Prefill (`4K–32K`)** | `2,770–2,889 tok/s` | `2,802–3,200 tok/s` | `~15,000–25,000 tok/s` |
-| **Peak Memory @ `256K` Context (`c=1`)** | `26.1 GiB` (`1` GPU) | `27.2 GiB` (`2` GPUs) | `~26–27 GiB` |
+| **Short Code Greedy (`36t`, `DFlash 2`)** | `155.4 tok/s` | **`257.5 tok/s`** warm (`247.9` cold) | `~850–1,100 tok/s` |
+| **File-Edit / Refactor (`1.5K`, `320t`)** | — | **`263.9 tok/s`** | `~900–1,150 tok/s` |
+| **8-Category Mean Decode (`256t`, `T=0`)** | — | **`159.6 tok/s`** | `~600–750 tok/s` |
+| **Cold Prefill (`2K–32K`, native FP8/NVFP4)** | `3,619` (`2K` FP8) / `2,770` (`32K`) | **`3,761` (`4K`) / `3,732` (`11K`) / `3,579` (`32K`)** | `~18,000–28,000 tok/s` |
+| **32K Context Sampled Code (`T=0.7`, warm)** | `~77–95 tok/s` | **`143.6–199.9 tok/s`** (`9–99 ms` TTFT) | `~550–720 tok/s` |
+| **Peak Memory @ `256K` Context (`c=1`)** | `26.1 GiB` (`1` GPU) | `31.3 GiB` (`32×32K` + `256K` solo) | `~26–27 GiB` (`c=1`) |
+| **Batched `BatchDFlash2` `c=32` (`spec=7`)** | **`493.1 tok/s`** (`1K` ctx) | **`585.1` wall / `846.4` sum** (`live SSE`) | `~2,800–3,600 tok/s` |
 | **Batched Spec `c=64` (`ctx=640`, `spec=4`)** | `600.8 tok/s` | `820.5 tok/s` (`1,132` SS) | `~4,100–4,500 tok/s` |
-| **Batched Spec `c=128` (`ctx=640` / `32K`)** | — | `1,187 / 1,228 tok/s` | `~5,000–6,500 tok/s` (PRO 6000 96 GB) |
-| **`65K` / `122K` Exact Needles** | `PASS` / `PASS` | `PASS` / `PASS` | `PASS` / `PASS` |
+| **Batched Spec `c=128` (`ctx=640` / `32K`)** | — | `1,187 / 1,228 tok/s` (`1,614 / 1,504` SS) | `~5,000–6,500 tok/s` (PRO 6000 96 GB) |
+| **6K Persistent Prefix Follow-Up (`c=1`)** | — | **`86 ms` TTFT** (`19.9×` vs `1.71s`) | `~15–25 ms` TTFT |
+| **`16K` / `65K` / `122K` Exact Needles** | `PASS` | **`PASS`** (`157 / 182 / 129 tok/s`) | `PASS` |
