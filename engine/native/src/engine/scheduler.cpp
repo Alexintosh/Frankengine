@@ -375,7 +375,6 @@ void Scheduler::batch_loop() {
     }
     auto& first = slots_.front();
     if (first.solo) {
-      first.solo = false;
       decoding_slots_.store(1, std::memory_order_relaxed);
       bool interrupted = false;
       try {
@@ -414,6 +413,7 @@ void Scheduler::batch_loop() {
         first.job->fail(e.what());
         first.done = true;
       }
+      first.solo = false;
       if (!interrupted) decoding_slots_.store(0, std::memory_order_relaxed);
       continue;
     }

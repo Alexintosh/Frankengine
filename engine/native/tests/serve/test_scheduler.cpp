@@ -324,6 +324,36 @@ void test_solo_telemetry_and_prefill_pacing() {
   CHECK(paced_512 >= 3);
 }
 
+void test_solo_crosses_batch_ctx_up_to_max_model_len() {
+  BatchGenerator gen(100);
+  gen.max_ctx_ = 200;
+  gen.batch_ctx_ = 128;
+  gen.spec_ = 4;
+  Scheduler scheduler(gen, {}, 16);
+
+  // 1) Solo request starting below batch_max_ctx() (force_solo == false) must cross batch_max_ctx()
+  //    up to max_model_len() instead of truncating at batch_max_ctx().
+  auto cross = std::make_shared<Job>(std::vector<int32_t>(100, 7), 60, Sampling{});
+  CHECK(scheduler.submit(cross));
+  CHECK(drain(*cross) == std::vector<int32_t>(60, 100));
+
+  // 2) Solo request exceeding max_model_len() still caps cleanly at max_model_len() - prompt_len.
+  auto capped = std::make_shared<Job>(std::vector<int32_t>(100, 8), 500, Sampling{});
+  CHECK(scheduler.submit(capped));
+  CHECK(drain(*capped) == std::vector<int32_t>(100, 100));
+
+  // 3) Concurrent batch wave (c=3) still caps each batch lane at batch_max_ctx() - prompt_len.
+  auto b1 = std::make_shared<Job>(std::vector<int32_t>(100, 9), 60, Sampling{});
+  auto b2 = std::make_shared<Job>(std::vector<int32_t>(100, 10), 60, Sampling{});
+  auto b3 = std::make_shared<Job>(std::vector<int32_t>(100, 11), 60, Sampling{});
+  CHECK(scheduler.submit(b1));
+  CHECK(scheduler.submit(b2));
+  CHECK(scheduler.submit(b3));
+  CHECK(drain(*b1) == std::vector<int32_t>(28, 100));
+  CHECK(drain(*b2) == std::vector<int32_t>(28, 100));
+  CHECK(drain(*b3) == std::vector<int32_t>(28, 100));
+}
+
 }  // namespace
 
 int main() {
@@ -333,6 +363,7 @@ int main() {
   test_prefix_anchor_eviction_at_full_capacity();
   test_system_prompt_anchor_boundary();
   test_solo_telemetry_and_prefill_pacing();
+  test_solo_crosses_batch_ctx_up_to_max_model_len();
   test_cuts();
   test_cancel_fifo_bound();
   test_failure_and_close();

@@ -11,9 +11,12 @@ class BatchGenerator final : public ingine::model::Generator {
  public:
   explicit BatchGenerator(int32_t token) : token_(token) {}
   std::string model_id() const override { return "batch-test"; }
-  int max_model_len() const override { return 8192; }
+  int max_model_len() const override { return max_ctx_; }
+  int batch_max_ctx() const override { return batch_ctx_ > 0 ? batch_ctx_ : max_ctx_; }
   int max_batch() const override { return 8; }
   int batch_spec() const override { return spec_; }
+  int max_ctx_ = 8192;
+  int batch_ctx_ = 0;
   int spec_ = 0;
 
   ingine::model::GenerateStats generate(
