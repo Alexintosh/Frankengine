@@ -13,6 +13,7 @@
 #include "model/batch.h"
 #include "model/batch_dflash2.h"
 #include "model/batch_drafter.h"
+#include "model/batch_engine.h"
 #include "model/drafter.h"
 #include "model/dflash2.h"
 
@@ -133,6 +134,7 @@ class EngineGenerator final : public Generator {
         throw std::invalid_argument("batch_ctx must be in [1024, max_ctx]");
       const TpLayout layout = rt_.tp() ? rt_.tp()->layout : TpLayout{};
       const cudaStream_t stream = rt_.stream();
+      adaptive_batch_spec_ = batch_spec_adaptive(rt_.tp(), stream);
       if (!rt_.weights().unembed_nvfp4.codes && (!rt_.weights().unembed.w.data || rt_.weights().unembed.fp8())) {
         batch_unembed_ = load_head(options.model_dir, /*dense_fp8=*/false, /*head_nvfp4=*/false, stream,
                                    batch_head_storage_, layout).dense;
@@ -204,6 +206,9 @@ class EngineGenerator final : public Generator {
       batch_drafts_.assign(std::size_t(options.max_batch) * G, 0);
       batch_conf_.assign(std::size_t(options.max_batch) * G, 0.f);
       batch_spec_histories_.resize(std::size_t(options.max_batch));
+      batch_slot_ema_p_.assign(std::size_t(options.max_batch), BatchSpecCost::initial_p);
+      batch_slot_spec_steps_.assign(std::size_t(options.max_batch), 0);
+      batch_slot_draft_budget_.assign(std::size_t(options.max_batch), options.batch_spec);
     }
     if (options.spec && options.draft_type != "dflash2")
       spec_ = std::make_unique<SpecLoop>(rt_, drafter_.get());
@@ -401,6 +406,7 @@ class EngineGenerator final : public Generator {
       }
     }
     batch_spec_histories_.at(std::size_t(slot)) = tokens_in_state_;
+    reset_batch_spec_cost(slot);
     if (batch_drafter_) batch_drafter_->reset_slot(slot);
     if (batch_dflash2_) batch_dflash2_->reset_slot(slot);
     if (pending_token >= 0) {
@@ -441,6 +447,7 @@ class EngineGenerator final : public Generator {
       CUDA_CHECK(cudaMemcpyAsync(dst.v_full_at(fi).data, src.v_full_at(fi).data, copy_bytes, cudaMemcpyDeviceToDevice, stream));
     }
     batch_spec_histories_.at(std::size_t(dst_slot)) = src_hist;
+    reset_batch_spec_cost(dst_slot);
     if (batch_drafter_) batch_drafter_->clone_slot(src_slot, dst_slot, len);
     if (batch_dflash2_) batch_dflash2_->clone_slot(src_slot, dst_slot, len);
     return true;
@@ -461,6 +468,7 @@ class EngineGenerator final : public Generator {
       auto& history = batch_spec_histories_.at(std::size_t(slot));
       int reused = 0;
       if (offset == 0) {
+        reset_batch_spec_cost(slot);
         if (!options_.cold_prefill && !history.empty() && history.size() < prompt.size() &&
             std::equal(history.begin(), history.end(), prompt.begin())) {
           reused = int(history.size());
@@ -560,7 +568,7 @@ class EngineGenerator final : public Generator {
     std::vector<std::vector<int32_t>> emitted(ns);
     if (n == 0) return emitted;
     constexpr int G = BatchDrafter::GAMMA;
-    const float theta = std::max(0.05f, options_.batch_spec_threshold * float(n) / float(options_.max_batch));
+    const BatchSpecCost cost(adaptive_batch_spec_, n, options_.max_batch, options_.batch_spec_threshold);
     std::vector<std::int32_t> m(ns), slot_ids(ns), tok;
     std::vector<std::int64_t> pos(ns);
     std::vector<float> temp(ns);
@@ -569,15 +577,10 @@ class EngineGenerator final : public Generator {
       const int s = slots[std::size_t(i)].slot;
       const int p_cur = int(batch_spec_histories_.at(std::size_t(s)).size());
       const int avail = std::max(0, options_.batch_ctx - 1 - p_cur);
-      const int k_max = std::min(options_.batch_spec, std::max(0, avail - 1));
-      const int k_min = std::min(options_.batch_spec_min, k_max);
-      int k = k_max;
-      if (options_.batch_spec_threshold > 0.f && k_max > 0) {
-        const float* c = batch_conf_.data() + std::size_t(s) * G;
-        float prod = 1.f;
-        k = 0;
-        while (k < k_max && ((prod *= c[k]) > theta || k < k_min)) ++k;
-      }
+      const int k_max = std::min(batch_slot_draft_budget_[s], std::max(0, avail - 1));
+      const float* c = batch_conf_.data() + std::size_t(s) * G;
+      const int k = cost.verification_width(k_max, options_.batch_spec_min, c, batch_slot_ema_p_[s],
+                                            batch_slot_spec_steps_[s]);
       m[std::size_t(i)] = k + 1;
       slot_ids[std::size_t(i)] = s;
       pos[std::size_t(i)] = p_cur;
@@ -598,14 +601,16 @@ class EngineGenerator final : public Generator {
       const std::int32_t* out = got.data() + off[std::size_t(i)];
       int a = 0;
       while (a < K && row[1 + a] == out[a]) ++a;
+      const int slot = slot_ids[std::size_t(i)];
+      BatchSpecCost::observe(K, a, batch_slot_ema_p_[slot], batch_slot_spec_steps_[slot]);
       emitted[std::size_t(i)].assign(row + 1, row + 1 + a);
       emitted[std::size_t(i)].push_back(out[a]);
       keep[std::size_t(i)] = a + 1;
-      auto& hist = batch_spec_histories_.at(std::size_t(slot_ids[std::size_t(i)]));
+      auto& hist = batch_spec_histories_.at(std::size_t(slot));
       hist.insert(hist.end(), row, row + a + 1);
       const std::int64_t np = pos[std::size_t(i)] + a + 1;
       if (np + 1 < options_.batch_ctx) {
-        d_slots.push_back(slot_ids[std::size_t(i)]);
+        d_slots.push_back(slot);
         d_anchors.push_back(out[a]);
         d_pos.push_back(np);
       }
@@ -1295,6 +1300,12 @@ class EngineGenerator final : public Generator {
     return token;
   }
 
+  void reset_batch_spec_cost(int slot) {
+    batch_slot_ema_p_[slot] = BatchSpecCost::initial_p;
+    batch_slot_spec_steps_[slot] = 0;
+    batch_slot_draft_budget_[slot] = options_.batch_spec;
+  }
+
   void batch_draft_slots(int n, const std::int32_t* slots, const std::int32_t* anchors, const std::int64_t* next_pos) {
     constexpr int G = BatchDrafter::GAMMA;
     const cudaStream_t stream = rt_.stream();
@@ -1349,19 +1360,36 @@ class EngineGenerator final : public Generator {
 
     if (!df_idx.empty()) {
       const int ndf = int(df_idx.size());
+      std::vector<std::int32_t> df_max_drafts;
+      int total_rows = ndf * G;
+      if (adaptive_batch_spec_) {
+        const BatchSpecCost cost(true, n, options_.max_batch, options_.batch_spec_threshold);
+        df_max_drafts.reserve(df_idx.size());
+        total_rows = 0;
+        for (const int i : df_idx) {
+          const int slot = slots[i];
+          const int budget = cost.proposal_budget(options_.batch_spec, options_.batch_spec_min, batch_slot_ema_p_[slot],
+                                                  batch_slot_spec_steps_[slot]);
+          batch_slot_draft_budget_[slot] = budget;
+          df_max_drafts.push_back(budget);
+          total_rows += budget;
+        }
+      }
       if (batch_dflash2_) {
         std::vector<std::int32_t> sl, an;
         std::vector<std::int64_t> np;
         gather_sub(df_idx, sl, an, np);
-        const BatchDFlash2::Drafts d = batch_dflash2_->propose(ndf, sl.data(), an.data(), np.data());
+        const BatchDFlash2::Drafts d = batch_dflash2_->propose(
+            ndf, sl.data(), an.data(), np.data(), df_max_drafts.empty() ? nullptr : df_max_drafts.data());
         scatter_sync(df_idx, d.tokens, d.conf);
       } else if (rt_.tp()) {
-        if (batch_dflash2_head_) batch_dflash2_head_->run(ndf, nullptr);
+        if (batch_dflash2_head_) batch_dflash2_head_->run_rows(total_rows);
         scatter_sync(df_idx, nullptr, nullptr);
       }
     }
     if (!ds_idx.empty()) {
       const int nds = int(ds_idx.size());
+      for (const int i : ds_idx) batch_slot_draft_budget_[slots[i]] = options_.batch_spec;
       if (batch_drafter_) {
         std::vector<std::int32_t> sl, an;
         std::vector<std::int64_t> np;
@@ -1384,6 +1412,7 @@ class EngineGenerator final : public Generator {
   BatchState batch_state_;
   std::string batch_draft_type_;
   int batch_dflash2_max_ctx_ = 0;
+  bool adaptive_batch_spec_ = false;
   std::unique_ptr<BatchDecoder> batch_dec_;
   std::unique_ptr<BatchDrafter> batch_drafter_;
   std::vector<DeviceBuffer> batch_dflash2_head_storage_;
@@ -1392,6 +1421,9 @@ class EngineGenerator final : public Generator {
   DeviceBuffer batch_gathered_, batch_rows_, batch_draft_bcast_;
   std::vector<std::int32_t> batch_drafts_;
   std::vector<float> batch_conf_;
+  std::vector<float> batch_slot_ema_p_;
+  std::vector<int> batch_slot_spec_steps_;
+  std::vector<int> batch_slot_draft_budget_;  // available proposals for the next verification
   std::uint64_t batch_draws_ = 0;
   RuntimeOptions options_;
   std::unique_ptr<Runtime> runtime_;

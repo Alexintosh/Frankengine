@@ -25,6 +25,28 @@ class BatchDFlash2Head;
 class BatchDrafter;
 class Prefiller;
 
+// Both batched entry points use the same policy so proposal budgets can be computed
+// independently on each TP rank from the accepted prefixes.
+bool batch_spec_adaptive(TpRuntime* tp, cudaStream_t stream);
+
+class BatchSpecCost {
+ public:
+  static constexpr float initial_p = 0.75f;
+
+  BatchSpecCost(bool adaptive, int n, int slots, float threshold);
+  int verification_width(int k_max, int k_min, const float* confidence, float ema_p, int steps) const;
+  int proposal_budget(int k_max, int k_min, float ema_p, int steps) const;
+  static void observe(int k, int accepted, float& ema_p, int& steps);
+
+ private:
+  int minimum_width(int k_max, int k_min, float ema_p, int steps) const;
+
+  int n_;
+  bool use_threshold_;
+  bool calibrate_;
+  float theta_;
+};
+
 struct BatchEngineOptions {
   std::filesystem::path model_dir;
   std::filesystem::path ablation;  // empty: the original model
@@ -100,6 +122,7 @@ class BatchEngine final : public BatchBackend {
   std::unique_ptr<BatchDecoder> dec_;  // 8 rows per sequence at most (admissions, verify steps)
   std::string batch_draft_type_;
   int dflash2_max_ctx_ = 6144;
+  bool adaptive_batch_spec_ = false;
   std::unique_ptr<BatchDrafter> drafter_;
   std::vector<DeviceBuffer> dflash2_head_storage_;
   std::unique_ptr<BatchDFlash2Head> dflash2_head_;
@@ -115,6 +138,9 @@ class BatchEngine final : public BatchBackend {
   std::uint64_t draft_calls_ = 0;
   std::vector<std::int32_t> drafts_;  // speculative: [slots, GAMMA] drafts after each slot's pending token
   std::vector<float> conf_;            // speculative: [slots, GAMMA] their confidences
+  std::vector<float> batch_slot_ema_p_;
+  std::vector<int> batch_slot_spec_steps_;
+  std::vector<int> batch_slot_draft_budget_;  // available proposals for the next verification
   std::vector<std::int32_t> draft_host_;  // speculative: the drafter's [n, GAMMA] output
   std::vector<float> conf_host_;
   std::FILE* trace_ = nullptr;

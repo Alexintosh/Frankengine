@@ -10,9 +10,11 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdlib>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 
 namespace ingine::model {
 namespace {
@@ -44,6 +46,69 @@ std::filesystem::path resolve_dflash2_dir(const BatchEngineOptions& o) {
 }
 
 }  // namespace
+
+bool batch_spec_adaptive(TpRuntime* tp, cudaStream_t stream) {
+  const bool root = !tp || tp->layout.tp_rank == 0;
+  int enabled = 1;
+  if (root) {
+    if (const char* env = std::getenv("INGINE_BATCH_SPEC_ADAPTIVE"); env && std::string_view(env) == "0")
+      enabled = 0;
+  }
+  if (tp) {
+    DeviceBuffer device(sizeof(enabled));
+    if (root)
+      CUDA_CHECK(cudaMemcpyAsync(device.p, &enabled, sizeof(enabled), cudaMemcpyHostToDevice, stream));
+    tp->broadcast_proposal(device.p, sizeof(enabled), stream);
+    CUDA_CHECK(cudaMemcpyAsync(&enabled, device.p, sizeof(enabled), cudaMemcpyDeviceToHost, stream));
+    tp->wait(stream);
+  }
+  return enabled != 0;
+}
+
+BatchSpecCost::BatchSpecCost(bool adaptive, int n, int slots, float threshold)
+    : n_(n),
+      use_threshold_(threshold > 0.f),
+      calibrate_(adaptive && n >= 5 && use_threshold_),
+      theta_(std::max(0.05f, threshold * float(n) / float(slots))) {
+  if (calibrate_)
+    theta_ = std::max(theta_, threshold * std::pow(float(n) / float(slots), 0.75f));
+}
+
+int BatchSpecCost::minimum_width(int k_max, int k_min, float ema_p, int steps) const {
+  if (calibrate_ && n_ >= 8 && steps >= 3 && ema_p < 0.35f) return std::min(1, k_max);
+  return std::min(k_min, k_max);
+}
+
+int BatchSpecCost::verification_width(int k_max, int k_min, const float* confidence, float ema_p, int steps) const {
+  if (!use_threshold_ || k_max == 0) return k_max;
+  const int k_min_eff = minimum_width(k_max, k_min, ema_p, steps);
+  const bool calibrated = calibrate_ && steps >= 2 && ema_p < 0.70f;
+  const float cal = std::clamp(ema_p, 0.15f, 1.f);
+  auto p_step = [&](int k) {
+    const float c = confidence[k];
+    return calibrated ? std::min(c, std::sqrt(c * cal)) : c;
+  };
+  float prod = 1.f;
+  int k = 0;
+  while (k < k_max && ((prod *= p_step(k)) > theta_ || k < k_min_eff)) ++k;
+  return k;
+}
+
+int BatchSpecCost::proposal_budget(int k_max, int k_min, float ema_p, int steps) const {
+  if (!calibrate_ || steps < 2 || ema_p >= 0.65f) return k_max;
+  const float cal = std::clamp(ema_p, 0.15f, 0.95f);
+  const int est = int(std::ceil(std::log(std::max(1e-4f, theta_)) / std::log(std::sqrt(cal))));
+  const int k_min_eff = minimum_width(k_max, k_min, ema_p, steps);
+  return std::clamp(est + 1, std::min(k_max, std::max(2, k_min_eff + 1)), k_max);
+}
+
+void BatchSpecCost::observe(int k, int accepted, float& ema_p, int& steps) {
+  if (k <= 0) return;
+  // A fully accepted prefix is right-censored, so it contributes no failure.
+  const float p_hat = float(accepted) / float(accepted + (accepted < k ? 1 : 0));
+  ema_p = 0.75f * ema_p + 0.25f * p_hat;
+  ++steps;
+}
 
 BatchEngine::Stream::Stream() { CUDA_CHECK(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking)); }
 BatchEngine::Stream::~Stream() {
@@ -85,6 +150,7 @@ BatchEngine::BatchEngine(const BatchEngineOptions& o)
   if (!(spec_threshold_ >= 0.f && spec_threshold_ < 1.f))
     throw std::invalid_argument("BatchEngine: spec_threshold must be in [0, 1)");
   if (spec_ > 0) {
+    adaptive_batch_spec_ = batch_spec_adaptive(tp_.get(), stream_.s);
     batch_draft_type_ = resolve_batch_draft_type(o);
     const bool hybrid = batch_draft_type_ == "hybrid";
     if (hybrid) dflash2_max_ctx_ = batch_dflash2_max_ctx(std::max(1, o.dflash2_max_ctx), tp_.get(), stream_.s);
@@ -128,6 +194,9 @@ BatchEngine::BatchEngine(const BatchEngineOptions& o)
     if (tp_) draft_bcast_ = DeviceBuffer(std::size_t(o.slots) * G * 8);
     drafts_.assign(std::size_t(o.slots) * G, 0);
     conf_.assign(std::size_t(o.slots) * G, 0.f);
+    batch_slot_ema_p_.assign(std::size_t(o.slots), BatchSpecCost::initial_p);
+    batch_slot_spec_steps_.assign(std::size_t(o.slots), 0);
+    batch_slot_draft_budget_.assign(std::size_t(o.slots), spec_);
     if (!o.spec_trace.empty() && !(trace_ = std::fopen(o.spec_trace.c_str(), "w")))
       throw std::runtime_error("BatchEngine: cannot write " + o.spec_trace.string());
   }
@@ -160,6 +229,11 @@ std::vector<std::int32_t> BatchEngine::admit(std::span<const Admission> requests
       throw std::invalid_argument("BatchEngine::admit: a prompt of " + std::to_string(P) +
                                   " tokens does not fit a slot of " + std::to_string(st_.ctx) + " positions");
     reset_slot(st_, a.slot, stream_.s);
+    if (spec_ > 0) {
+      batch_slot_ema_p_[a.slot] = BatchSpecCost::initial_p;
+      batch_slot_spec_steps_[a.slot] = 0;
+      batch_slot_draft_budget_[a.slot] = spec_;
+    }
     if (drafter_) drafter_->reset_slot(a.slot);
     if (dflash2_) dflash2_->reset_slot(a.slot);
     if (P <= kStepPrefill && P + 8 <= st_.ctx) together.push_back(i);
@@ -325,20 +399,37 @@ void BatchEngine::draft(int n) {
 
   if (!df_idx.empty()) {
     const int ndf = int(df_idx.size());
+    std::vector<std::int32_t> df_max_drafts;
+    int total_rows = ndf * G;
+    if (adaptive_batch_spec_) {
+      const BatchSpecCost cost(true, n, st_.slots, spec_threshold_);
+      df_max_drafts.reserve(df_idx.size());
+      total_rows = 0;
+      for (const int i : df_idx) {
+        const int slot = slot_[i];
+        const int budget = cost.proposal_budget(spec_, spec_min_, batch_slot_ema_p_[slot],
+                                                batch_slot_spec_steps_[slot]);
+        batch_slot_draft_budget_[slot] = budget;
+        df_max_drafts.push_back(budget);
+        total_rows += budget;
+      }
+    }
     if (dflash2_) {
       std::vector<std::int32_t> sl, an;
       std::vector<std::int64_t> np;
       gather_sub(df_idx, sl, an, np);
-      const BatchDFlash2::Drafts d = dflash2_->propose(ndf, sl.data(), an.data(), np.data());
+      const BatchDFlash2::Drafts d =
+          dflash2_->propose(ndf, sl.data(), an.data(), np.data(), df_max_drafts.empty() ? nullptr : df_max_drafts.data());
       scatter_sync(df_idx, d.tokens, d.conf);
     } else if (tp_) {
-      if (dflash2_head_) dflash2_head_->run(ndf, nullptr);
+      if (dflash2_head_) dflash2_head_->run_rows(total_rows);
       scatter_sync(df_idx, nullptr, nullptr);
     }
   }
 
   if (!ds_idx.empty()) {
     const int nds = int(ds_idx.size());
+    for (const int i : ds_idx) batch_slot_draft_budget_[slot_[i]] = spec_;
     if (drafter_) {
       std::vector<std::int32_t> sl, an;
       std::vector<std::int64_t> np;
@@ -359,18 +450,15 @@ void BatchEngine::step(std::span<Seq> seqs, std::vector<std::vector<std::int32_t
   const int n = int(seqs.size());
   emitted.resize(std::size_t(n));
   if (n == 0) return;
-  // drafts verified per sequence: spec, or with spec_threshold the leading drafts whose estimated acceptance (the
-  // product of their confidences) exceeds the threshold scaled by the running share of the slots (a row costs the
-  // same, a step's tokens fall with fewer sequences), at most spec
   m_.resize(std::size_t(n));
-  const float theta = std::max(0.05f, spec_threshold_ * float(n) / float(st_.slots));
+  const BatchSpecCost cost(adaptive_batch_spec_, n, st_.slots, spec_threshold_);
   for (int i = 0; i < n; ++i) {
-    int k = spec_;
-    if (spec_threshold_ > 0.f) {
-      const float* c = conf_.data() + std::size_t(seqs[i].slot) * G;
-      float p = 1.f;
-      k = 0;
-      while (k < spec_ && ((p *= c[k]) > theta || k < spec_min_)) ++k;
+    int k = 0;
+    if (spec_ > 0) {
+      const int slot = seqs[i].slot;
+      const float* c = conf_.data() + std::size_t(slot) * G;
+      k = cost.verification_width(batch_slot_draft_budget_[slot], spec_min_, c,
+                                  batch_slot_ema_p_[slot], batch_slot_spec_steps_[slot]);
     }
     m_[std::size_t(i)] = k + 1;
   }
@@ -401,6 +489,7 @@ void BatchEngine::step(std::span<Seq> seqs, std::vector<std::vector<std::int32_t
     const std::int32_t* out = got.data() + off_[std::size_t(i)];     // the target's token after each row
     int a = 0;
     while (a < K && row[1 + a] == out[a]) ++a;
+    BatchSpecCost::observe(K, a, batch_slot_ema_p_[slot_[i]], batch_slot_spec_steps_[slot_[i]]);
     emitted[i].assign(row + 1, row + 1 + a);
     emitted[i].push_back(out[a]);
     keep_[i] = a + 1;

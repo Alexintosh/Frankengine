@@ -28,6 +28,8 @@ class BatchDFlash2Head {
 
   // Rank 0 passes `hidden` [n * 7, H]; rank 1 passes nullptr.
   void run(int n, const __nv_bfloat16* hidden = nullptr);
+  // Both ranks pass the same compacted row count.
+  void run_rows(int total_rows, const __nv_bfloat16* hidden = nullptr);
   const std::int32_t* ids() const;
   const float* values() const;
   std::size_t device_bytes() const;
@@ -70,7 +72,9 @@ class BatchDFlash2 {
     const std::int32_t* tokens;  // device int32 [n, 7]
     const float* conf;           // device fp32 [n, 7]
   };
-  Drafts propose(int n, const std::int32_t* slots, const std::int32_t* anchors, const std::int64_t* pos);
+  // Optional per-sequence budgets are clamped to [1, GAMMA]. Unused output entries are zero.
+  Drafts propose(int n, const std::int32_t* slots, const std::int32_t* anchors, const std::int64_t* pos,
+                 const std::int32_t* max_drafts = nullptr);
 
   int slots() const;
   int max_seqs() const;

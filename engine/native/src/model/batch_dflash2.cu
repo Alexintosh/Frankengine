@@ -57,55 +57,82 @@ __device__ __forceinline__ Bf e4m3_to_bf(std::uint8_t x) {
   return __float2bfloat16_rn(float(v));
 }
 
-// RMSNorm [rows, width] (eps = 1e-6f), matching solo DFlash2::normalize(..., position=-1).
-__global__ void rmsnorm_rows(const Bf* __restrict__ x, const Bf* __restrict__ weight, int width,
-                             Bf* __restrict__ out) {
-  __shared__ float sums[Threads];
-  const int row = blockIdx.x;
-  const int lane = threadIdx.x;
-  x += std::size_t(row) * width;
-  out += std::size_t(row) * width;
+template <typename Vector>
+__device__ __forceinline__ bool is_aligned(const void* ptr) {
+  return reinterpret_cast<std::uintptr_t>(ptr) % alignof(Vector) == 0;
+}
+
+__device__ __forceinline__ unsigned int pack_bf16_pair(Bf low, Bf high) {
+  return unsigned(__bfloat16_as_ushort(low)) | (unsigned(__bfloat16_as_ushort(high)) << 16);
+}
+
+__device__ __forceinline__ unsigned int normalize_pair(unsigned int x, unsigned int w, float scale) {
+  const float low = __uint_as_float(x << 16) * scale * __uint_as_float(w << 16);
+  const float high = __uint_as_float(x & 0xffff0000u) * scale * __uint_as_float(w & 0xffff0000u);
+  return pack_bf16_pair(__float2bfloat16(low), __float2bfloat16(high));
+}
+
+__device__ __forceinline__ float rms_sum_squares(const Bf* values, int width, int lane) {
   float sum = 0.f;
   for (int i = lane; i < width; i += Threads) {
-    const float value = __bfloat162float(x[i]);
+    const float value = __bfloat162float(values[i]);
     sum += value * value;
   }
-  sums[lane] = sum;
+  return sum;
+}
+
+__device__ __forceinline__ void rmsnorm_row(const Bf* x, const Bf* weight, int width, Bf* out,
+                                           float* sums, uint4* row_cache) {
+  const int lane = threadIdx.x;
+  const bool vectorized = width % 8 == 0 && is_aligned<uint4>(x) && is_aligned<uint4>(weight) &&
+                          is_aligned<uint4>(out);
+  // Keep the scalar kernel's per-thread summation order and reduction tree.
+  if (vectorized) {
+    const auto* input = reinterpret_cast<const uint4*>(x);
+    for (int i = lane; i < width / 8; i += Threads) row_cache[i] = input[i];
+    __syncthreads();
+    sums[lane] = rms_sum_squares(reinterpret_cast<const Bf*>(row_cache), width, lane);
+  } else {
+    sums[lane] = rms_sum_squares(x, width, lane);
+  }
   __syncthreads();
   for (int stride = Threads / 2; stride; stride /= 2) {
     if (lane < stride) sums[lane] += sums[lane + stride];
     __syncthreads();
   }
   const float scale = rsqrtf(sums[0] / width + 1e-6f);
-  for (int i = lane; i < width; i += Threads)
-    out[i] = __float2bfloat16(__bfloat162float(x[i]) * scale * __bfloat162float(weight[i]));
+  if (vectorized) {
+    const auto* weights = reinterpret_cast<const uint4*>(weight);
+    auto* output = reinterpret_cast<uint4*>(out);
+    for (int i = lane; i < width / 8; i += Threads) {
+      const uint4 v = row_cache[i];
+      const uint4 w = weights[i];
+      output[i] = make_uint4(normalize_pair(v.x, w.x, scale), normalize_pair(v.y, w.y, scale),
+                             normalize_pair(v.z, w.z, scale), normalize_pair(v.w, w.w, scale));
+    }
+  } else {
+    for (int i = lane; i < width; i += Threads)
+      out[i] = __float2bfloat16(__bfloat162float(x[i]) * scale * __bfloat162float(weight[i]));
+  }
 }
 
-// Final norm extracting only proposal rows 1..7 of each 8-row block into contiguous [n * 7, H].
+// RMSNorm [rows, width], also used in place when committing context.
+__global__ void rmsnorm_rows(const Bf* x, const Bf* weight, int width, Bf* out) {
+  __shared__ float sums[Threads];
+  extern __shared__ uint4 row_cache[];
+  const std::size_t off = std::size_t(blockIdx.x) * width;
+  rmsnorm_row(x + off, weight, width, out + off, sums, row_cache);
+}
+
+// Normalize the budgeted proposal rows of each block into contiguous [total_rows, H].
 __global__ void final_norm_compact(const Bf* __restrict__ x, const Bf* __restrict__ weight,
+                                   const std::int32_t* __restrict__ row_map,
                                    Bf* __restrict__ out) {
   __shared__ float sums[Threads];
-  const int prop_idx = blockIdx.x;
-  const int seq = prop_idx / Proposals;
-  const int p = prop_idx % Proposals;
-  const int src_row = seq * Block + (p + 1);
-  const int lane = threadIdx.x;
-  x += std::size_t(src_row) * H;
-  out += std::size_t(prop_idx) * H;
-  float sum = 0.f;
-  for (int i = lane; i < H; i += Threads) {
-    const float value = __bfloat162float(x[i]);
-    sum += value * value;
-  }
-  sums[lane] = sum;
-  __syncthreads();
-  for (int stride = Threads / 2; stride; stride /= 2) {
-    if (lane < stride) sums[lane] += sums[lane + stride];
-    __syncthreads();
-  }
-  const float scale = rsqrtf(sums[0] / H + 1e-6f);
-  for (int i = lane; i < H; i += Threads)
-    out[i] = __float2bfloat16(__bfloat162float(x[i]) * scale * __bfloat162float(weight[i]));
+  extern __shared__ uint4 row_cache[];
+  const int row = blockIdx.x;
+  const int src_row = row_map[2 * row] * Block + row_map[2 * row + 1] + 1;
+  rmsnorm_row(x + std::size_t(src_row) * H, weight, H, out + std::size_t(row) * H, sums, row_cache);
 }
 
 // Commit scatter: kv [rows, 2*KV] (k | v) -> ring_k, ring_v at [slot, layer, pos % W, KV].
@@ -161,8 +188,15 @@ __global__ void build_block_ids(const std::int32_t* __restrict__ anchors, std::i
 }
 
 __global__ void f32_to_bf16(const float* __restrict__ x, Bf* __restrict__ out, int size) {
-  const int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i < size) out[i] = __float2bfloat16(x[i]);
+  const int i = (blockIdx.x * blockDim.x + threadIdx.x) * 4;
+  if (i + 3 < size && is_aligned<float4>(x) && is_aligned<uint2>(out)) {
+    const float4 v = *reinterpret_cast<const float4*>(x + i);
+    *reinterpret_cast<uint2*>(out + i) = make_uint2(
+        pack_bf16_pair(__float2bfloat16(v.x), __float2bfloat16(v.y)),
+        pack_bf16_pair(__float2bfloat16(v.z), __float2bfloat16(v.w)));
+  } else {
+    for (int j = 0; j < 4 && i + j < size; ++j) out[i + j] = __float2bfloat16(x[i + j]);
+  }
 }
 
 // Batched 2-tap dynamic conv: resets shifted to 0 at every block boundary (row % 8 == 0).
@@ -234,15 +268,38 @@ __global__ void batch_qkv_rope(const Bf* __restrict__ qkv, const std::int32_t* _
   }
 }
 
+__device__ __forceinline__ Bf swiglu_value(Bf gate, Bf up) {
+  const float g = __bfloat162float(gate);
+  return __hmul(__float2bfloat16(g / (1.f + expf(-g))), up);
+}
+
+__device__ __forceinline__ unsigned int swiglu_pair(unsigned int gate, unsigned int up) {
+  const Bf low = swiglu_value(__ushort_as_bfloat16(gate & 0xffffu), __ushort_as_bfloat16(up & 0xffffu));
+  const Bf high = swiglu_value(__ushort_as_bfloat16(gate >> 16), __ushort_as_bfloat16(up >> 16));
+  return pack_bf16_pair(low, high);
+}
+
 // Batched SwiGLU on concatenated gate_up [M, 2*I] -> out [M, I].
 __global__ void batch_swiglu(const Bf* __restrict__ gate_up, Bf* __restrict__ out, int total) {
-  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int idx = (blockIdx.x * blockDim.x + threadIdx.x) * 8;
   if (idx >= total) return;
-  const int row = idx / I;
-  const int col = idx % I;
-  const Bf* gu = gate_up + std::size_t(row) * (2 * I);
-  const float g = __bfloat162float(gu[col]);
-  out[idx] = __hmul(__float2bfloat16(g / (1.f + expf(-g))), gu[I + col]);
+  if (I % 8 == 0 && idx + 7 < total && is_aligned<uint4>(gate_up) && is_aligned<uint4>(out)) {
+    const int row = idx / I;
+    const int col = idx % I;
+    const Bf* gu = gate_up + std::size_t(row) * (2 * I) + col;
+    const uint4 gate = *reinterpret_cast<const uint4*>(gu);
+    const uint4 up = *reinterpret_cast<const uint4*>(gu + I);
+    *reinterpret_cast<uint4*>(out + idx) = make_uint4(swiglu_pair(gate.x, up.x), swiglu_pair(gate.y, up.y),
+                                                     swiglu_pair(gate.z, up.z), swiglu_pair(gate.w, up.w));
+  } else {
+    for (int j = 0; j < 8 && idx + j < total; ++j) {
+      const int i = idx + j;
+      const int row = i / I;
+      const int col = i % I;
+      const Bf* gu = gate_up + std::size_t(row) * (2 * I) + col;
+      out[i] = swiglu_value(gu[0], gu[I]);
+    }
+  }
 }
 
 // Tensor-core GQA batched sliding-window + bidirectional block attention.
@@ -460,10 +517,11 @@ __global__ void __launch_bounds__(Threads)
 __global__ void batch_score_edges(const std::int32_t* __restrict__ ids, const float* __restrict__ unary,
                                   const Bf* __restrict__ projected, const Bf* __restrict__ predecessors,
                                   const Bf* __restrict__ successors, const std::int32_t* __restrict__ anchors,
+                                  const std::int32_t* __restrict__ row_map,
                                   float* __restrict__ lattice) {
-  const int row = blockIdx.x;  // seq * Proposals + edge
-  const int seq = row / Proposals;
-  const int edge = row % Proposals;
+  const int row = blockIdx.x;
+  const int seq = row_map[2 * row];
+  const int edge = row_map[2 * row + 1];
   const int previous = blockIdx.y;
   const int next = blockIdx.z;
   const int lane = threadIdx.x;
@@ -486,24 +544,32 @@ __global__ void batch_score_edges(const std::int32_t* __restrict__ ids, const fl
 }
 
 __global__ void batch_walk(const std::int32_t* __restrict__ ids, const float* __restrict__ lattice,
+                           const std::int32_t* __restrict__ prop_off, const std::int32_t* __restrict__ prop_cnt,
                            std::int32_t* __restrict__ tokens, float* __restrict__ confidence, bool cumulative) {
   const int seq = blockIdx.x;
+  const int start = prop_off[seq];
+  const int count = prop_cnt[seq];
+  const int output = seq * Proposals;
   int previous = 0;
   float prod = 1.f;
-  for (int edge = 0; edge < Proposals; ++edge) {
-    const int row = seq * Proposals + edge;
+  for (int edge = 0; edge < count; ++edge) {
+    const int row = start + edge;
     const float* scores = lattice + (row * 16 + previous) * 16;
     int best = 0;
     for (int next = 1; next < 16; ++next) {
       if (scores[next] > scores[best]) best = next;
     }
-    tokens[row] = ids[row * 16 + best];
+    tokens[output + edge] = ids[row * 16 + best];
     float mass = 0.f;
     for (int next = 0; next < 16; ++next) mass += expf(scores[next] - scores[best]);
     const float c = 1.f / mass;
     prod *= c;
-    confidence[row] = cumulative ? prod : c;
+    confidence[output + edge] = cumulative ? prod : c;
     previous = best;
+  }
+  for (int edge = count; edge < Proposals; ++edge) {
+    tokens[output + edge] = 0;
+    confidence[output + edge] = 0.f;
   }
 }
 
@@ -593,20 +659,26 @@ BatchDFlash2Head::BatchDFlash2Head(TpRuntime& tp, head::Nvfp4Matrix matrix, int 
 BatchDFlash2Head::~BatchDFlash2Head() = default;
 
 void BatchDFlash2Head::run(int n, const Bf* hidden_in) {
+  if (n < 1 || n > impl_->max_seqs) throw std::invalid_argument("BatchDFlash2Head::run: n out of range");
+  run_rows(n * GAMMA, hidden_in);
+}
+
+void BatchDFlash2Head::run_rows(int total_rows, const Bf* hidden_in) {
   auto& d = *impl_;
-  if (n < 1 || n > d.max_seqs) throw std::invalid_argument("BatchDFlash2Head::run: n out of range");
-  const int mh = n * GAMMA;
-  const std::size_t hidden_bytes = std::size_t(mh) * H * sizeof(Bf);
+  if (total_rows < 1 || total_rows > d.max_seqs * GAMMA)
+    throw std::invalid_argument("BatchDFlash2Head::run_rows: total_rows out of range");
+  const std::size_t hidden_bytes = std::size_t(total_rows) * H * sizeof(Bf);
   Bf* input = hidden_in ? const_cast<Bf*>(hidden_in) : d.hidden;
   d.tp.exchange_draft_head(input, hidden_bytes, nullptr, d.stream);
-  kernels::batch::head_topk16_nvfp4(input, H, d.matrix, mh, d.head_ws, d.top_vals, d.top_ids, d.stream);
-  const int total_cands = mh * 16;
+  kernels::batch::head_topk16_nvfp4(input, H, d.matrix, total_rows, d.head_ws, d.top_vals, d.top_ids, d.stream);
+  const int total_cands = total_rows * 16;
   pack_batch_candidates<<<(total_cands + 255) / 256, 256, 0, d.stream>>>(
       d.top_vals, d.top_ids, total_cands, d.local_cand);
   d.tp.exchange_draft_head(d.local_cand, std::size_t(total_cands) * sizeof(head::Candidate), d.gathered_cand,
                            d.stream);
   if (hidden_in) {
-    merge_batch_head_candidates<<<(mh + 127) / 128, 128, 0, d.stream>>>(d.gathered_cand, mh, d.top_ids, d.top_vals);
+    merge_batch_head_candidates<<<(total_rows + 127) / 128, 128, 0, d.stream>>>(
+        d.gathered_cand, total_rows, d.top_ids, d.top_vals);
   }
   CUDA_CHECK(cudaGetLastError());
 }
@@ -655,8 +727,11 @@ struct BatchDFlash2::Impl {
   MappedHostBuffer pin_commit_slot, pin_commit_pos;
 
   // Propose scratch (M = max_seqs * 8, MH = max_seqs * 7)
-  std::int32_t* d_propose_params = nullptr;  // 5 * max_seqs: slots, anchors, pos, vbegin, vend
+  // Slot, anchor, position, valid bounds, proposal offset/count, then (sequence, step) per compacted row.
+  static constexpr int ProposeFields = 7;
+  std::int32_t* d_propose_params = nullptr;
   MappedHostBuffer pin_propose_params;
+  cudaEvent_t propose_params_copied = nullptr;
   std::int64_t* ids = nullptr;
   float* embed_f32 = nullptr;
   Bf *x = nullptr, *normed = nullptr, *convolved = nullptr, *coeff = nullptr;
@@ -840,8 +915,9 @@ struct BatchDFlash2::Impl {
     // Propose scratch
     const int M = max_seqs * Block;
     const int MH = max_seqs * Proposals;
-    d_propose_params = alloc<std::int32_t>(std::size_t(5) * max_seqs);
-    pin_propose_params = MappedHostBuffer(std::size_t(5) * max_seqs * sizeof(std::int32_t));
+    const std::size_t propose_ints = std::size_t(ProposeFields) * max_seqs + std::size_t(2) * MH;
+    d_propose_params = alloc<std::int32_t>(propose_ints);
+    pin_propose_params = MappedHostBuffer(propose_ints * sizeof(std::int32_t));
     ids = alloc<std::int64_t>(M);
     embed_f32 = alloc<float>(std::size_t(M) * H);
     x = alloc<Bf>(std::size_t(M) * H);
@@ -882,6 +958,12 @@ struct BatchDFlash2::Impl {
     tokens = alloc<std::int32_t>(MH);
     conf = alloc<float>(MH);
     CUDA_CHECK(cudaStreamSynchronize(s));
+    CUDA_CHECK(cudaEventCreateWithFlags(&propose_params_copied, cudaEventDisableTiming));
+  }
+
+  ~Impl() {
+    cudaEventSynchronize(propose_params_copied);
+    cudaEventDestroy(propose_params_copied);
   }
 
   void reset_slot(int slot) {
@@ -987,7 +1069,7 @@ struct BatchDFlash2::Impl {
                                  cudaMemcpyHostToDevice, s));
 
       gemm.run(taps + std::size_t(r0) * 4 * H, rows, fc_bf16, H, 4 * H, ctx, s);
-      rmsnorm_rows<<<rows, Threads, 0, s>>>(ctx, hidden_norm, H, ctx);
+      rmsnorm_rows<<<rows, Threads, H * sizeof(Bf), s>>>(ctx, hidden_norm, H, ctx);
       for (int l = 0; l < NumLayers; ++l) {
         gemm.run(ctx, rows, layers[l].kv_commit, 2 * KV, H, commit_kv, s);
         if (kv_fp8) {
@@ -1002,9 +1084,14 @@ struct BatchDFlash2::Impl {
     CUDA_CHECK(cudaGetLastError());
   }
 
-  Drafts propose(int n, const std::int32_t* slot_ids, const std::int32_t* anchors, const std::int64_t* pos) {
+  Drafts propose(int n, const std::int32_t* slot_ids, const std::int32_t* anchors, const std::int64_t* pos,
+                 const std::int32_t* max_drafts) {
     if (n < 1 || n > max_seqs) throw std::invalid_argument("BatchDFlash2::propose: n out of range");
+    // Callers may enqueue back-to-back proposals with different row maps.
+    CUDA_CHECK(cudaEventSynchronize(propose_params_copied));
     auto* p = static_cast<std::int32_t*>(pin_propose_params.data());
+    auto* row_map = p + ProposeFields * n;
+    int total_rows = 0;
     int max_keys = Block;
     for (int i = 0; i < n; ++i) {
       const int sl = slot_ids[i];
@@ -1015,27 +1102,38 @@ struct BatchDFlash2::Impl {
       const int ve = std::min(valid_end[std::size_t(sl)], P);
       const int ring_count = std::max(0, ve - std::max(vb, P - W + 1));
       max_keys = std::max(max_keys, ring_count + Block);
+      const int count = max_drafts ? std::clamp(int(max_drafts[i]), 1, Proposals) : Proposals;
       p[i] = sl;
-      p[max_seqs + i] = anchors[i];
-      p[2 * max_seqs + i] = P;
-      p[3 * max_seqs + i] = vb;
-      p[4 * max_seqs + i] = ve;
+      p[n + i] = anchors[i];
+      p[2 * n + i] = P;
+      p[3 * n + i] = vb;
+      p[4 * n + i] = ve;
+      p[5 * n + i] = total_rows;
+      p[6 * n + i] = count;
+      for (int step = 0; step < count; ++step) {
+        row_map[2 * (total_rows + step)] = i;
+        row_map[2 * (total_rows + step) + 1] = step;
+      }
+      total_rows += count;
     }
-    CUDA_CHECK(cudaMemcpyAsync(d_propose_params, p, std::size_t(5) * max_seqs * sizeof(std::int32_t),
-                               cudaMemcpyHostToDevice, s));
+    const std::size_t param_bytes = std::size_t(ProposeFields * n + 2 * total_rows) * sizeof(std::int32_t);
+    CUDA_CHECK(cudaMemcpyAsync(d_propose_params, p, param_bytes, cudaMemcpyHostToDevice, s));
+    CUDA_CHECK(cudaEventRecord(propose_params_copied, s));
     const std::int32_t* d_slots = d_propose_params;
-    const std::int32_t* d_anchors = d_propose_params + max_seqs;
-    const std::int32_t* d_pos = d_propose_params + 2 * max_seqs;
-    const std::int32_t* d_vbegin = d_propose_params + 3 * max_seqs;
-    const std::int32_t* d_vend = d_propose_params + 4 * max_seqs;
+    const std::int32_t* d_anchors = d_propose_params + n;
+    const std::int32_t* d_pos = d_propose_params + 2 * n;
+    const std::int32_t* d_vbegin = d_propose_params + 3 * n;
+    const std::int32_t* d_vend = d_propose_params + 4 * n;
+    const std::int32_t* d_prop_off = d_propose_params + 5 * n;
+    const std::int32_t* d_prop_cnt = d_propose_params + 6 * n;
+    const std::int32_t* d_row_map = d_propose_params + ProposeFields * n;
 
     const int M = n * Block;
-    const int MH = n * Proposals;
 
     // 1. Embeddings: bit-exact with solo DFlash2 via kernels::dense::embed
     build_block_ids<<<n, Block, 0, s>>>(d_anchors, ids);
     kernels::dense::embed(ids, M, embed, embed_norm, embed_f32, false, s);
-    f32_to_bf16<<<(M * H + Threads - 1) / Threads, Threads, 0, s>>>(embed_f32, x, M * H);
+    f32_to_bf16<<<(M * H + 4 * Threads - 1) / (4 * Threads), Threads, 0, s>>>(embed_f32, x, M * H);
 
     // Attention chunking
     const int target = chunk_target(n);
@@ -1048,7 +1146,7 @@ struct BatchDFlash2::Impl {
       const LayerW& L = layers[l];
 
       // Pre-norm + attention conv (part 0)
-      rmsnorm_rows<<<M, Threads, 0, s>>>(x, L.pre, H, normed);
+      rmsnorm_rows<<<M, Threads, H * sizeof(Bf), s>>>(x, L.pre, H, normed);
       gemm.run(normed, M, L.attn_conv_proj, Coefficients, H, coeff, s);
       batch_convolution<<<conv_grid, Threads, 0, s>>>(normed, coeff, L.attn_conv_base, 0, convolved, false);
 
@@ -1075,36 +1173,37 @@ struct BatchDFlash2::Impl {
       batch_convolution<<<conv_grid, Threads, 0, s>>>(projection, coeff, L.attn_conv_base, 1, x, true);
 
       // Post-norm + MLP conv (part 0) + fused gate_up + SwiGLU + down + MLP conv residual (part 1)
-      rmsnorm_rows<<<M, Threads, 0, s>>>(x, L.post, H, normed);
+      rmsnorm_rows<<<M, Threads, H * sizeof(Bf), s>>>(x, L.post, H, normed);
       gemm.run(normed, M, L.mlp_conv_proj, Coefficients, H, coeff, s);
       batch_convolution<<<conv_grid, Threads, 0, s>>>(normed, coeff, L.mlp_conv_base, 0, convolved, false);
 
       run_linear(convolved, M, L.gate_up, mx_act_h, gate_up_buf);
-      batch_swiglu<<<(M * I + Threads - 1) / Threads, Threads, 0, s>>>(gate_up_buf, act_buf, M * I);
+      batch_swiglu<<<(M * I + 8 * Threads - 1) / (8 * Threads), Threads, 0, s>>>(gate_up_buf, act_buf, M * I);
       run_linear(act_buf, M, L.down, mx_act_i, projection);
       batch_convolution<<<conv_grid, Threads, 0, s>>>(projection, coeff, L.mlp_conv_base, 1, x, true);
     }
 
-    // 3. Final norm + compact proposal rows 1..7 -> hidden_props [n * 7, H]
-    final_norm_compact<<<MH, Threads, 0, s>>>(x, final_norm, hidden_props);
+    // 3. Final norm + compact proposal rows into hidden_props [total_rows, H]
+    final_norm_compact<<<total_rows, Threads, H * sizeof(Bf), s>>>(x, final_norm, d_row_map, hidden_props);
 
     // 4. Target NVFP4 head + top-16 (TP=1 or TP=2 sharded)
     const std::int32_t* cand_ids = nullptr;
     const float* cand_vals = nullptr;
     if (sharded_head) {
-      sharded_head->run(n, hidden_props);
+      sharded_head->run_rows(total_rows, hidden_props);
       cand_ids = sharded_head->ids();
       cand_vals = sharded_head->values();
     } else {
-      kernels::batch::head_topk16_nvfp4(hidden_props, H, target_head, MH, head_ws, top_vals, top_ids, s);
+      kernels::batch::head_topk16_nvfp4(hidden_props, H, target_head, total_rows, head_ws, top_vals, top_ids, s);
       cand_ids = top_ids;
       cand_vals = top_vals;
     }
 
     // 5. Batched DFlash2 path selector
-    gemm.run(hidden_props, MH, selector_w, Rank, H, projected, s);
-    batch_score_edges<<<dim3(MH, 16, 16), 32, 0, s>>>(cand_ids, cand_vals, projected, pred, succ, d_anchors, lattice);
-    batch_walk<<<n, 1, 0, s>>>(cand_ids, lattice, tokens, conf, cumulative);
+    gemm.run(hidden_props, total_rows, selector_w, Rank, H, projected, s);
+    batch_score_edges<<<dim3(total_rows, 16, 16), 32, 0, s>>>(
+        cand_ids, cand_vals, projected, pred, succ, d_anchors, d_row_map, lattice);
+    batch_walk<<<n, 1, 0, s>>>(cand_ids, lattice, d_prop_off, d_prop_cnt, tokens, conf, cumulative);
     CUDA_CHECK(cudaGetLastError());
     return {tokens, conf};
   }
@@ -1125,8 +1224,8 @@ void BatchDFlash2::commit(int n, const std::int32_t* slots, const std::int64_t* 
   impl_->commit(n, slots, start, count, taps);
 }
 BatchDFlash2::Drafts BatchDFlash2::propose(int n, const std::int32_t* slots, const std::int32_t* anchors,
-                                           const std::int64_t* pos) {
-  return impl_->propose(n, slots, anchors, pos);
+                                           const std::int64_t* pos, const std::int32_t* max_drafts) {
+  return impl_->propose(n, slots, anchors, pos, max_drafts);
 }
 int BatchDFlash2::slots() const { return impl_->slots; }
 int BatchDFlash2::max_seqs() const { return impl_->max_seqs; }
