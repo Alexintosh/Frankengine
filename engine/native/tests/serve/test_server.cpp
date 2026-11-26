@@ -336,6 +336,22 @@ void test_models_and_health() {
   CHECK(request(s->port(), "POST", "/v1/completions", "{}").status == 404);
 }
 
+void test_telemetry_and_metrics() {
+  auto s = serve();
+  Chat c = chat(s->port(), {{"model", "inkling-test"}});
+  CHECK(c.status == 200);
+  Response tel = request(s->port(), "GET", "/v1/telemetry");
+  CHECK(tel.status == 200);
+  Json j = Json::parse(tel.body);
+  CHECK(j["model"] == "inkling-test");
+  CHECK(j["total_decode_tokens"].get<uint64_t>() >= 1);
+  CHECK(j.contains("live_decode_tok_s") && j.contains("clone_slot_lanes") && j.contains("clone_slot_saved_tokens"));
+  Response met = request(s->port(), "GET", "/metrics");
+  CHECK(met.status == 200);
+  CHECK(met.body.find("frankengine_decode_tokens_total ") != std::string::npos);
+  CHECK(met.body.find("frankengine_clone_slot_saved_tokens_total ") != std::string::npos);
+}
+
 void test_non_streaming() {
   auto s = serve();
   Chat r = chat(s->port(), {{"model", "whatever"}});
@@ -876,6 +892,7 @@ int main() {
   g_fmt = &fmt;
   const std::vector<std::pair<std::string, std::function<void()>>> tests = {
       {"models_and_health", test_models_and_health},
+      {"telemetry_and_metrics", test_telemetry_and_metrics},
       {"batch_stream_disconnect", test_batch_stream_disconnect},
       {"non_streaming", test_non_streaming},
       {"streaming_matches_non_streaming[False]", [] { test_streaming_matches_non_streaming(false); }},

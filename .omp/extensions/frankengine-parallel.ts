@@ -3,15 +3,18 @@ import * as os from "os";
 import * as path from "path";
 
 /**
- * Frankengine Parallel Fan-Out & Aggregate Token Counter Extension for omp.
+ * Frankengine Parallel Fan-Out & Live Hardware Aggregate Telemetry Extension for omp.
  *
  * Features:
  * - `/fanout [on|off|N|reset]` (alias `/parallel`): toggles automatic parallel fan-out mode
  *   (injects Skeleton-of-Thought + `lane-writer` single-turn batch rules via `before_agent_start`
  *   so any build/refactor prompt automatically triggers N parallel lanes + GPU `clone_slot`).
- * - Real-time aggregate token counter & aggregate tok/s across the parent session AND all
- *   parallel subagent lanes (via `task:subagent:progress`, `task:subagent:lifecycle`,
- *   `message_update`, `message_end`, and `tool_result`), rendered directly in omp's status bar.
+ * - Real-time aggregate token counter & aggregate tok/s across parent + ALL parallel subagents:
+ *   * Tracks local omp events (`task:subagent:progress`, `task:subagent:lifecycle`,
+ *     `message_update`, `message_end`, `tool_result`).
+ *   * Automatically polls Frankengine's zero-overhead `GET /v1/telemetry` endpoint when available
+ *     to display exact live GPU hardware tok/s, active decoding lanes, spec accept len (alpha+1),
+ *     and `clone_slot` saved KV tokens right in omp's status bar & live parallel widget!
  */
 
 interface FanoutConfig {
@@ -25,18 +28,26 @@ interface LaneState {
   status: "running" | "completed" | "failed" | "aborted";
   startedAt: number;
   finishedAt?: number;
-  /** Exact tokens reported by omp subagent progress/result (input+output or total) */
   reportedTokens: number;
-  /** Exact output tokens if available from result usage */
   outputTokens: number;
-  /** Exact cached tokens if available from result usage */
   cacheReadTokens: number;
-  /** Live streaming character estimate while a turn is still in flight */
   liveEstOutputTokens: number;
   requests: number;
 }
 
+interface GpuTelemetry {
+  active: number;
+  decoding: number;
+  liveDecodeTokS: number;
+  totalDecodeTokens: number;
+  avgAcceptLen: number;
+  cloneSlotLanes: number;
+  cloneSlotSavedTokens: number;
+  updatedAt: number;
+}
+
 const CONFIG_PATH = path.join(os.homedir(), ".omp", "agent", "frankengine-parallel.json");
+const MODELS_YML_PATH = path.join(os.homedir(), ".omp", "agent", "models.yml");
 
 function loadConfig(): FanoutConfig {
   try {
@@ -57,8 +68,25 @@ function saveConfig(cfg: FanoutConfig): void {
     fs.mkdirSync(path.dirname(CONFIG_PATH), { recursive: true });
     fs.writeFileSync(CONFIG_PATH, JSON.stringify(cfg, null, 2) + "\n", "utf8");
   } catch {
-    // Non-fatal if home dir is read-only
+    // Non-fatal
   }
+}
+
+function discoverTelemetryUrl(): string | null {
+  if (process.env.FRANKENGINE_TELEMETRY_URL) return process.env.FRANKENGINE_TELEMETRY_URL;
+  if (process.env.FRANKENGINE_URL) {
+    return process.env.FRANKENGINE_URL.replace(/\/+$/, "") + "/telemetry";
+  }
+  try {
+    const yml = fs.readFileSync(MODELS_YML_PATH, "utf8");
+    const m = yml.match(/baseUrl:\s*["']?(https?:\/\/[^\s"']+)/);
+    if (m?.[1]) {
+      return m[1].replace(/\/+$/, "") + "/telemetry";
+    }
+  } catch {
+    // ignore
+  }
+  return null;
 }
 
 function fmtNum(n: number): string {
@@ -103,6 +131,12 @@ export default function frankengineParallelExtension(pi: any) {
   });
 
   const cfg: FanoutConfig = loadConfig();
+  const telemetryUrl = discoverTelemetryUrl();
+  let telemetrySupported = telemetryUrl !== null;
+  let telemetryInFlight = false;
+  let gpuTel: GpuTelemetry | null = null;
+  let gpuBaselineDecodeTok: number | null = null;
+  let gpuBaselineCloneSaved: number | null = null;
 
   // Session-wide aggregate telemetry (parent + all parallel subagents)
   let parentOutputTokens = 0;
@@ -119,6 +153,42 @@ export default function frankengineParallelExtension(pi: any) {
   let lastUi: any = null;
   let refreshTimer: ReturnType<typeof setInterval> | null = null;
 
+  async function pollGpuTelemetry() {
+    if (!telemetrySupported || !telemetryUrl || telemetryInFlight) return;
+    telemetryInFlight = true;
+    try {
+      const ctrl = new AbortController();
+      const t = setTimeout(() => ctrl.abort(), 800);
+      const res = await fetch(telemetryUrl, { signal: ctrl.signal });
+      clearTimeout(t);
+      if (res.status === 404) {
+        telemetrySupported = false;
+        return;
+      }
+      if (!res.ok) return;
+      const d: any = await res.json();
+      const totalDec = Number(d?.total_decode_tokens ?? 0) || 0;
+      const cloneSaved = Number(d?.clone_slot_saved_tokens ?? 0) || 0;
+      if (gpuBaselineDecodeTok === null) gpuBaselineDecodeTok = totalDec;
+      if (gpuBaselineCloneSaved === null) gpuBaselineCloneSaved = cloneSaved;
+      gpuTel = {
+        active: Number(d?.active ?? 0) || 0,
+        decoding: Number(d?.decoding ?? 0) || 0,
+        liveDecodeTokS: Number(d?.live_decode_tok_s ?? 0) || 0,
+        totalDecodeTokens: totalDec,
+        avgAcceptLen: Number(d?.avg_accept_len ?? 0) || 0,
+        cloneSlotLanes: Number(d?.clone_slot_lanes ?? 0) || 0,
+        cloneSlotSavedTokens: cloneSaved,
+        updatedAt: Date.now(),
+      };
+      renderStatus();
+    } catch {
+      // Transient timeout / offline; silently fall back to local omp counters
+    } finally {
+      telemetryInFlight = false;
+    }
+  }
+
   function computeAggregate() {
     let subTotal = 0;
     let subOutput = 0;
@@ -132,29 +202,36 @@ export default function frankengineParallelExtension(pi: any) {
       else if (lane.status === "completed") done++;
       else failed++;
 
-      // Prefer exact output tokens when known; otherwise live streaming estimate;
-      // for reportedTokens (total tokens across turns), track separately.
       const estOut = lane.outputTokens > 0 ? lane.outputTokens : lane.liveEstOutputTokens;
       subOutput += estOut;
       subTotal += Math.max(lane.reportedTokens, estOut);
       subCache += lane.cacheReadTokens;
     }
 
-    const aggOutput = parentOutputTokens + parentLiveEstOutput + subOutput;
+    const now = Date.now();
+    const freshGpu = gpuTel && now - gpuTel.updatedAt < 4000 ? gpuTel : null;
+    const gpuSessionOut =
+      freshGpu && gpuBaselineDecodeTok !== null ? Math.max(0, freshGpu.totalDecodeTokens - gpuBaselineDecodeTok) : 0;
+    const gpuCloneSaved =
+      freshGpu && gpuBaselineCloneSaved !== null ? Math.max(0, freshGpu.cloneSlotSavedTokens - gpuBaselineCloneSaved) : 0;
+
+    const localAggOut = parentOutputTokens + parentLiveEstOutput + subOutput;
+    const aggOutput = Math.max(localAggOut, gpuSessionOut);
     const aggTotal = parentInputTokens + parentOutputTokens + parentCacheReadTokens + parentLiveEstOutput + subTotal;
     const aggCache = parentCacheReadTokens + subCache;
 
-    // Aggregate decode rate during active burst or active parent turn
+    // Prefer exact hardware live_decode_tok_s when /v1/telemetry is fresh; otherwise pure generated-output rate
     let aggRate = 0;
-    const now = Date.now();
-    if (burstStartMs > 0 && (running > 0 || now - burstLastActivityMs < 4000)) {
-      const elapsedS = Math.max(0.25, ((running > 0 ? now : burstLastActivityMs) - burstStartMs) / 1000);
+    let rateIsGpu = false;
+    if (freshGpu && freshGpu.liveDecodeTokS >= 1) {
+      aggRate = freshGpu.liveDecodeTokS;
+      rateIsGpu = true;
+    } else if (burstStartMs > 0 && (running > 0 || now - burstLastActivityMs < 4000)) {
+      const elapsedS = Math.max(0.5, ((running > 0 ? now : burstLastActivityMs) - burstStartMs) / 1000);
       const burstOut = Math.max(0, subOutput - burstBaselineSubagentOut);
-      // If exact subagent output tokens haven't landed yet, fall back to live estimate or reported delta
-      const effectiveTok = burstOut > 0 ? burstOut : subTotal;
-      aggRate = effectiveTok / elapsedS;
+      if (burstOut > 0) aggRate = burstOut / elapsedS;
     } else if (parentTurnStartMs > 0 && parentLiveEstOutput > 0) {
-      const elapsedS = Math.max(0.25, (now - parentTurnStartMs) / 1000);
+      const elapsedS = Math.max(0.5, (now - parentTurnStartMs) / 1000);
       aggRate = parentLiveEstOutput / elapsedS;
     }
 
@@ -166,9 +243,11 @@ export default function frankengineParallelExtension(pi: any) {
       aggOutput,
       aggTotal,
       aggCache,
-      subOutput,
-      subTotal,
+      gpuCloneSaved,
+      avgAcceptLen: freshGpu?.avgAcceptLen ?? 0,
+      gpuDecoding: freshGpu?.decoding ?? 0,
       aggRate,
+      rateIsGpu,
     };
   }
 
@@ -188,15 +267,16 @@ export default function frankengineParallelExtension(pi: any) {
     }
 
     if (s.aggOutput > 0 || s.aggTotal > 0) {
-      // Show aggregate generated tokens (parent + all subagent lanes) and total processed
-      if (s.aggOutput > 0) {
-        parts.push(`Σout ${fmtNum(s.aggOutput)}`);
-      }
+      if (s.aggOutput > 0) parts.push(`Σout ${fmtNum(s.aggOutput)}`);
       parts.push(`Σtot ${fmtNum(s.aggTotal)}`);
     }
 
+    if (s.gpuCloneSaved > 0) {
+      parts.push(`clone ${fmtNum(s.gpuCloneSaved)}`);
+    }
+
     if (s.aggRate >= 1) {
-      parts.push(`${Math.round(s.aggRate)} tok/s`);
+      parts.push(`${Math.round(s.aggRate)} tok/s${s.rateIsGpu ? " GPU" : ""}`);
     }
 
     targetUi.setStatus("frankengine-fanout", parts.join(" · "));
@@ -207,8 +287,12 @@ export default function frankengineParallelExtension(pi: any) {
         const barWidth = 16;
         const filled = s.totalLanes > 0 ? Math.round((s.done / s.totalLanes) * barWidth) : 0;
         const bar = "█".repeat(filled) + "░".repeat(Math.max(0, barWidth - filled));
+        const rateStr = s.aggRate >= 1 ? ` · ${s.rateIsGpu ? "" : "~"}${Math.round(s.aggRate)} tok/s${s.rateIsGpu ? " GPU" : " agg"}` : "";
+        const extraStr =
+          (s.avgAcceptLen >= 1.1 ? ` · α+1=${s.avgAcceptLen.toFixed(2)}` : "") +
+          (s.gpuCloneSaved > 0 ? ` · clone_slot ${fmtNum(s.gpuCloneSaved)} tok` : "");
         targetUi.setWidget("frankengine-fanout-live", [
-          `⚡ Frankengine Parallel [${bar}] ${s.done}/${s.totalLanes} lanes (${s.running} active · ${elapsedS}s) · Σout ${fmtNum(s.aggOutput)} tok · Σtot ${fmtNum(s.aggTotal)} tok${s.aggRate >= 1 ? ` · ~${Math.round(s.aggRate)} tok/s agg` : ""}`,
+          `⚡ Frankengine Parallel [${bar}] ${s.done}/${s.totalLanes} lanes (${s.running} active · ${elapsedS}s) · Σout ${fmtNum(s.aggOutput)} tok${rateStr}${extraStr}`,
         ]);
       } else {
         targetUi.setWidget("frankengine-fanout-live", undefined);
@@ -216,7 +300,6 @@ export default function frankengineParallelExtension(pi: any) {
     }
   }
 
-  // Helper attached inline to avoid extra allocations
   function resetStats() {
     parentOutputTokens = 0;
     parentInputTokens = 0;
@@ -227,6 +310,13 @@ export default function frankengineParallelExtension(pi: any) {
     burstStartMs = 0;
     burstLastActivityMs = 0;
     burstBaselineSubagentOut = 0;
+    if (gpuTel) {
+      gpuBaselineDecodeTok = gpuTel.totalDecodeTokens;
+      gpuBaselineCloneSaved = gpuTel.cloneSlotSavedTokens;
+    } else {
+      gpuBaselineDecodeTok = null;
+      gpuBaselineCloneSaved = null;
+    }
   }
 
   function ensureTicker() {
@@ -234,13 +324,15 @@ export default function frankengineParallelExtension(pi: any) {
     refreshTimer = setInterval(() => {
       const s = computeAggregate();
       if (s.running > 0) {
+        void pollGpuTelemetry();
         renderStatus();
       } else if (refreshTimer) {
         clearInterval(refreshTimer);
         refreshTimer = null;
+        void pollGpuTelemetry();
         renderStatus();
       }
-    }, 300);
+    }, 500);
   }
 
   // ---- Subscribe to omp's live subagent eventBus channels ----
@@ -278,6 +370,7 @@ export default function frankengineParallelExtension(pi: any) {
       }
       burstLastActivityMs = now;
       ensureTicker();
+      void pollGpuTelemetry();
       renderStatus();
     });
 
@@ -320,7 +413,6 @@ export default function frankengineParallelExtension(pi: any) {
       if (typeof p.requests === "number") {
         lane.requests = p.requests;
       }
-      // Estimate live streaming output tokens from recentOutput or streaming tool args while turn is in flight
       let liveChars = 0;
       if (Array.isArray(p.recentOutput)) {
         for (const line of p.recentOutput) liveChars += String(line).length;
@@ -332,8 +424,6 @@ export default function frankengineParallelExtension(pi: any) {
       if (est > lane.liveEstOutputTokens) {
         lane.liveEstOutputTokens = est;
       }
-      // Once progress.tokens lands on message_end, if exact outputTokens wasn't set yet,
-      // estimate output portion cleanly (for lane-writer, prompt is ~3.8K so output = max(est, tokens - context))
       if (lane.reportedTokens > 0 && lane.outputTokens === 0) {
         const ctxTok = Number(p.contextTokens ?? 0) || 0;
         const inferredOut = ctxTok > 0 && lane.reportedTokens > ctxTok ? lane.reportedTokens - ctxTok : 0;
@@ -352,11 +442,13 @@ export default function frankengineParallelExtension(pi: any) {
     if (pi.getFlag?.("fanout") === true) {
       cfg.enabled = true;
     }
+    void pollGpuTelemetry();
     renderStatus(ctx?.ui);
   });
 
   pi.on("session_switch", (_ev: any, ctx: any) => {
     resetStats();
+    void pollGpuTelemetry();
     renderStatus(ctx?.ui);
   });
 
@@ -364,11 +456,11 @@ export default function frankengineParallelExtension(pi: any) {
     lastUi = ctx?.ui ?? lastUi;
     parentTurnStartMs = Date.now();
     parentLiveEstOutput = 0;
+    void pollGpuTelemetry();
     renderStatus(ctx?.ui);
 
     if (!cfg.enabled) return;
 
-    // Never inject fan-out recursion into subagent prompts or if already present
     const sysText = Array.isArray(ev?.systemPrompt)
       ? ev.systemPrompt.join("\n\n")
       : typeof ev?.systemPrompt === "string"
@@ -401,11 +493,11 @@ export default function frankengineParallelExtension(pi: any) {
       parentCacheReadTokens += u.cacheRead;
       parentLiveEstOutput = 0;
       parentTurnStartMs = 0;
+      void pollGpuTelemetry();
       renderStatus(ctx?.ui);
     }
   });
 
-  // Capture exact per-subagent usage when `task` tool returns its results
   pi.on("tool_result", (ev: any, ctx: any) => {
     const results = ev?.details?.results;
     if (Array.isArray(results)) {
@@ -439,6 +531,7 @@ export default function frankengineParallelExtension(pi: any) {
       }
       burstLastActivityMs = now;
     }
+    void pollGpuTelemetry();
     renderStatus(ctx?.ui);
   });
 
@@ -477,6 +570,7 @@ export default function frankengineParallelExtension(pi: any) {
         cfg.enabled = !cfg.enabled;
       }
       saveConfig(cfg);
+      void pollGpuTelemetry();
       renderStatus(ctx?.ui);
       const s = computeAggregate();
       ctx?.ui?.notify?.(

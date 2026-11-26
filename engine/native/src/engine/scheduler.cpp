@@ -119,10 +119,66 @@ void Scheduler::withdraw(const std::shared_ptr<Job>& job) {
   if (it != waiting_.end()) waiting_.erase(it);
 }
 
+void Scheduler::record_decode(int tokens, int lane_steps, bool is_batch) {
+  if (tokens <= 0) return;
+  total_decode_tokens_.fetch_add(uint64_t(tokens), std::memory_order_relaxed);
+  if (is_batch) {
+    total_batch_steps_.fetch_add(1, std::memory_order_relaxed);
+    total_batch_lane_steps_.fetch_add(uint64_t(lane_steps), std::memory_order_relaxed);
+    total_batch_emitted_.fetch_add(uint64_t(tokens), std::memory_order_relaxed);
+  }
+  const auto now = Clock::now();
+  std::lock_guard lock(telemetry_mutex_);
+  decode_window_.push_back({now, tokens});
+  const auto cutoff = now - std::chrono::milliseconds(1500);
+  while (decode_window_.size() > 2 && decode_window_.front().at < cutoff) {
+    decode_window_.pop_front();
+  }
+}
+
+double Scheduler::compute_live_tps() const {
+  const auto now = Clock::now();
+  std::lock_guard lock(telemetry_mutex_);
+  if (decode_window_.empty()) return 0.0;
+  const auto cutoff = now - std::chrono::milliseconds(1500);
+  if (decode_window_.back().at < cutoff) return 0.0;
+  uint64_t sum = 0;
+  Clock::time_point first = now;
+  for (const auto& s : decode_window_) {
+    if (s.at >= cutoff) {
+      if (sum == 0) first = s.at;
+      sum += uint64_t(s.tokens);
+    }
+  }
+  if (sum == 0) return 0.0;
+  const double span_s = std::max(0.15, std::chrono::duration<double>(now - first).count());
+  return double(sum) / span_s;
+}
+
 SchedulerStats Scheduler::stats() const {
   std::lock_guard lock(mutex_);
   const int active = max_batch_ == 1 ? int(active_ != nullptr) : int(slots_.size());
-  return {int(waiting_.size()), active != 0, max_queue_, active, max_batch_, generator_.batch_max_ctx(), generator_.batch_spec()};
+  SchedulerStats st;
+  st.waiting = int(waiting_.size());
+  st.running = active != 0;
+  st.max_queue = max_queue_;
+  st.active = active;
+  st.max_batch = max_batch_;
+  st.batch_ctx = generator_.batch_max_ctx();
+  st.batch_spec = generator_.batch_spec();
+  st.decoding = decoding_slots_.load(std::memory_order_relaxed);
+  st.total_decode_tokens = total_decode_tokens_.load(std::memory_order_relaxed);
+  st.total_prefill_tokens = total_prefill_tokens_.load(std::memory_order_relaxed);
+  st.total_batch_steps = total_batch_steps_.load(std::memory_order_relaxed);
+  st.total_batch_lane_steps = total_batch_lane_steps_.load(std::memory_order_relaxed);
+  st.total_batch_emitted = total_batch_emitted_.load(std::memory_order_relaxed);
+  st.clone_slot_lanes = clone_slot_lanes_.load(std::memory_order_relaxed);
+  st.clone_slot_saved_tokens = clone_slot_saved_tokens_.load(std::memory_order_relaxed);
+  st.live_decode_tok_s = compute_live_tps();
+  st.avg_accept_len = st.total_batch_lane_steps > 0
+      ? double(st.total_batch_emitted) / double(st.total_batch_lane_steps)
+      : 0.0;
+  return st;
 }
 
 void Scheduler::close() {
@@ -289,6 +345,8 @@ void Scheduler::batch_loop() {
         }
       }
       if (cloned > 0) {
+        clone_slot_lanes_.fetch_add(uint64_t(cloned), std::memory_order_relaxed);
+        clone_slot_saved_tokens_.fetch_add(uint64_t(cloned) * uint64_t(src.offset), std::memory_order_relaxed);
         server_log().info("shared-prefix fork: src_slot={} cloned={} lanes at {} tokens",
                           src.slot, cloned, src.offset);
       }
@@ -348,8 +406,13 @@ void Scheduler::batch_loop() {
         const auto result = generator_.prefill_slot_chunk(
             slot.slot, slot.job->prompt_ids, slot.offset, slot.sampling, fork_at);
         if (!slot.offset) slot.job->cached_tokens_.store(result.reused_tokens);
+        const int delta_prefill = std::max(0, result.offset - std::max(before, result.reused_tokens));
+        if (delta_prefill > 0) total_prefill_tokens_.fetch_add(uint64_t(delta_prefill), std::memory_order_relaxed);
         slot.offset = result.offset;
-        if (result.token) emit(slot, std::span(&*result.token, 1));
+        if (result.token) {
+          emit(slot, std::span(&*result.token, 1));
+          record_decode(1, 1, false);
+        }
       } catch (const std::exception& e) {
         slot.job->fail(e.what());
         slot.done = true;
@@ -368,10 +431,16 @@ void Scheduler::batch_loop() {
       rows.push_back({slot.slot, slot.token, &slot.sampling});
       decoding.push_back(&slot);
     }
+    decoding_slots_.store(int(rows.size()), std::memory_order_relaxed);
     if (!rows.empty()) {
       try {
         const auto emitted = generator_.decode_batch_step_multi(rows);
-        for (std::size_t i = 0; i < rows.size(); ++i) emit(*decoding[i], emitted.at(i));
+        int step_tokens = 0;
+        for (std::size_t i = 0; i < rows.size(); ++i) {
+          step_tokens += int(emitted.at(i).size());
+          emit(*decoding[i], emitted.at(i));
+        }
+        record_decode(step_tokens, int(rows.size()), true);
       } catch (const std::exception& e) {
         for (auto* slot : decoding) {
           slot->job->fail(e.what());
@@ -402,6 +471,7 @@ void Scheduler::run(Job& job) {
         break;
       }
     }
+    if (!out.empty()) record_decode(int(out.size()), 1, false);
     job.push(out);
     return more;
   };

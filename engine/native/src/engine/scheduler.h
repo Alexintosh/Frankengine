@@ -77,6 +77,16 @@ struct SchedulerStats {
   int max_batch = 1;
   int batch_ctx = 0;
   int batch_spec = 0;
+  int decoding = 0;
+  uint64_t total_decode_tokens = 0;
+  uint64_t total_prefill_tokens = 0;
+  uint64_t total_batch_steps = 0;
+  uint64_t total_batch_lane_steps = 0;
+  uint64_t total_batch_emitted = 0;
+  uint64_t clone_slot_lanes = 0;
+  uint64_t clone_slot_saved_tokens = 0;
+  double live_decode_tok_s = 0.0;
+  double avg_accept_len = 0.0;
 };
 
 class Scheduler {
@@ -118,6 +128,24 @@ class Scheduler {
   std::deque<std::shared_ptr<Job>> waiting_;
   std::shared_ptr<Job> active_;
   std::vector<ActiveSlot> slots_;
+  void record_decode(int tokens, int lane_steps, bool is_batch);
+  double compute_live_tps() const;
+
+  struct TelemetrySample {
+    Clock::time_point at;
+    int tokens = 0;
+  };
+  mutable std::mutex telemetry_mutex_;
+  std::deque<TelemetrySample> decode_window_;
+  std::atomic<int> decoding_slots_{0};
+  std::atomic<uint64_t> total_decode_tokens_{0};
+  std::atomic<uint64_t> total_prefill_tokens_{0};
+  std::atomic<uint64_t> total_batch_steps_{0};
+  std::atomic<uint64_t> total_batch_lane_steps_{0};
+  std::atomic<uint64_t> total_batch_emitted_{0};
+  std::atomic<uint64_t> clone_slot_lanes_{0};
+  std::atomic<uint64_t> clone_slot_saved_tokens_{0};
+
   bool closed_ = false;
   std::thread thread_;
 };
