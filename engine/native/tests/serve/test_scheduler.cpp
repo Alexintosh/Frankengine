@@ -259,13 +259,23 @@ void test_system_prompt_anchor_boundary() {
   CHECK(scheduler.submit(j2));
   CHECK(drain(*j1) == std::vector<int32_t>(4, 100));
   CHECK(drain(*j2) == std::vector<int32_t>(4, 100));
+  // Wave 2 (c=2 concurrent requests with different user suffixes) must reuse the 321-token system anchor.
   const int before = gen.prefilled_tokens.load();
-  // Single follow-up request with the same system prompt (even c=1!) must reuse the 321-token system anchor.
   auto j3 = std::make_shared<Job>(make_prompt(3), 4, Sampling{});
+  auto j4 = std::make_shared<Job>(make_prompt(4), 4, Sampling{});
   CHECK(scheduler.submit(j3));
+  CHECK(scheduler.submit(j4));
   CHECK(drain(*j3) == std::vector<int32_t>(4, 100));
+  CHECK(drain(*j4) == std::vector<int32_t>(4, 100));
   CHECK(j3->cached_tokens() == 321);
-  CHECK(gen.prefilled_tokens.load() - before == 24);
+  CHECK(j4->cached_tokens() == 321);
+  CHECK(gen.prefilled_tokens.load() - before == 48);
+
+  // An idle c=1 request must route to fast Solo mode (never trapped in BatchDecoder by a batch anchor).
+  auto j5 = std::make_shared<Job>(make_prompt(5), 4, Sampling{});
+  CHECK(scheduler.submit(j5));
+  CHECK(drain(*j5) == std::vector<int32_t>(4, 100));
+  CHECK(scheduler.stats().decoding == 0);
 }
 
 }  // namespace

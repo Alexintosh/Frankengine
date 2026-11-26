@@ -228,6 +228,12 @@ void Scheduler::batch_loop() {
     return !job->images.empty() ||
            (generator_.batch_spec() > 0 && int(job->prompt_ids.size()) + generator_.batch_spec() + 2 >= generator_.batch_max_ctx());
   };
+  // Tiny side-requests (e.g. UI title generation / short classifiers) finish in ~0.3s in solo mode.
+  // Never interrupt a solo job for a single tiny side-request (or interrupt a tiny solo job right before
+  // it finishes), which would otherwise kick a long single-session agent prompt into BatchDecoder (c=1).
+  const auto is_tiny_side_req = [](const std::shared_ptr<Job>& job) {
+    return job->images.empty() && job->prompt_ids.size() <= 512 && job->max_new_tokens <= 128;
+  };
   const auto emit = [&](ActiveSlot& slot, std::span<const int32_t> tokens) {
     std::vector<int32_t> out;
     const int ctx_cap = (slot.solo || slot.force_solo) ? generator_.max_model_len() : generator_.batch_max_ctx();
@@ -277,6 +283,11 @@ void Scheduler::batch_loop() {
         if (solo_only && !slots_.empty()) break;
         waiting_.pop_front();
         const bool idle = slots_.empty() && waiting_.empty();
+        // If a single tiny side-request (e.g. UI title gen) arrives alongside a single real prompt,
+        // serialize them in fast Solo mode rather than promoting both into slower BatchDecoder (c=1..2).
+        const bool solo_with_tiny_peer =
+            slots_.empty() && waiting_.size() == 1 &&
+            (is_tiny_side_req(job) != is_tiny_side_req(waiting_.front()));
         int best_direct = -1, direct_prefix = -1;
         int best_anchor = -1, anchor_prefix = -1;
         int first_free_non_anchor = -1;
@@ -299,7 +310,12 @@ void Scheduler::batch_loop() {
         int chosen = -1;
         int pending_src = -1;
         int pending_len = 0;
-        if (solo_only) {
+        // When the server is completely idle (c=1), or only paired with a single tiny side-request,
+        // ALWAYS run in fast Solo mode on slot 0 (Solo maintains its own 2 GB GPU checkpoint/park cache).
+        // Routing an idle c=1 request into BatchDecoder just to hit a batch prefix anchor trades 1-2s of
+        // one-time TTFT for a 2-3x decode slowdown!
+        const bool route_solo = solo_only || idle || solo_with_tiny_peer;
+        if (route_solo) {
           chosen = 0;
           erase_anchor(0);
         } else if (direct_prefix > 0 && direct_prefix >= anchor_prefix) {
@@ -331,17 +347,20 @@ void Scheduler::batch_loop() {
         slot.force_solo = solo_only;
         slot.pending_anchor_src = pending_src;
         slot.pending_anchor_len = pending_len;
-        // Keep solo mode when truly idle unless a warm persistent prefix anchor already holds >= 256 tokens.
-        slot.solo = solo_only || (idle && chosen == 0 && pending_src < 0 && anchor_prefix < kMinAnchorPrefix);
+        slot.solo = route_solo;
         job->started();
-        if (solo_only) break;
+        if (route_solo) break;
       }
     }
 
-    if (slots_.empty()) continue;
+    if (slots_.empty()) {
+      decoding_slots_.store(0, std::memory_order_relaxed);
+      continue;
+    }
     auto& first = slots_.front();
     if (first.solo) {
       first.solo = false;
+      decoding_slots_.store(1, std::memory_order_relaxed);
       bool interrupted = false;
       try {
         const auto st = generator_.generate_interruptible(
@@ -350,7 +369,10 @@ void Scheduler::batch_loop() {
               emit(first, tokens);
               if (first.done || first.job->cancelled()) return false;
               std::lock_guard lock(mutex_);
-              interrupted = !first.force_solo && !waiting_.empty() && first.job->images.empty() &&
+              const bool tiny_guard =
+                  waiting_.size() == 1 &&
+                  (is_tiny_side_req(first.job) || is_tiny_side_req(waiting_.front()));
+              interrupted = !first.force_solo && !tiny_guard && !waiting_.empty() && first.job->images.empty() &&
                             !needs_solo(waiting_.front()) &&
                             (generator_.batch_spec() == 0 ||
                              int(first.job->prompt_ids.size()) + first.emitted + generator_.batch_spec() + 2 < generator_.batch_max_ctx());
@@ -372,6 +394,7 @@ void Scheduler::batch_loop() {
         first.job->fail(e.what());
         first.done = true;
       }
+      if (!interrupted) decoding_slots_.store(0, std::memory_order_relaxed);
       continue;
     }
 
