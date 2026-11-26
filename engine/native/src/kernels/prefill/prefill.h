@@ -68,17 +68,22 @@ struct AttnPrepParams {
   int T = 0, pos0 = 0;
   bool full = false;
   int hkv = kKvHeads;
-  const float* q_scale = nullptr;  // [24, 128]
-  const float* r_scale = nullptr;  // [24, 16]
-  const float* k_w = nullptr;      // full: k_static [4, 1024] by lag; sliding: k_conv [1024, 4] conv1d order
+  const float* q_scale = nullptr;  // [local query heads, 128]
+  const float* r_scale = nullptr;  // [local query heads, 16]
+  const float* k_w = nullptr;      // full: [4, local KV channels] by lag; sliding: [local KV channels, 4] conv1d order
   const float* v_w = nullptr;
-  const float* conv_k = nullptr;   // [3, 1024] previous conv inputs (read only; see conv_state_update)
+  const float* conv_k = nullptr;   // [3, local KV channels] previous conv inputs (read only)
   const float* conv_v = nullptr;
-  __nv_bfloat16* q = nullptr;      // out [T, 24, 128]
-  __nv_bfloat16* rel = nullptr;    // out [T, 24, 16]
-  void* k_out = nullptr;           // out [T, 8, 128] rows: bf16, or fp8 e4m3 (out_fp8: full caches with kv_fp8)
+  __nv_bfloat16* q = nullptr;      // out [T, local query heads, 128]
+  __nv_bfloat16* rel = nullptr;    // out [T, local query heads, 16]
+  void* k_out = nullptr;           // out [T, local KV heads, 128]: BF16 or FP8 E4M3 (full caches with out_fp8)
   void* v_out = nullptr;
   bool out_fp8 = false;
+  // Optional sliding ring destination, written from the same BF16 results as k_out/v_out. Snapshot the
+  // incoming ring before launching attn_prep. Only the last min(T, 1024) rows are published.
+  __nv_bfloat16* k_ring = nullptr;
+  __nv_bfloat16* v_ring = nullptr;
+  int64_t* ring_pos = nullptr;
 };
 // model._qkv per token: q (scale, clip, tau, BF16), rel (scale, clip, tau, BF16), keys/values through the
 // static (sliding) or dynamic (full) conv, BF16, key clip / value RMS norm, stored at the cache precision.
@@ -88,6 +93,8 @@ void attn_prep(const AttnPrepParams& p, cudaStream_t stream);
 // [16, 1024], out bf16 [T, 24, 1024].
 void rel_logits(const __nv_bfloat16* rel, const float* rel_proj, int T, __nv_bfloat16* out, cudaStream_t stream,
                 int heads = kHeads);
+// Round and transpose FP32 [16, 1024] weights into BF16 [1024, 16] for tiled relative bias in attention.
+void pack_rel_proj(const float* rel_proj, __nv_bfloat16* out, cudaStream_t stream);
 
 struct AttnParams {
   const __nv_bfloat16* q = nullptr;  // [T, 24, 128]
@@ -104,6 +111,9 @@ struct AttnParams {
   const __nv_bfloat16* proj = nullptr; // [T, ld]: gate (sigmoid input) and sink logits in SEG order
   int ld = 0;
   __nv_bfloat16* out = nullptr;        // [T, 3072] = bf16(bf16(attention * sigmoid(lse - sink)) * sigmoid(gate))
+  // When both are provided, explicit sliding attention computes its own relative bias in shared memory.
+  const __nv_bfloat16* rel_query = nullptr;  // [T, local query heads, 16]
+  const __nv_bfloat16* rel_proj = nullptr;   // packed by pack_rel_proj
 };
 // flex.attend + the output gate of model._visit: scores (q.k)/sqrt(128) + rel bias (distance < 1024), masked,
 // softmax with the per-head sink folded in through the log-sum-exp. Q.K in BF16 MMA with FP32 accumulation
@@ -117,9 +127,14 @@ void attention(const AttnParams& p, cudaStream_t stream);
 // ext = [state (3 rows), x]; x bf16 [T, ld], w fp32 [C, 4], state fp32 [3, C], out fp32 [T, C].
 void static_conv(const __nv_bfloat16* x, int ld, int T, int C, const float* w, const float* state, float* out,
                  cudaStream_t stream);
+// Same convolution, with the history update fused into the first time tile.
+void static_conv_update(const __nv_bfloat16* x, int ld, int T, int C, const float* w, float* state, float* out,
+                        cudaStream_t stream);
 
 // state <- the last three rows of [state, x] (x bf16 [T, ld], C channels). Run after every reader of state.
 void conv_state_update(float* state, const __nv_bfloat16* x, int ld, int T, int C, cudaStream_t stream);
+void kv_conv_state_update(float* state_k, float* state_v, const __nv_bfloat16* x_k, const __nv_bfloat16* x_v,
+                          int ld, int T, int C, cudaStream_t stream);
 
 // ---------------------------------------------------------------------------------------- message gates
 

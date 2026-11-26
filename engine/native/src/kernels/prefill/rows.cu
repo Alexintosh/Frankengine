@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cmath>
 #include <stdexcept>
+#include <type_traits>
 
 namespace ingine::kernels::prefill {
 namespace {
@@ -37,7 +38,7 @@ __device__ __forceinline__ void store_bf16x4(uint16_t* p, const float (&f)[4]) {
 
 // ---- attn_prep: one CTA (8 warps) per token
 
-template <int KvHeads>
+template <int KvHeads, bool WriteRing>
 __global__ void __launch_bounds__(256) attn_prep_kernel(const AttnPrepParams p) {
   constexpr int Heads = KvHeads * (kHeads / kKvHeads), KvDim = KvHeads * kHeadDim;
   constexpr int OffRel = 2 * Heads * kHeadDim, OffK = OffRel + Heads * (kRel + 1);
@@ -45,6 +46,8 @@ __global__ void __launch_bounds__(256) attn_prep_kernel(const AttnPrepParams p) 
   const int t = blockIdx.x, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
   const uint16_t* row = reinterpret_cast<const uint16_t*>(p.proj) + size_t(t) * p.ld;
   const int pos = p.pos0 + t;
+  const bool publish = WriteRing && t >= p.T - kRelExtent;
+  const int slot = pos & (kRelExtent - 1);
   // model.log_scale: 1 + 0.1 * log(clamp((p + 1) / 8192, min=1))
   const float tau = 1.f + 0.1f * logf(fmaxf(float(pos + 1) * (1.f / 8192.f), 1.f));
   const float qk_clip = 22.627416997969522f, rel_clip = 8.f;
@@ -77,6 +80,7 @@ __global__ void __launch_bounds__(256) attn_prep_kernel(const AttnPrepParams p) 
     if (p.full) x = round_bf16(x * tau);
     if (lane < 16) reinterpret_cast<uint16_t*>(p.rel)[(size_t(t) * Heads + h) * kRel + j] = f2bf_bits(x);
   }
+  if (publish && threadIdx.x == 0) p.ring_pos[slot] = pos;
   // keys / values of KV head `warp`, 4 channels per lane
   if (warp >= KvHeads) return;
   const int c = warp * kHeadDim + lane * 4;
@@ -141,7 +145,12 @@ __global__ void __launch_bounds__(256) attn_prep_kernel(const AttnPrepParams p) 
                          (uint32_t(f2e4m3(y[3])) << 24);
       *reinterpret_cast<uint32_t*>(static_cast<uint8_t*>(dst) + size_t(t) * KvDim + c) = b;
     } else {
-      store_bf16x4(static_cast<uint16_t*>(dst) + size_t(t) * KvDim + c, y);
+      const uint2 packed = make_uint2(pack_bf16x2(y[0], y[1]), pack_bf16x2(y[2], y[3]));
+      *reinterpret_cast<uint2*>(static_cast<uint16_t*>(dst) + size_t(t) * KvDim + c) = packed;
+      if (publish) {
+        auto* ring = reinterpret_cast<uint16_t*>(kv == 0 ? p.k_ring : p.v_ring);
+        *reinterpret_cast<uint2*>(ring + size_t(slot) * KvDim + c) = packed;
+      }
     }
   }
 }
@@ -223,36 +232,112 @@ rel_logits_mma_kernel(const uint16_t* __restrict__ rel, const float* __restrict_
   }
 }
 
-// ---- static conv over time: thread = channel, CONV_ROWS consecutive rows
+// ---- static conv over time: CONV_ROWS consecutive rows, one or four channels per thread
 
 constexpr int CONV_ROWS = 16;
 
-__global__ void static_conv_kernel(const uint16_t* __restrict__ x, int ld, int T, int C, const float* __restrict__ w,
-                                   const float* __restrict__ state, float* __restrict__ out) {
-  const int c = blockIdx.x * blockDim.x + threadIdx.x;
-  if (c >= C) return;
-  const int t0 = blockIdx.y * CONV_ROWS, t1 = min(T, t0 + CONV_ROWS);
-  const float4 w4 = *reinterpret_cast<const float4*>(w + size_t(c) * 4);
-  auto in = [&](int src) { return src >= 0 ? bf2f(x[size_t(src) * ld + c]) : state[(3 + src) * C + c]; };
-  float e0 = in(t0 - 3), e1 = in(t0 - 2), e2 = in(t0 - 1);
-  const float inv = 1.f / 2.2360679774997896f;
-  for (int t = t0; t < t1; ++t) {
-    const float e3 = bf2f(x[size_t(t) * ld + c]);
-    float acc = __fmul_rn(w4.x, e0);
-    acc = __fadd_rn(acc, __fmul_rn(w4.y, e1));
-    acc = __fadd_rn(acc, __fmul_rn(w4.z, e2));
-    acc = __fadd_rn(acc, __fmul_rn(w4.w, e3));
-    out[size_t(t) * C + c] = __fmul_rn(__fadd_rn(acc, e3), inv);
-    e0 = e1, e1 = e2, e2 = e3;
+template <int Channels>
+__device__ __forceinline__ void load_conv_row(const uint16_t* x, int ld, const float* state, int C, int c,
+                                              int src, float (&f)[Channels]) {
+  if constexpr (Channels == 4) {
+    if (src >= 0) {
+      load_bf16x4(x + size_t(src) * ld + c, f);
+    } else {
+      const float4 v = *reinterpret_cast<const float4*>(state + (3 + src) * C + c);
+      f[0] = v.x, f[1] = v.y, f[2] = v.z, f[3] = v.w;
+    }
+  } else {
+    f[0] = src >= 0 ? bf2f(x[size_t(src) * ld + c]) : state[(3 + src) * C + c];
   }
 }
 
-__global__ void conv_state_kernel(float* __restrict__ state, const uint16_t* __restrict__ x, int ld, int T, int C) {
-  const int c = blockIdx.x * blockDim.x + threadIdx.x;
+template <int Channels>
+__device__ __forceinline__ void store_conv_row(float* dst, const float (&f)[Channels]) {
+  if constexpr (Channels == 4)
+    *reinterpret_cast<float4*>(dst) = make_float4(f[0], f[1], f[2], f[3]);
+  else
+    *dst = f[0];
+}
+
+template <int Channels>
+__device__ __forceinline__ void update_conv_rows(float* state, const uint16_t* x, int ld, int T, int C, int c) {
+  for (int i = 0; i < 3; ++i) {  // old state is read from a later row than the one being written
+    float f[Channels];
+    load_conv_row(x, ld, state, C, c, T - 3 + i, f);
+    store_conv_row(state + i * C + c, f);
+  }
+}
+
+template <int Channels, bool Update>
+__global__ void static_conv_kernel(const uint16_t* __restrict__ x, int ld, int T, int C, const float* __restrict__ w,
+                                   std::conditional_t<Update, float, const float>* __restrict__ state,
+                                   float* __restrict__ out) {
+  const int c = (blockIdx.x * blockDim.x + threadIdx.x) * Channels;
   if (c >= C) return;
-  for (int i = 0; i < 3; ++i) {  // in order: reads row T + i of the old state before row i is written
-    const int src = T - 3 + i;
-    state[i * C + c] = src >= 0 ? bf2f(x[size_t(src) * ld + c]) : state[(3 + src) * C + c];
+  const int t0 = blockIdx.y * CONV_ROWS, t1 = min(T, t0 + CONV_ROWS);
+  float4 weights[Channels];
+#pragma unroll
+  for (int i = 0; i < Channels; ++i)
+    weights[i] = *reinterpret_cast<const float4*>(w + size_t(c + i) * 4);
+  float e0[Channels], e1[Channels], e2[Channels];
+  load_conv_row(x, ld, state, C, c, t0 - 3, e0);
+  load_conv_row(x, ld, state, C, c, t0 - 2, e1);
+  load_conv_row(x, ld, state, C, c, t0 - 1, e2);
+  const float inv = 1.f / 2.2360679774997896f;
+  for (int t = t0; t < t1; ++t) {
+    float e3[Channels], result[Channels];
+    load_conv_row(x, ld, state, C, c, t, e3);
+#pragma unroll
+    for (int i = 0; i < Channels; ++i) {
+      const float4 w4 = weights[i];
+      float acc = __fmul_rn(w4.x, e0[i]);
+      acc = __fadd_rn(acc, __fmul_rn(w4.y, e1[i]));
+      acc = __fadd_rn(acc, __fmul_rn(w4.z, e2[i]));
+      acc = __fadd_rn(acc, __fmul_rn(w4.w, e3[i]));
+      result[i] = __fmul_rn(__fadd_rn(acc, e3[i]), inv);
+      e0[i] = e1[i], e1[i] = e2[i], e2[i] = e3[i];
+    }
+    store_conv_row(out + size_t(t) * C + c, result);
+  }
+  if constexpr (Update) {
+    static_assert(CONV_ROWS >= 3);
+    // Only the first time tile needs the old state. Each thread owns its channels throughout.
+    if (t0 == 0) update_conv_rows<Channels>(state, x, ld, T, C, c);
+  }
+}
+
+template <int Channels>
+__global__ void conv_state_kernel(float* state_k, const uint16_t* x_k, int ld, int T, int C,
+                                   float* state_v, const uint16_t* x_v) {
+  const int c = (blockIdx.x * blockDim.x + threadIdx.x) * Channels;
+  if (c >= C) return;
+  if (blockIdx.y == 0) update_conv_rows<Channels>(state_k, x_k, ld, T, C, c);
+  else update_conv_rows<Channels>(state_v, x_v, ld, T, C, c);
+}
+
+bool conv_vector_aligned(const __nv_bfloat16* x, int ld, int C, const float* state) {
+  return C % 4 == 0 && ld % 4 == 0 && reinterpret_cast<uintptr_t>(x) % 8 == 0 &&
+         reinterpret_cast<uintptr_t>(state) % 16 == 0;
+}
+
+__global__ void pack_rel_proj_kernel(const float* __restrict__ w, uint16_t* __restrict__ out) {
+  constexpr int Distances = 32;
+  __shared__ uint16_t weights[kRel][Distances + 1];
+  const int d0 = blockIdx.x * Distances;
+  const int tid = threadIdx.x;
+  const int d = tid % Distances;
+#pragma unroll
+  for (int j = tid / Distances; j < kRel; j += 128 / Distances)
+    weights[j][d] = f2bf_bits(w[j * kRelExtent + d0 + d]);
+  __syncthreads();
+  if (tid < Distances * 2) {
+    const int col = tid / 2, half = tid % 2;
+    uint4 v;
+    v.x = uint32_t(weights[8 * half][col]) | (uint32_t(weights[8 * half + 1][col]) << 16);
+    v.y = uint32_t(weights[8 * half + 2][col]) | (uint32_t(weights[8 * half + 3][col]) << 16);
+    v.z = uint32_t(weights[8 * half + 4][col]) | (uint32_t(weights[8 * half + 5][col]) << 16);
+    v.w = uint32_t(weights[8 * half + 6][col]) | (uint32_t(weights[8 * half + 7][col]) << 16);
+    *reinterpret_cast<uint4*>(out + (d0 + col) * kRel + 8 * half) = v;
   }
 }
 
@@ -322,10 +407,14 @@ __global__ void widen_kernel(const int32_t* __restrict__ in, int T, int64_t* __r
   if (i < T) out[i] = in[i] < 0 ? negative_as : in[i];
 }
 
+template <bool Aligned>
 __global__ void __launch_bounds__(ROW_T) put_rows_kernel(const uint16_t* __restrict__ src, float* __restrict__ dst) {
   const size_t off = size_t(blockIdx.x) * H + threadIdx.x * 4;
   const uint16_t* s = src + off;
-  *reinterpret_cast<float4*>(dst + off) = make_float4(bf2f(s[0]), bf2f(s[1]), bf2f(s[2]), bf2f(s[3]));
+  float v[4];
+  if constexpr (Aligned) load_bf16x4(s, v);
+  else v[0] = bf2f(s[0]), v[1] = bf2f(s[1]), v[2] = bf2f(s[2]), v[3] = bf2f(s[3]);
+  *reinterpret_cast<float4*>(dst + off) = make_float4(v[0], v[1], v[2], v[3]);
 }
 
 __global__ void __launch_bounds__(ROW_T) tap_kernel(const float* __restrict__ x, uint16_t* __restrict__ out,
@@ -381,8 +470,15 @@ __global__ void __launch_bounds__(256) head_kernel(const uint16_t* __restrict__ 
 void attn_prep(const AttnPrepParams& p, cudaStream_t stream) {
   if (p.T <= 0 || !p.proj || !p.q || !p.rel || !p.k_out || !p.v_out || !p.conv_k || !p.conv_v)
     throw std::invalid_argument("attn_prep: missing argument");
-  if (p.hkv == kKvHeads) attn_prep_kernel<kKvHeads><<<p.T, 256, 0, stream>>>(p);
-  else if (p.hkv == kKvHeads / 2) attn_prep_kernel<kKvHeads / 2><<<p.T, 256, 0, stream>>>(p);
+  const bool ring = p.k_ring || p.v_ring || p.ring_pos;
+  if (ring && (p.full || p.out_fp8 || !p.k_ring || !p.v_ring || !p.ring_pos))
+    throw std::invalid_argument("attn_prep: ring needs all BF16 sliding cache destinations");
+  auto dispatch = [&]<int KvHeads>() {
+    if (ring) attn_prep_kernel<KvHeads, true><<<p.T, 256, 0, stream>>>(p);
+    else attn_prep_kernel<KvHeads, false><<<p.T, 256, 0, stream>>>(p);
+  };
+  if (p.hkv == kKvHeads) dispatch.template operator()<kKvHeads>();
+  else if (p.hkv == kKvHeads / 2) dispatch.template operator()<kKvHeads / 2>();
   else throw std::invalid_argument("attn_prep: unsupported KV head count");
 }
 
@@ -396,14 +492,40 @@ void rel_logits(const __nv_bfloat16* rel, const float* rel_proj, int T, __nv_bfl
       reinterpret_cast<const uint16_t*>(rel), rel_proj, M, reinterpret_cast<uint16_t*>(out));
 }
 
+void pack_rel_proj(const float* rel_proj, __nv_bfloat16* out, cudaStream_t stream) {
+  pack_rel_proj_kernel<<<kRelExtent / 32, 128, 0, stream>>>(
+      rel_proj, reinterpret_cast<uint16_t*>(out));
+}
+
 void static_conv(const __nv_bfloat16* x, int ld, int T, int C, const float* w, const float* state, float* out,
                  cudaStream_t stream) {
   const dim3 grid((C + 127) / 128, (T + CONV_ROWS - 1) / CONV_ROWS);
-  static_conv_kernel<<<grid, 128, 0, stream>>>(reinterpret_cast<const uint16_t*>(x), ld, T, C, w, state, out);
+  static_conv_kernel<1, false><<<grid, 128, 0, stream>>>(reinterpret_cast<const uint16_t*>(x), ld, T, C, w, state, out);
+}
+
+void static_conv_update(const __nv_bfloat16* x, int ld, int T, int C, const float* w, float* state, float* out,
+                        cudaStream_t stream) {
+  const auto* xb = reinterpret_cast<const uint16_t*>(x);
+  const int tiles = (T + CONV_ROWS - 1) / CONV_ROWS;
+  if (T >= CONV_ROWS && conv_vector_aligned(x, ld, C, state) && reinterpret_cast<uintptr_t>(out) % 16 == 0)
+    static_conv_kernel<4, true><<<dim3((C + 511) / 512, tiles), 128, 0, stream>>>(xb, ld, T, C, w, state, out);
+  else
+    static_conv_kernel<1, true><<<dim3((C + 127) / 128, tiles), 128, 0, stream>>>(xb, ld, T, C, w, state, out);
 }
 
 void conv_state_update(float* state, const __nv_bfloat16* x, int ld, int T, int C, cudaStream_t stream) {
-  conv_state_kernel<<<(C + 127) / 128, 128, 0, stream>>>(state, reinterpret_cast<const uint16_t*>(x), ld, T, C);
+  conv_state_kernel<1><<<(C + 127) / 128, 128, 0, stream>>>(
+      state, reinterpret_cast<const uint16_t*>(x), ld, T, C, nullptr, nullptr);
+}
+
+void kv_conv_state_update(float* state_k, float* state_v, const __nv_bfloat16* x_k, const __nv_bfloat16* x_v,
+                          int ld, int T, int C, cudaStream_t stream) {
+  const auto* k = reinterpret_cast<const uint16_t*>(x_k);
+  const auto* v = reinterpret_cast<const uint16_t*>(x_v);
+  if (conv_vector_aligned(x_k, ld, C, state_k) && conv_vector_aligned(x_v, ld, C, state_v))
+    conv_state_kernel<4><<<dim3((C + 511) / 512, 2), 128, 0, stream>>>(state_k, k, ld, T, C, state_v, v);
+  else
+    conv_state_kernel<1><<<dim3((C + 127) / 128, 2), 128, 0, stream>>>(state_k, k, ld, T, C, state_v, v);
 }
 
 void gate_inputs(const GateRows& rows, int G, int T, __nv_bfloat16* gin, cudaStream_t stream) {
@@ -421,7 +543,10 @@ void widen_ids(const int32_t* in, int T, int64_t* out, int32_t negative_as, cuda
 }
 
 void put_rows(const __nv_bfloat16* src, int count, float* dst, cudaStream_t stream) {
-  if (count > 0) put_rows_kernel<<<count, ROW_T, 0, stream>>>(reinterpret_cast<const uint16_t*>(src), dst);
+  if (count <= 0) return;
+  const auto* x = reinterpret_cast<const uint16_t*>(src);
+  if (reinterpret_cast<uintptr_t>(x) % 8 == 0) put_rows_kernel<true><<<count, ROW_T, 0, stream>>>(x, dst);
+  else put_rows_kernel<false><<<count, ROW_T, 0, stream>>>(x, dst);
 }
 
 void store_tap(const float* x, int T, __nv_bfloat16* out, int64_t out_stride, cudaStream_t stream) {

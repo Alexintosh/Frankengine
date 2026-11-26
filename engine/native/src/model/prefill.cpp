@@ -133,6 +133,10 @@ void Prefiller::run(State& st, const std::int32_t* tokens, int T, int pos0, floa
                                 std::to_string(st.max_ctx));
   const Weights& w = w_;
   const int kv = layout_.kv_dim_local, q = layout_.q_dim_local;
+  static const bool optimize = [] {
+    const char* env = std::getenv("INGINE_PREFILL_OPT");
+    return !env || !*env || std::strtol(env, nullptr, 10) != 0;
+  }();
   std::array<int, NUM_SEGS + 1> offsets;
   for (int i = 0; i <= NUM_SEGS; ++i) offsets[i] = layout_.weight_offset(i);
   const cudaStream_t s = stream_;
@@ -148,9 +152,9 @@ void Prefiller::run(State& st, const std::int32_t* tokens, int T, int pos0, floa
     tp_->reduce(partial, result, slab, TpSchedule::Prefill, op, s);
     if (partial) tp_narrow_hidden(partial, result, slab, s);
   };
-  auto mix = [&](const std::vector<const float*>& blocks, const float* base, const float* write, const float* abl_r,
-                 const float* abl_w, float* partial_out, const float* queries, int Q, const float* norm_w,
-                 __nv_bfloat16* out_bf16, float* out_f32) {
+  auto mix_params = [&](const std::vector<const float*>& blocks, const float* base, const float* write, const float* abl_r,
+                        const float* abl_w, float* partial_out, const float* queries, int Q, const float* norm_w,
+                        __nv_bfloat16* out_bf16, float* out_f32) {
     dense::MixParams p;
     p.blocks = blocks.empty() ? nullptr : block_table(blocks);
     p.nblocks = int(blocks.size());
@@ -166,7 +170,15 @@ void Prefiller::run(State& st, const std::int32_t* tokens, int T, int pos0, floa
     p.out_bf16 = out_bf16;
     p.out_f32 = out_f32;
     p.M = T;
-    dense::mix(p, false, s);
+    return p;
+  };
+  auto post_conv = [&](const __nv_bfloat16* input, const Tensor& w, float* state, float* out) {
+    if (optimize) {
+      pk::static_conv_update(input, H, T, H, f32p(w), state, out, s);
+    } else {
+      pk::static_conv(input, H, T, H, f32p(w), state, out, s);
+      pk::conv_state_update(state, input, H, T, H, s);
+    }
   };
   // B rows of a Dense matrix as BF16: the matrix itself, or its FP8 rows dequantized (weights.dequant)
   auto bf16_rows = [&](const Dense& d) -> const __nv_bfloat16* {
@@ -223,30 +235,43 @@ void Prefiller::run(State& st, const std::int32_t* tokens, int T, int pos0, floa
     const int pv = prev_v >= 0 ? prev_v : 0;
     const float* r_prev = mlp_dirs + std::size_t(pv) * H;
     const float* w_prev = mlp_w + 4 * std::size_t(pv);
+    dense::MixParams msg_mix;
     if (msgs) {
       const int i = l - LOOP_START;
       const float* src_base = i == 0 ? part_ : E_[p - 1];
       const float* src_write = i == 0 ? y2_ : nullptr;
-      mix({B2_[p - 1]}, src_base, src_write, r_prev, w_prev, i == 0 ? E_[p - 1] : nullptr,
-          f32p(w.message_queries) + std::size_t(i) * 4 * H, 4, nullptr, nullptr, msgs_);
+      msg_mix = mix_params({B2_[p - 1]}, src_base, src_write, r_prev, w_prev, i == 0 ? E_[p - 1] : nullptr,
+                           f32p(w.message_queries) + std::size_t(i) * 4 * H, 4, nullptr, nullptr, msgs_);
       if (i == 0) write = nullptr;
     }
     // ---- attention read(s)
     const float* queries = layer.attn_query.data ? f32p(layer.attn_query) : nullptr;
     const int nq = layer.attn_query.data ? layer.attn_query.ne[1] : 1;
     float* partial_out = hid != base ? hid : nullptr;
+    dense::MixParams attn_mix =
+        msgs ? mix_params(blocks, base, write, r_prev, w_prev, partial_out, queries, nq, nullptr, nullptr, mixf_)
+             : mix_params(blocks, base, write, r_prev, w_prev, partial_out, l > 0 ? queries : nullptr, l > 0 ? nq : 1,
+                          f32p(layer.attn_norm_mix), xin_, nullptr);
+    const bool tap_visit = tap < 3 && v == TAP_VISITS[tap];
+    if (optimize && tap_visit && tap_out) {
+      attn_mix.new_bf16 = tap_out + std::size_t(tap) * H;
+      attn_mix.new_bf16_stride = std::int64_t(NUM_TAPS) * H;
+    }
+    if (optimize && msgs) {
+      // The message path reads the previous pass's blocks. It shares no writes with this pass's attention read.
+      dense::mix_pair(attn_mix, msg_mix, false, s);
+    } else {
+      if (msgs) dense::mix(msg_mix, false, s);
+      dense::mix(attn_mix, false, s);
+    }
     if (msgs) {
-      mix(blocks, base, write, r_prev, w_prev, partial_out, queries, nq, nullptr, nullptr, mixf_);
       pk::GateRows rows;
       for (int g = 0; g < 3; ++g) rows.h[g] = mixf_ + (layer.full ? g : 0) * slab, rows.msg[g] = msgs_ + g * slab;
       gates(rows, 3, layer.qkv_gate_down, layer.qkv_gate_forget16, layer.qkv_gate_gain16, f32p(layer.attn_norm3),
             xin_);
-    } else {
-      mix(blocks, base, write, r_prev, w_prev, partial_out, l > 0 ? queries : nullptr, l > 0 ? nq : 1,
-          f32p(layer.attn_norm_mix), xin_, nullptr);
     }
-    if (tap < 3 && v == TAP_VISITS[tap]) {
-      if (tap_out) pk::store_tap(hid, T, tap_out + std::size_t(tap) * H, std::int64_t(NUM_TAPS) * H, s);
+    if (tap_visit) {
+      if (!optimize && tap_out) pk::store_tap(hid, T, tap_out + std::size_t(tap) * H, std::int64_t(NUM_TAPS) * H, s);
       ++tap;
     }
 
@@ -327,15 +352,26 @@ void Prefiller::run(State& st, const std::int32_t* tokens, int T, int pos0, floa
       pk::ring_gather(k_ring, v_ring, ring_pos, pos0, T, krows_, vrows_, kpos_, kpos_rows_, s, layout_.hkv_local, st.k_ring_at(ri).ne[2]);
       ap.k_out = krows_ + std::size_t(WINDOW) * kv, ap.v_out = vrows_ + std::size_t(WINDOW) * kv;
       ap.out_fp8 = false;
+      if (optimize) {
+        ap.k_ring = k_ring, ap.v_ring = v_ring, ap.ring_pos = ring_pos;
+        at.rel_query = rel16_, at.rel_proj = rel_, at.rel = nullptr;
+      }
       pk::attn_prep(ap, s);
-      pk::ring_update(krows_, vrows_, pos0, T, k_ring, v_ring, ring_pos, s, layout_.hkv_local);
+      if (!optimize) pk::ring_update(krows_, vrows_, pos0, T, k_ring, v_ring, ring_pos, s, layout_.hkv_local);
       pk::key_tile_bounds(kpos_, WINDOW + T, bounds_, s);
       at.k = krows_, at.v = vrows_, at.kv_fp8 = false, at.kpos = kpos_, at.bounds = bounds_, at.L = WINDOW + T;
       at.window = WINDOW;
     }
-    pk::conv_state_update(st.conv_k_at(v), proj_ + offsets[SEG_K], R, T, kv, s);
-    pk::conv_state_update(st.conv_v_at(v), proj_ + offsets[SEG_V], R, T, kv, s);
-    pk::rel_logits(rel16_, f32p(layer.rel_proj), T, rel_, s, layout_.hq_local);
+    const auto* k_proj = proj_ + offsets[SEG_K];
+    const auto* v_proj = proj_ + offsets[SEG_V];
+    if (optimize) {
+      pk::kv_conv_state_update(st.conv_k_at(v), st.conv_v_at(v), k_proj, v_proj, R, T, kv, s);
+    } else {
+      pk::conv_state_update(st.conv_k_at(v), k_proj, R, T, kv, s);
+      pk::conv_state_update(st.conv_v_at(v), v_proj, R, T, kv, s);
+    }
+    if (at.rel_query) pk::pack_rel_proj(f32p(layer.rel_proj), rel_, s);
+    else pk::rel_logits(rel16_, f32p(layer.rel_proj), T, rel_, s, layout_.hq_local);
     pk::attention(at, s);
 
     // ---- output projection + post-attention conv
@@ -350,23 +386,22 @@ void Prefiller::run(State& st, const std::int32_t* tokens, int T, int pos0, floa
       gemm_->run(attn_out_, q, wo, q, wo_product, H, wo_fp32, T, H, q, s);
     }
     if (tp_) reduce(2 * v, wo_out_);
-    pk::static_conv(wo_out_, H, T, H, f32p(layer.attn_conv), st.conv_attn_at(v), y_, s);
-    pk::conv_state_update(st.conv_attn_at(v), wo_out_, H, T, H, s);
+    post_conv(wo_out_, layer.attn_conv, st.conv_attn_at(v), y_);
 
     // ---- MLP read: this visit's attention write, ablated, on top of hid (or a fresh block)
     std::vector<const float*> mlp_blocks = blocks;
     if (boundary) mlp_blocks.push_back(hid);
     const float* mbase = boundary ? nullptr : hid;
     if (msgs) {
-      mix(mlp_blocks, mbase, y_, attn_dirs + std::size_t(v) * H, attn_w + 4 * std::size_t(v), part_, f32p(layer.mlp_query), 1, nullptr,
-          nullptr, mixm_);
+      dense::mix(mix_params(mlp_blocks, mbase, y_, attn_dirs + std::size_t(v) * H, attn_w + 4 * std::size_t(v), part_,
+                            f32p(layer.mlp_query), 1, nullptr, nullptr, mixm_), false, s);
       pk::GateRows rows;
       rows.h[0] = mixm_, rows.msg[0] = msgs_ + 3 * slab;
       gates(rows, 1, layer.mlp1_gate_down, layer.mlp1_gate_forget16, layer.mlp1_gate_gain16, f32p(layer.mlp_norm1),
             xm_);
     } else {
-      mix(mlp_blocks, mbase, y_, attn_dirs + std::size_t(v) * H, attn_w + 4 * std::size_t(v), part_, f32p(layer.mlp_query), 1,
-          f32p(layer.mlp_norm1), xm_, nullptr);
+      dense::mix(mix_params(mlp_blocks, mbase, y_, attn_dirs + std::size_t(v) * H, attn_w + 4 * std::size_t(v), part_,
+                            f32p(layer.mlp_query), 1, f32p(layer.mlp_norm1), xm_, nullptr), false, s);
     }
 
     // ---- routed experts (model._moe_grouped) + post-MLP conv
@@ -389,16 +424,16 @@ void Prefiller::run(State& st, const std::int32_t* tokens, int T, int pos0, floa
       pk::moe_down(me, act_, T, work, down_, s);
       pk::moe_combine(down_, wts_, T, moe_sum_, s);
     }
-    pk::static_conv(moe_sum_, H, T, H, f32p(layer.mlp_conv), st.conv_mlp_at(v), y2_, s);
-    pk::conv_state_update(st.conv_mlp_at(v), moe_sum_, H, T, H, s);
+    post_conv(moe_sum_, layer.mlp_conv, st.conv_mlp_at(v), y2_);
     prev_v = v;
   }
 
   // ---- final read, taps, head of the last row
   st.length = pos0 + T;
   if (!emit_head && !tap_out) return;
-  mix({B0_, B1_, B2_[2], E_[2]}, part_, y2_, mlp_dirs + std::size_t(prev_v) * H, mlp_w + 4 * std::size_t(prev_v), nullptr,
-      f32p(w.final_query), 1, f32p(w.final_norm), xf_, nullptr);
+  dense::mix(mix_params({B0_, B1_, B2_[2], E_[2]}, part_, y2_, mlp_dirs + std::size_t(prev_v) * H,
+                        mlp_w + 4 * std::size_t(prev_v), nullptr, f32p(w.final_query), 1, f32p(w.final_norm), xf_, nullptr),
+             false, s);
   if (tap_out)
     CUDA_CHECK(cudaMemcpy2DAsync(tap_out + std::size_t(NUM_TAPS - 1) * H, std::size_t(NUM_TAPS) * H * 2, xf_,
                                  std::size_t(H) * 2, std::size_t(H) * 2, T, cudaMemcpyDeviceToDevice, s));
