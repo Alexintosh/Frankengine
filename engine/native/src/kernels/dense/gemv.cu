@@ -140,6 +140,19 @@ struct DFlash2Epi {
   }
 };
 
+struct DFlash2F32Epi {
+  static constexpr int kInputs = 1;
+  static constexpr bool kScatter = true;
+  const __nv_bfloat16* x;
+  float* out;
+  int rows;
+  __device__ int input_of(int) const { return 0; }
+  __device__ const __nv_bfloat16* x_of(int) const { return x; }
+  __device__ void store1(int row, int m, float v) const {
+    out[size_t(m) * rows + row] = v;
+  }
+};
+
 template <bool Mlp, bool BF16>
 __global__ void conv_epilogue_kernel(const float* x, const __nv_bfloat16* x_bf16, int M, const float* conv_w,
                                     float* state, float* out, float* hist) {
@@ -599,8 +612,16 @@ void dflash2_fp8(const __nv_bfloat16* x, Matrix w, __nv_bfloat16* out, cudaStrea
   const auto* codes = static_cast<const uint8_t*>(w.w);
   const DFlash2Epi epi{x, out, w.rows};
   switch (w.cols) {
+    case 2048:
+      launch_ex(gemv_mma_kernel<true, 2048, 8, 8, 4, DFlash2Epi>, grid, 256, 0, 1,
+                false, stream, codes, w.scale, w.rows, 0u, epi);
+      break;
     case 2304:
       launch_ex(gemv_mma_kernel<true, 2304, 8, 12, 3, DFlash2Epi>, grid, 384, 0, 1,
+                false, stream, codes, w.scale, w.rows, 0u, epi);
+      break;
+    case 3456:
+      launch_ex(gemv_mma_kernel<true, 3456, 8, 9, 3, DFlash2Epi>, grid, 288, 0, 1,
                 false, stream, codes, w.scale, w.rows, 0u, epi);
       break;
     case 4096:
@@ -616,6 +637,24 @@ void dflash2_fp8(const __nv_bfloat16* x, Matrix w, __nv_bfloat16* out, cudaStrea
                 false, stream, codes, w.scale, w.rows, 0u, epi);
       break;
     default: require(false, "dflash2_fp8: unsupported input width");
+  }
+}
+
+void dflash2_fp8_f32(const __nv_bfloat16* x, Matrix w, float* out, cudaStream_t stream) {
+  require(x && w.w && w.scale && w.rows > 0 && out, "dflash2_fp8_f32: invalid arguments");
+  const dim3 grid((w.rows + 15) / 16);
+  const auto* codes = static_cast<const uint8_t*>(w.w);
+  const DFlash2F32Epi epi{x, out, w.rows};
+  switch (w.cols) {
+    case 2048:
+      launch_ex(gemv_mma_kernel<true, 2048, 8, 8, 4, DFlash2F32Epi>, grid, 256, 0, 1,
+                false, stream, codes, w.scale, w.rows, 0u, epi);
+      break;
+    case 3456:
+      launch_ex(gemv_mma_kernel<true, 3456, 8, 9, 3, DFlash2F32Epi>, grid, 288, 0, 1,
+                false, stream, codes, w.scale, w.rows, 0u, epi);
+      break;
+    default: require(false, "dflash2_fp8_f32: unsupported input width");
   }
 }
 

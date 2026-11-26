@@ -87,16 +87,20 @@ class EngineGenerator final : public Generator {
       throw std::invalid_argument("DFlash2 requires speculative decoding");
     if (use_dflash2 && options.head_nvfp4 && rt_.tp() && !dflash2_full_head())
       dflash2_head_ = std::make_unique<DFlash2Head>(*rt_.tp(), rt_.weights().unembed_nvfp4, rt_.stream());
-    if (use_dflash2 && options.tp.rank == 0) {
+    const bool shard_dflash2 = use_dflash2 && rt_.tp() && dflash2_shard_backbone();
+    if (use_dflash2 && (options.tp.rank == 0 || shard_dflash2)) {
       auto dir = options.dflash2_dir;
       if (dir.empty())
         if (const char* env = std::getenv("INKLING_DFLASH2_DIR")) dir = env;
       if (dir.empty()) throw std::invalid_argument("DFlash2 requires a checkpoint directory");
-      dflash2_ = std::make_unique<DFlash2>(dir, rt_.stream(), options.draft_type == "dflash2" && options.draft_nvfp4);
+      dflash2_ = std::make_unique<DFlash2>(dir, rt_.stream(), options.draft_type == "dflash2" && options.draft_nvfp4,
+                                           shard_dflash2 ? rt_.tp() : nullptr);
       const auto* embed = ptr<const __nv_bfloat16>(rt_.weights().embed);
       const auto* embed_norm = ptr<const float>(rt_.weights().embed_norm);
       if (dflash2_head_) {
         dflash2_->bind_sharded_head(*dflash2_head_, embed, embed_norm);
+      } else if (options.tp.rank != 0) {
+        dflash2_->bind_backbone_only(embed, embed_norm);
       } else if (!rt_.tp() && options.head_nvfp4) {
         dflash2_->bind_head(rt_.weights().unembed_nvfp4, embed, embed_norm);
       } else {
@@ -170,7 +174,7 @@ class EngineGenerator final : public Generator {
     // the vision tower's weights are resident: loaded before the park budget below is measured
     if (options.vision) vision_ = std::make_unique<VisionEncoder>(options.model_dir, rt_.stream());
     CUDA_CHECK(cudaStreamSynchronize(rt_.stream()));
-    if (dflash2_head_) rt_.tp()->check();
+    if (dflash2_head_ || (dflash2_ && dflash2_->is_sharded())) rt_.tp()->check();
     if (rt_.tp() && options.park_mb < 0) {
       park_budget_ = 0;
     } else if (options.park_mb < 0) {  // leave room for the workspaces a long prefill adds later
@@ -815,6 +819,7 @@ class EngineGenerator final : public Generator {
       if (options_.tp.serve && !rt_.tp()->agree(start, stream)) {
         forget_state();
         reset_state(st, stream);
+        if (flash && dflash2_) dflash2_->reset();
         if (!flash && drafter_) drafter_->reset();
         start = 0;
         stats.reuse = Reuse::None;

@@ -100,9 +100,14 @@ comm::CommPlan make_plan(const RuntimeOptions& options) {
   const std::uint64_t wire_hash = bf16 ? 0x200b : options.tp.wire == TpWire::Bf16Moe ? 0x200c : 0x200f;
   const std::uint64_t layout_hash = wire_hash | (std::uint64_t(options.max_batch - 1) << 16);
   const auto gather_bytes = kVocabularyShard * sizeof(float) * options.max_batch;
+  const bool dflash2_active = options.draft_type != "dspark";
+  const bool shard_dflash2 = dflash2_active && dflash2_shard_backbone();
   return {std::max(bytes, gather_bytes), layout_hash, checkpoint_fingerprint(options),
-          schedule | (std::uint64_t(options.draft_type != "dspark" &&
-                    options.head_nvfp4 && !dflash2_full_head()) << 49) | (std::uint64_t(options.tp.serve) << 48) | (std::uint64_t(options.spec_widths) << 46)};
+          schedule | (std::uint64_t(dflash2_active &&
+                    options.head_nvfp4 && !dflash2_full_head()) << 49) | (std::uint64_t(options.tp.serve) << 48) |
+                    (std::uint64_t(options.spec_widths) << 46) | (std::uint64_t(shard_dflash2) << 45) |
+                    (std::uint64_t(shard_dflash2 && dflash2_gqa()) << 44) |
+                    (std::uint64_t(shard_dflash2 && dflash2_shard_fp32()) << 43)};
 }
 
 comm::CommOptions transport_options(const RuntimeOptions& options) {
@@ -255,6 +260,16 @@ void TpRuntime::allreduce_bf16(__nv_bfloat16* bf16, std::size_t count, TpSchedul
   impl_->backend->allreduce_bf16({bf16, count}, {bf16, count}, site, stream);
 #else
   (void)bf16; (void)count; (void)schedule; (void)op; (void)stream;
+#endif
+}
+
+void TpRuntime::allreduce_f32(float* fp32, std::size_t count, TpSchedule schedule,
+                              unsigned op, cudaStream_t stream) {
+#ifdef INGINE_HAS_TP_COMM
+  const comm::CollectiveSite site{static_cast<unsigned>(schedule), op};
+  impl_->backend->allreduce_f32({fp32, count}, {fp32, count}, site, stream);
+#else
+  (void)fp32; (void)count; (void)schedule; (void)op; (void)stream;
 #endif
 }
 

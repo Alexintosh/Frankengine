@@ -18,3 +18,9 @@ endif()
 if(TARGET ingine_model)
   ingine_add_test(NAME spec_forced SOURCES test_forced.cpp LIBS ingine_model CUDA::cudart GPU MODEL TIMEOUT 600)
 endif()
+
+# Sharded TP=2 DFlash2 2-rank parity and half-shard CUDA-graph latency test.
+if(TARGET ingine_model)
+  ingine_add_test(NAME spec_dflash2_sharded SOURCES test_dflash2_sharded.cu LIBS ingine_model CUDA::cudart
+                  GPU MODEL TIMEOUT 600)
+endif()

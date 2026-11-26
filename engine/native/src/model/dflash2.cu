@@ -95,23 +95,48 @@ __global__ void convert(const float* x, Bf* out, int size) {
   if (i < size) out[i] = __float2bfloat16(x[i]);
 }
 
+__global__ void widen(const Bf* x, float* out, int size) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < size) out[i] = __bfloat162float(x[i]);
+}
+
+__global__ void sum_bf16_pair(const Bf* a, const Bf* b, Bf* out_a, Bf* out_b, int size) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < size) {
+    const Bf v = __float2bfloat16_rn(__bfloat162float(a[i]) + __bfloat162float(b[i]));
+    out_a[i] = v;
+    out_b[i] = v;
+  }
+}
+
+__global__ void sum_f32_pair_to_bf16(const float* a, const float* b, Bf* out_a, Bf* out_b, int size) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < size) {
+    const Bf v = __float2bfloat16_rn(a[i] + b[i]);
+    out_a[i] = v;
+    out_b[i] = v;
+  }
+}
+
 // One CTA per query. Warp-cooperative dot products followed by a stable
 // softmax and a channel-parallel value reduction.
+template <int LocalQHeads, int LocalKVHeads>
 __global__ void attend(const Bf* query, const Bf* ring_k, const Bf* ring_v,
                        const Bf* block_k, const Bf* block_v, int position, Bf* out,
                        const int* device_position = nullptr) {
+  constexpr int LocalKV = LocalKVHeads * D;
   if (device_position) position = *device_position;
   __shared__ float scores[W + Block];
   __shared__ float reductions[Threads];
   const int tid = threadIdx.x;
-  const int qrow = blockIdx.x / QHeads;
-  const int kvhead = (blockIdx.x % QHeads) / (QHeads / KVHeads);
+  const int qrow = blockIdx.x / LocalQHeads;
+  const int kvhead = (blockIdx.x % LocalQHeads) / (LocalQHeads / LocalKVHeads);
   const int begin = max(0, position + qrow - W + 1);
   const int count = position + Block - begin;
   query += blockIdx.x * D;
   for (int i = tid / 32; i < count; i += Threads / 32) {
     const int pos = begin + i;
-    const Bf* key = (pos < position ? ring_k + (pos % W) * KV : block_k + (pos - position) * KV)
+    const Bf* key = (pos < position ? ring_k + (pos % W) * LocalKV : block_k + (pos - position) * LocalKV)
                    + kvhead * D;
     float dot = 0;
     for (int j = tid % 32; j < D; j += 32)
@@ -145,7 +170,7 @@ __global__ void attend(const Bf* query, const Bf* ring_k, const Bf* ring_v,
   float value = 0;
   for (int i = 0; i < count; ++i) {
     const int pos = begin + i;
-    const Bf* row = pos < position ? ring_v + (pos % W) * KV : block_v + (pos - position) * KV;
+    const Bf* row = pos < position ? ring_v + (pos % W) * LocalKV : block_v + (pos - position) * LocalKV;
     value += scores[i] * __bfloat162float(row[kvhead * D + tid]);
   }
   out[blockIdx.x * D + tid] = __float2bfloat16(value / reductions[0]);
@@ -156,9 +181,11 @@ __global__ void attend(const Bf* query, const Bf* ring_k, const Bf* ring_v,
 constexpr int AttentionTile = 128;
 constexpr int MaxSplits = (W + Block + AttentionTile - 1) / AttentionTile;
 
+template <int LocalQHeads, int LocalKVHeads>
 __global__ void attend_split(const Bf* query, const Bf* ring_k, const Bf* ring_v,
                              const Bf* block_k, const Bf* block_v, int position,
                              float* partial, const int* device_position = nullptr) {
+  constexpr int LocalKV = LocalKVHeads * D;
   if (device_position) position = *device_position;
   constexpr int Warps = Threads / 32;
   __shared__ float numerators[Warps][D];
@@ -166,8 +193,8 @@ __global__ void attend_split(const Bf* query, const Bf* ring_k, const Bf* ring_v
   const int lane = threadIdx.x % 32;
   const int warp = threadIdx.x / 32;
   const int query_idx = blockIdx.x;
-  const int kvhead = (query_idx % QHeads) / (QHeads / KVHeads);
-  const int begin = max(0, position + query_idx / QHeads - W + 1);
+  const int kvhead = (query_idx % LocalQHeads) / (LocalQHeads / LocalKVHeads);
+  const int begin = max(0, position + query_idx / LocalQHeads - W + 1);
   const int first = begin + blockIdx.y * AttentionTile;
   const int end = min(first + AttentionTile, position + Block);
   float peak = -CUDART_INF_F, sum = 0.f;
@@ -176,7 +203,7 @@ __global__ void attend_split(const Bf* query, const Bf* ring_k, const Bf* ring_v
   const float2 q0 = __bfloat1622float2(q[2 * lane]);
   const float2 q1 = __bfloat1622float2(q[2 * lane + 1]);
   for (int pos = first + warp; pos < end; pos += Warps) {
-    const int offset = (pos < position ? pos % W : pos - position) * KV + kvhead * D;
+    const int offset = (pos < position ? pos % W : pos - position) * LocalKV + kvhead * D;
     const auto* k = reinterpret_cast<const __nv_bfloat162*>(
         (pos < position ? ring_k : block_k) + offset);
     const auto* v = reinterpret_cast<const __nv_bfloat162*>(
@@ -225,9 +252,12 @@ __global__ void attend_split(const Bf* query, const Bf* ring_k, const Bf* ring_v
 constexpr int GqaTile = 32, QPerKV = QHeads / KVHeads, GqaRows = Block * QPerKV;
 constexpr int GqaSplits = (W + Block + GqaTile - 1) / GqaTile;
 
+template <int LocalQHeads, int LocalKVHeads>
 __global__ void gqa_attention(const Bf* query, const Bf* ring_k, const Bf* ring_v,
                               const Bf* block_k, const Bf* block_v, int position,
                               float* partial, const int* device_position) {
+  constexpr int LocalKV = LocalKVHeads * D;
+  static_assert(LocalQHeads / LocalKVHeads == QPerKV);
   if (device_position) position = *device_position;
   using namespace nvcuda::wmma;
   __shared__ __align__(32) Bf qs[GqaRows][D], ks[GqaTile][D], vs[GqaTile][D];
@@ -243,11 +273,11 @@ __global__ void gqa_attention(const Bf* query, const Bf* ring_k, const Bf* ring_
   for (int i = tid; i < GqaTile * D / 8; i += Threads) {
     const int row = i / (D / 8), col = i % (D / 8);
     const int pos = first + row;
-    const int qidx = (row / QPerKV) * QHeads + head * QPerKV + row % QPerKV;
+    const int qidx = (row / QPerKV) * LocalQHeads + head * QPerKV + row % QPerKV;
     reinterpret_cast<uint4*>(qs[row])[col] = reinterpret_cast<const uint4*>(query + qidx * D)[col];
     uint4 k = make_uint4(0, 0, 0, 0), v = k;
     if (pos < end) {
-      const int off = (pos < position ? pos % W : pos - position) * KV + head * D;
+      const int off = (pos < position ? pos % W : pos - position) * LocalKV + head * D;
       k = reinterpret_cast<const uint4*>((pos < position ? ring_k : block_k) + off)[col];
       v = reinterpret_cast<const uint4*>((pos < position ? ring_v : block_v) + off)[col];
     }
@@ -269,7 +299,7 @@ __global__ void gqa_attention(const Bf* query, const Bf* ring_k, const Bf* ring_
   // Each warp reduces one query row at a time. The left edge advances
   // for each proposal token, while all proposal K/V remain visible.
   for (int qr = warp; qr < GqaRows; qr += 4) {
-    const int qrow = qr / QPerKV, qidx = qrow * QHeads + head * QPerKV + qr % QPerKV;
+    const int qrow = qr / QPerKV, qidx = qrow * LocalQHeads + head * QPerKV + qr % QPerKV;
     const int pos = first + lane;
     const bool valid = pos < end && pos >= max(0, position + qrow - W + 1);
     const float score = valid ? scores[qr][lane] * rsqrtf(float(D)) : -CUDART_INF_F;
@@ -300,7 +330,7 @@ __global__ void gqa_attention(const Bf* query, const Bf* ring_k, const Bf* ring_
     __syncwarp();
     for (int i = lane; i < 256; i += 32) {
       const int qr = (warp / 2) * 16 + i / 16;
-      const int qidx = (qr / QPerKV) * QHeads + head * QPerKV + qr % QPerKV;
+      const int qidx = (qr / QPerKV) * LocalQHeads + head * QPerKV + qr % QPerKV;
       partial[(qidx * GqaSplits + blockIdx.y) * (D + 2) + d + i % 16] = scratch[warp][i / 16][i % 16];
     }
     __syncwarp();
@@ -378,6 +408,8 @@ __global__ void best16(const float* values, const int* ids, float* out_values, i
   }
 }
 
+enum class ShardMode { Replicated, RowSlice, ColSlice };
+
 struct Linear {
   const Bf* bf16 = nullptr;
   head::Nvfp4Matrix packed;
@@ -400,7 +432,7 @@ struct DraftLayer {
 
 namespace {
 struct DraftProfile {
-  enum Stage { Commit, Embedding, Linear, Attention, Conv, Head, Selector, Count };
+  enum Stage { Commit, Embedding, Linear, Attention, Conv, Comm, Head, Selector, Count };
   struct Span {
     cudaEvent_t begin = nullptr, end = nullptr;
     Stage stage;
@@ -412,7 +444,7 @@ struct DraftProfile {
   cudaStream_t stream;
   bool enabled;
   bool capturing = false;
-  std::array<Span, 45> spans;
+  std::array<Span, 64> spans;
   int used = 0, rounds = 0, commits = 0;
   int position = 0;
   std::array<double, Count> totals{};
@@ -450,7 +482,7 @@ struct DraftProfile {
   void print() const {
     if (!rounds) return;
     const char* names[Count] = {"commit", "embed/final_norm", "5L linear", "5L attn",
-                                "5L conv/norm", "head/topk", "selector"};
+                                "5L conv/norm", "5L allreduce", "head/topk", "selector"};
     std::fprintf(stderr, "DFlash2 profile (%d rounds, final position %d)", rounds, position);
     double total = 0;
     for (int i = 0; i < Count; ++i) {
@@ -484,6 +516,12 @@ __global__ void cumulative_confidence(float* confidence) {
 
 struct DFlash2::Impl {
   cudaStream_t s;
+  TpRuntime* tp = nullptr;
+  int tp_size = 1;
+  int tp_rank = 0;
+  int q_heads = QHeads, kv_heads = KVHeads;
+  int q_dim = Q, kv_dim = KV, i_dim = I;
+  bool shard_fp32 = false;
   DraftProfile profile;
   int length = 0;
   int* device_position = nullptr;
@@ -505,26 +543,29 @@ struct DFlash2::Impl {
   std::array<DraftLayer, 5> layers;
   Linear fc, selector;
   Bf* padded_taps = nullptr;
-  const Bf *hidden_norm, *final_norm, *pred, *succ;
-  Bf *ctx, *commit_k, *commit_v, *x, *normed, *convolved, *coeff;
-  Bf *q, *key, *value, *block_key, *attention, *projection, *gate, *up, *projected;
-  float* attention_partial;
-  float *fp4_scratch, *lattice, *confidence;
-  int* tokens;
+  const Bf *hidden_norm = nullptr, *final_norm = nullptr, *pred = nullptr, *succ = nullptr;
+  Bf *ctx = nullptr, *commit_k = nullptr, *commit_v = nullptr, *x = nullptr, *normed = nullptr;
+  Bf *convolved = nullptr, *coeff = nullptr;
+  Bf *q = nullptr, *key = nullptr, *value = nullptr, *block_key = nullptr, *attention = nullptr;
+  Bf *projection = nullptr, *gate = nullptr, *up = nullptr, *projected = nullptr;
+  float* attention_partial = nullptr;
+  float* partial_f32 = nullptr;
+  float *fp4_scratch = nullptr, *lattice = nullptr, *confidence = nullptr;
+  int* tokens = nullptr;
   head::Nvfp4Matrix target_head;
   DFlash2Head* sharded_head = nullptr;
   const Bf* embed = nullptr;
   const float* embed_norm = nullptr;
   Bf* embeddings = nullptr;
-  int64_t* ids;
-  float* embed_output;
+  int64_t* ids = nullptr;
+  float* embed_output = nullptr;
   std::filesystem::path dump_dir;
   const bool cumulative = std::getenv("INKLING_DFLASH2_CUMULATIVE_CONFIDENCE") != nullptr;
   bool dump_written = false;
   int dump_round = 0, proposal_round = 0;
-  float *unary, *pool_values, *top_values;
-  int *anchor_dev, *pool_ids, *top_ids;
-  void* top_workspace;
+  float *unary = nullptr, *pool_values = nullptr, *top_values = nullptr;
+  int *anchor_dev = nullptr, *pool_ids = nullptr, *top_ids = nullptr;
+  void* top_workspace = nullptr;
 
   template <typename T = Bf>
   T* allocate(std::size_t n) {
@@ -532,9 +573,24 @@ struct DFlash2::Impl {
     return static_cast<T*>(buffers.back().p);
   }
 
-  Impl(const std::filesystem::path& path, cudaStream_t stream, bool nvfp4) : s(stream),
-        profile{stream, std::getenv("INKLING_DFLASH2_PROFILE") != nullptr} {
+  Impl(const std::filesystem::path& path, cudaStream_t stream, bool nvfp4,
+       TpRuntime* tp_rt, int shard_size, int shard_rank)
+      : s(stream),
+        tp(tp_rt),
+        tp_size(tp_rt ? tp_rt->layout.tp_size : shard_size),
+        tp_rank(tp_rt ? tp_rt->layout.tp_rank : shard_rank),
+        q_heads(QHeads / tp_size),
+        kv_heads(KVHeads / tp_size),
+        q_dim(Q / tp_size),
+        kv_dim(KV / tp_size),
+        i_dim(I / tp_size),
+        shard_fp32(tp_size == 2 && dflash2_shard_fp32()),
+        profile{stream, std::getenv("INKLING_DFLASH2_PROFILE") != nullptr && tp_rank == 0} {
+    if ((tp_size != 1 && tp_size != 2) || tp_rank < 0 || tp_rank >= tp_size)
+      throw std::invalid_argument("DFlash2 supports tp_size 1 or 2 and tp_rank in [0, tp_size)");
     if (const auto* dir = std::getenv("INKLING_DFLASH2_DUMP")) {
+      if (tp_size != 1)
+        throw std::invalid_argument("INKLING_DFLASH2_DUMP requires unsharded DFlash2");
       dump_dir = dir;
       if (const auto* round = std::getenv("INKLING_DFLASH2_DUMP_ROUND")) {
         std::size_t parsed = 0;
@@ -553,7 +609,7 @@ struct DFlash2::Impl {
     const bool hybrid = precision == "hybrid";
     if (dump_dir.empty())
       device_position = allocate<int>(1);
-    gqa = std::getenv("INKLING_DFLASH2_GQA") != nullptr;
+    gqa = dflash2_gqa();
     SafetensorsModel model(path);
     auto upload = [&](const std::string& name, std::vector<std::int64_t> shape, DeviceBuffer& buffer) {
       const auto tensor = model.at(name);
@@ -568,38 +624,120 @@ struct DFlash2::Impl {
       buffers.emplace_back();
       return upload(name, std::move(shape), buffers.back());
     };
-    auto linear = [&](const std::string& name, int rows, int cols, bool pack = false) {
+    auto linear = [&](const std::string& name, int full_rows, int full_cols, bool pack = false,
+                      ShardMode shard = ShardMode::Replicated) {
+      if (tp_size == 1) shard = ShardMode::Replicated;
+      const int rows = shard == ShardMode::RowSlice ? full_rows / tp_size : full_rows;
+      const int cols = shard == ShardMode::ColSlice ? full_cols / tp_size : full_cols;
       Linear layer;
       layer.rows = rows;
       layer.cols = cols;
       const bool mlp = name.find(".mlp.") != std::string::npos;
-      if (pack && !precision.empty() && !(hybrid && mlp)) {
-        DeviceBuffer source;
-        const auto* weights = upload(name, {rows, cols}, source);
-        auto* codes = allocate<uint8_t>(std::size_t(rows) * cols);
-        auto* scale = allocate<float>(rows);
-        kernels::dense::fp8_rows(weights, rows, cols, codes, scale, s);
-        layer.fp8 = {codes, scale, rows, cols};
-        // Bulk context commit uses the same quantized K/V weights through the
-        // BF16 GEMM path. Keep mirrors only for the two commit projections.
-        if (name.ends_with(".k_proj.weight") || name.ends_with(".v_proj.weight")) {
-          auto* mirror = allocate(std::size_t(rows) * cols);
-          kernels::dense::dequant_rows(codes, scale, rows, cols, mirror, s);
-          layer.bf16 = mirror;
+      const bool use_fp8 = pack && !precision.empty() && !(hybrid && mlp);
+      const bool use_nvfp4 = pack && !use_fp8 && (nvfp4 || hybrid);
+      if (shard == ShardMode::Replicated) {
+        if (use_fp8) {
+          DeviceBuffer source;
+          const auto* weights = upload(name, {full_rows, full_cols}, source);
+          auto* codes = allocate<uint8_t>(std::size_t(rows) * cols);
+          auto* scale = allocate<float>(rows);
+          kernels::dense::fp8_rows(weights, rows, cols, codes, scale, s);
+          layer.fp8 = {codes, scale, rows, cols};
+          if (name.ends_with(".k_proj.weight") || name.ends_with(".v_proj.weight")) {
+            auto* mirror = allocate(std::size_t(rows) * cols);
+            kernels::dense::dequant_rows(codes, scale, rows, cols, mirror, s);
+            layer.bf16 = mirror;
+          }
+          CUDA_CHECK(cudaStreamSynchronize(s));
+        } else if (use_nvfp4) {
+          DeviceBuffer source;
+          const auto* weights = upload(name, {full_rows, full_cols}, source);
+          const auto elements = std::size_t(rows) * cols;
+          auto* codes = allocate<uint8_t>(elements / 2);
+          auto* scales = allocate<uint8_t>(elements / 16);
+          const float scale = head::nvfp4_outer_scale(weights, elements, s);
+          head::nvfp4_pack_rows(weights, rows, cols, scale, codes, scales, s);
+          CUDA_CHECK(cudaStreamSynchronize(s));
+          layer.packed = {codes, scales, scale, rows, 0};
+        } else {
+          layer.bf16 = load(name, {full_rows, full_cols});
         }
-        CUDA_CHECK(cudaStreamSynchronize(s));
-      } else if (pack && (nvfp4 || hybrid)) {
+      } else if (shard == ShardMode::RowSlice) {
         DeviceBuffer source;
-        const auto* weights = upload(name, {rows, cols}, source);
-        const auto elements = std::size_t(rows) * cols;
-        auto* codes = allocate<uint8_t>(elements / 2);
-        auto* scales = allocate<uint8_t>(elements / 16);
-        const float scale = head::nvfp4_outer_scale(weights, elements, s);
-        head::nvfp4_pack_rows(weights, rows, cols, scale, codes, scales, s);
-        CUDA_CHECK(cudaStreamSynchronize(s));
-        layer.packed = {codes, scales, scale, rows, 0};
+        const auto* full_weights = upload(name, {full_rows, full_cols}, source);
+        const auto* weights = full_weights + std::size_t(tp_rank) * rows * cols;
+        if (use_fp8) {
+          auto* codes = allocate<uint8_t>(std::size_t(rows) * cols);
+          auto* scale = allocate<float>(rows);
+          kernels::dense::fp8_rows(weights, rows, cols, codes, scale, s);
+          layer.fp8 = {codes, scale, rows, cols};
+          // Bulk context commit uses the same quantized K/V weights through the
+          // BF16 GEMM path. Keep mirrors only for the two commit projections.
+          if (name.ends_with(".k_proj.weight") || name.ends_with(".v_proj.weight")) {
+            auto* mirror = allocate(std::size_t(rows) * cols);
+            kernels::dense::dequant_rows(codes, scale, rows, cols, mirror, s);
+            layer.bf16 = mirror;
+          }
+          CUDA_CHECK(cudaStreamSynchronize(s));
+        } else if (use_nvfp4) {
+          const auto full_elements = std::size_t(full_rows) * full_cols;
+          const auto elements = std::size_t(rows) * cols;
+          auto* codes = allocate<uint8_t>(elements / 2);
+          auto* scales = allocate<uint8_t>(elements / 16);
+          // Calibrate on the full tensor so the outer scale matches unsharded packing.
+          const float scale = head::nvfp4_outer_scale(full_weights, full_elements, s);
+          head::nvfp4_pack_rows(weights, rows, cols, scale, codes, scales, s);
+          CUDA_CHECK(cudaStreamSynchronize(s));
+          layer.packed = {codes, scales, scale, rows, 0};
+        } else {
+          auto* dst = allocate(std::size_t(rows) * cols);
+          CUDA_CHECK(cudaMemcpyAsync(dst, weights, std::size_t(rows) * cols * sizeof(Bf),
+                                     cudaMemcpyDeviceToDevice, s));
+          CUDA_CHECK(cudaStreamSynchronize(s));
+          layer.bf16 = dst;
+        }
       } else {
-        layer.bf16 = load(name, {rows, cols});
+        // ShardMode::ColSlice (row-parallel o_proj / down_proj): quantize the full row first so
+        // per-row FP8 scales / NVFP4 outer scale and codes match unsharded DFlash2 bit-for-bit.
+        DeviceBuffer source;
+        const auto* full_weights = upload(name, {full_rows, full_cols}, source);
+        if (use_fp8) {
+          DeviceBuffer full_codes_buf(std::size_t(full_rows) * full_cols);
+          auto* scale = allocate<float>(full_rows);
+          kernels::dense::fp8_rows(full_weights, full_rows, full_cols, full_codes_buf.p, scale, s);
+          auto* codes = allocate<uint8_t>(std::size_t(rows) * cols);
+          const auto* src_codes = static_cast<const uint8_t*>(full_codes_buf.p) + std::size_t(tp_rank) * cols;
+          CUDA_CHECK(cudaMemcpy2DAsync(codes, cols, src_codes, full_cols, cols, rows,
+                                       cudaMemcpyDeviceToDevice, s));
+          CUDA_CHECK(cudaStreamSynchronize(s));
+          layer.fp8 = {codes, scale, rows, cols};
+        } else if (use_nvfp4) {
+          const auto full_elements = std::size_t(full_rows) * full_cols;
+          const float scale = head::nvfp4_outer_scale(full_weights, full_elements, s);
+          DeviceBuffer full_codes_buf(full_elements / 2);
+          DeviceBuffer full_scales_buf(full_elements / 16);
+          head::nvfp4_pack_rows(full_weights, full_rows, full_cols, scale,
+                                static_cast<uint8_t*>(full_codes_buf.p),
+                                static_cast<uint8_t*>(full_scales_buf.p), s);
+          const auto elements = std::size_t(rows) * cols;
+          auto* codes = allocate<uint8_t>(elements / 2);
+          auto* scales = allocate<uint8_t>(elements / 16);
+          const auto* src_codes = static_cast<const uint8_t*>(full_codes_buf.p) + std::size_t(tp_rank) * (cols / 2);
+          const auto* src_scales = static_cast<const uint8_t*>(full_scales_buf.p) + std::size_t(tp_rank) * (cols / 16);
+          CUDA_CHECK(cudaMemcpy2DAsync(codes, cols / 2, src_codes, full_cols / 2, cols / 2, rows,
+                                       cudaMemcpyDeviceToDevice, s));
+          CUDA_CHECK(cudaMemcpy2DAsync(scales, cols / 16, src_scales, full_cols / 16, cols / 16, rows,
+                                       cudaMemcpyDeviceToDevice, s));
+          CUDA_CHECK(cudaStreamSynchronize(s));
+          layer.packed = {codes, scales, scale, rows, 0};
+        } else {
+          auto* dst = allocate(std::size_t(rows) * cols);
+          const auto* src = full_weights + std::size_t(tp_rank) * cols;
+          CUDA_CHECK(cudaMemcpy2DAsync(dst, cols * sizeof(Bf), src, full_cols * sizeof(Bf),
+                                       cols * sizeof(Bf), rows, cudaMemcpyDeviceToDevice, s));
+          CUDA_CHECK(cudaStreamSynchronize(s));
+          layer.bf16 = dst;
+        }
       }
       return layer;
     };
@@ -613,9 +751,11 @@ struct DFlash2::Impl {
     }
     hidden_norm = load("hidden_norm.weight", {H});
     final_norm = load("norm.weight", {H});
-    selector = linear("candidate_selector.hidden_projection.weight", Rank, H);
-    pred = load("candidate_selector.predecessor_codebook", {Vocabulary, Rank});
-    succ = load("candidate_selector.successor_codebook", {Vocabulary, Rank});
+    if (tp_rank == 0) {
+      selector = linear("candidate_selector.hidden_projection.weight", Rank, H);
+      pred = load("candidate_selector.predecessor_codebook", {Vocabulary, Rank});
+      succ = load("candidate_selector.successor_codebook", {Vocabulary, Rank});
+    }
     for (std::size_t i = 0; i < layers.size(); ++i) {
       auto& l = layers[i];
       const std::string prefix = "layers." + std::to_string(i) + ".";
@@ -629,37 +769,41 @@ struct DFlash2::Impl {
       l.knorm = load(prefix + "self_attn.k_norm.weight", {D});
       l.attention = conv("attention_conv");
       l.mlp = conv("mlp_conv");
-      l.q = linear(prefix + "self_attn.q_proj.weight", Q, H, true);
-      l.k = linear(prefix + "self_attn.k_proj.weight", KV, H, true);
-      l.v = linear(prefix + "self_attn.v_proj.weight", KV, H, true);
-      l.o = linear(prefix + "self_attn.o_proj.weight", H, Q, true);
-      l.gate = linear(prefix + "mlp.gate_proj.weight", I, H, true);
-      l.up = linear(prefix + "mlp.up_proj.weight", I, H, true);
-      l.down = linear(prefix + "mlp.down_proj.weight", H, I, true);
-      l.keys = allocate(W * KV);
-      l.values = allocate(W * KV);
+      l.q = linear(prefix + "self_attn.q_proj.weight", Q, H, true, ShardMode::RowSlice);
+      l.k = linear(prefix + "self_attn.k_proj.weight", KV, H, true, ShardMode::RowSlice);
+      l.v = linear(prefix + "self_attn.v_proj.weight", KV, H, true, ShardMode::RowSlice);
+      l.o = linear(prefix + "self_attn.o_proj.weight", H, Q, true, ShardMode::ColSlice);
+      l.gate = linear(prefix + "mlp.gate_proj.weight", I, H, true, ShardMode::RowSlice);
+      l.up = linear(prefix + "mlp.up_proj.weight", I, H, true, ShardMode::RowSlice);
+      l.down = linear(prefix + "mlp.down_proj.weight", H, I, true, ShardMode::ColSlice);
+      l.keys = allocate(W * kv_dim);
+      l.values = allocate(W * kv_dim);
     }
     ctx = allocate(CommitBatch * H);
-    commit_k = allocate(CommitBatch * KV);
-    commit_v = allocate(CommitBatch * KV);
+    commit_k = allocate(CommitBatch * kv_dim);
+    commit_v = allocate(CommitBatch * kv_dim);
     x = allocate(Block * H);
     normed = allocate(Block * H);
     convolved = allocate(Block * H);
     coeff = allocate(Block * Coefficients);
-    q = allocate(Block * Q);
-    key = allocate(Block * KV);
-    value = allocate(Block * KV);
-    block_key = allocate(Block * KV);
-    attention = allocate(Block * Q);
-    attention_partial = allocate<float>(Block * QHeads * (gqa ? GqaSplits : MaxSplits) * (D + 2));
-    projection = allocate(Block * Q);
-    gate = allocate(Block * I);
-    up = allocate(Block * I);
-    projected = allocate(Proposals * Rank);
-    fp4_scratch = (nvfp4 || hybrid) ? allocate<float>(Block * I) : nullptr;
-    lattice = allocate<float>(Proposals * 16 * 16);
-    tokens = allocate<int>(Proposals);
-    confidence = allocate<float>(Proposals);
+    q = allocate(Block * q_dim);
+    key = allocate(Block * kv_dim);
+    value = allocate(Block * kv_dim);
+    block_key = allocate(Block * kv_dim);
+    attention = allocate(Block * q_dim);
+    attention_partial = allocate<float>(Block * q_heads * (gqa ? GqaSplits : MaxSplits) * (D + 2));
+    // projection holds q_proj ([Block, q_dim]) as well as o_proj/down_proj ([Block, H]).
+    projection = allocate(Block * std::max(q_dim, H));
+    gate = allocate(Block * i_dim);
+    up = allocate(Block * i_dim);
+    if (tp_size == 2) partial_f32 = allocate<float>(Block * H);
+    fp4_scratch = (nvfp4 || hybrid) ? allocate<float>(Block * std::max(i_dim, H)) : nullptr;
+    if (tp_rank == 0) {
+      projected = allocate(Proposals * Rank);
+      lattice = allocate<float>(Proposals * 16 * 16);
+      tokens = allocate<int>(Proposals);
+      confidence = allocate<float>(Proposals);
+    }
   }
 
   template <typename T>
@@ -685,6 +829,17 @@ struct DFlash2::Impl {
         convert<<<(elements + Threads - 1) / Threads, Threads, 0, s>>>(
             fp4_scratch, out + first * w.rows, elements);
       }
+    }
+  }
+
+  void linear_f32(const Bf* input, const Linear& w, float* out) {
+    if (w.fp8.w) {
+      kernels::dense::dflash2_fp8_f32(input, w.fp8, out, s);
+    } else if (w.packed.codes) {
+      head::project_nvfp4(input, Block, w.cols, w.packed, out, s);
+    } else {
+      gemm.run(input, Block, w.bf16, w.rows, w.cols, projection, s);
+      widen<<<(Block * w.rows + Threads - 1) / Threads, Threads, 0, s>>>(projection, out, Block * w.rows);
     }
   }
 
@@ -716,15 +871,15 @@ struct DFlash2::Impl {
       for (const auto& l : layers) {
         linear(ctx, projected_rows, l.k, commit_k);
         linear(ctx, projected_rows, l.v, commit_v);
-        normalize<<<count * KVHeads, Threads, 0, s>>>(
-            commit_k, l.knorm, D, KVHeads, pos, l.keys, W);
+        normalize<<<count * kv_heads, Threads, 0, s>>>(
+            commit_k, l.knorm, D, kv_heads, pos, l.keys, W);
         const int slot = pos % W;
         const int contiguous = std::min(count, W - slot);
-        CUDA_CHECK(cudaMemcpyAsync(l.values + slot * KV, commit_v, contiguous * KV * sizeof(Bf),
+        CUDA_CHECK(cudaMemcpyAsync(l.values + slot * kv_dim, commit_v, contiguous * kv_dim * sizeof(Bf),
                                    cudaMemcpyDeviceToDevice, s));
         if (contiguous < count)
-          CUDA_CHECK(cudaMemcpyAsync(l.values, commit_v + contiguous * KV,
-                                     (count - contiguous) * KV * sizeof(Bf), cudaMemcpyDeviceToDevice, s));
+          CUDA_CHECK(cudaMemcpyAsync(l.values, commit_v + contiguous * kv_dim,
+                                     (count - contiguous) * kv_dim * sizeof(Bf), cudaMemcpyDeviceToDevice, s));
       }
     }
     CUDA_CHECK(cudaGetLastError());
@@ -755,54 +910,95 @@ struct DFlash2::Impl {
         projection, coeff, conv.base, 1, x, true);
   }
 
-  const Bf* forward(const Bf* embeds, const int* position = nullptr) {
-    const int splits = attention_splits();
-    CUDA_CHECK(cudaMemcpyAsync(x, embeds, Block * H * sizeof(Bf), cudaMemcpyDeviceToDevice, s));
-    for (const auto& l : layers) {
-      profile.begin(DraftProfile::Conv);
-      prepare(l.pre, l.attention);
-      profile.end();
-      profile.begin(DraftProfile::Linear);
-      linear(convolved, Block, l.q, projection);
-      normalize<<<Block * QHeads, Threads, 0, s>>>(projection, l.qnorm, D, QHeads, length, q, 0, position);
-      linear(convolved, Block, l.k, key);
-      normalize<<<Block * KVHeads, Threads, 0, s>>>(key, l.knorm, D, KVHeads, length, block_key, 0, position);
-      linear(convolved, Block, l.v, value);
-      profile.end();
-      profile.begin(DraftProfile::Attention);
-      if (!splits) {
-        attend<<<Block * QHeads, Threads, 0, s>>>(
-            q, l.keys, l.values, block_key, value, length, attention, position);
-      } else if (gqa) {
-        const int tiles = (std::min(length, W - 1) + Block + GqaTile - 1) / GqaTile;
-        const int grid_tiles = position ? GqaSplits : tiles;
-        gqa_attention<<<dim3(KVHeads, grid_tiles), Threads, 0, s>>>(
-            q, l.keys, l.values, block_key, value, length, attention_partial, position);
-        merge_attention<GqaSplits><<<Block * QHeads, Threads, 0, s>>>(
-            attention_partial, tiles, attention, position);
+  template <int LocalQHeads, int LocalKVHeads>
+  void run_attention(const DraftLayer& l, int splits, const int* position) {
+    if (!splits) {
+      attend<LocalQHeads, LocalKVHeads><<<Block * LocalQHeads, Threads, 0, s>>>(
+          q, l.keys, l.values, block_key, value, length, attention, position);
+    } else if (gqa) {
+      const int tiles = (std::min(length, W - 1) + Block + GqaTile - 1) / GqaTile;
+      const int grid_tiles = position ? GqaSplits : tiles;
+      gqa_attention<LocalQHeads, LocalKVHeads><<<dim3(LocalKVHeads, grid_tiles), Threads, 0, s>>>(
+          q, l.keys, l.values, block_key, value, length, attention_partial, position);
+      merge_attention<GqaSplits><<<Block * LocalQHeads, Threads, 0, s>>>(
+          attention_partial, tiles, attention, position);
+    } else {
+      attend_split<LocalQHeads, LocalKVHeads><<<dim3(Block * LocalQHeads, splits), Threads, 0, s>>>(
+          q, l.keys, l.values, block_key, value, length, attention_partial, position);
+      merge_attention<MaxSplits><<<Block * LocalQHeads, Threads, 0, s>>>(
+          attention_partial, splits, attention, nullptr);
+    }
+  }
+
+  void layer_attn_partial(int idx, int splits, const int* position, bool to_f32) {
+    const auto& l = layers[idx];
+    profile.begin(DraftProfile::Conv);
+    prepare(l.pre, l.attention);
+    profile.end();
+    profile.begin(DraftProfile::Linear);
+    linear(convolved, Block, l.q, projection);
+    normalize<<<Block * q_heads, Threads, 0, s>>>(projection, l.qnorm, D, q_heads, length, q, 0, position);
+    linear(convolved, Block, l.k, key);
+    normalize<<<Block * kv_heads, Threads, 0, s>>>(key, l.knorm, D, kv_heads, length, block_key, 0, position);
+    linear(convolved, Block, l.v, value);
+    profile.end();
+    profile.begin(DraftProfile::Attention);
+    if (tp_size == 2) run_attention<QHeads / 2, KVHeads / 2>(l, splits, position);
+    else run_attention<QHeads, KVHeads>(l, splits, position);
+    profile.end();
+    profile.begin(DraftProfile::Linear);
+    if (to_f32) linear_f32(attention, l.o, partial_f32);
+    else linear(attention, Block, l.o, projection);
+    profile.end();
+  }
+
+  void layer_mlp_partial(int idx, bool to_f32) {
+    const auto& l = layers[idx];
+    profile.begin(DraftProfile::Conv);
+    residual(l.attention);
+    prepare(l.post, l.mlp);
+    profile.end();
+    profile.begin(DraftProfile::Linear);
+    linear(convolved, Block, l.gate, gate);
+    linear(convolved, Block, l.up, up);
+    swiglu<<<Block * i_dim / Threads, Threads, 0, s>>>(gate, up, gate);
+    if (to_f32) linear_f32(gate, l.down, partial_f32);
+    else linear(gate, Block, l.down, projection);
+    profile.end();
+  }
+
+  void layer_mlp_epilogue(int idx) {
+    profile.begin(DraftProfile::Conv);
+    residual(layers[idx].mlp);
+    profile.end();
+  }
+
+  void reduce_partial(unsigned op, bool to_f32) {
+    if (tp) {
+      profile.begin(DraftProfile::Comm);
+      if (to_f32) {
+        tp->allreduce_f32(partial_f32, Block * H, TpSchedule::Proposal, op, s);
+        convert<<<(Block * H + Threads - 1) / Threads, Threads, 0, s>>>(partial_f32, projection, Block * H);
       } else {
-        attend_split<<<dim3(Block * QHeads, splits), Threads, 0, s>>>(
-            q, l.keys, l.values, block_key, value, length, attention_partial, position);
-        merge_attention<MaxSplits><<<Block * QHeads, Threads, 0, s>>>(
-            attention_partial, splits, attention, nullptr);
+        tp->allreduce_bf16(projection, Block * H, TpSchedule::Proposal, op, s);
       }
       profile.end();
-      profile.begin(DraftProfile::Linear);
-      linear(attention, Block, l.o, projection);
-      profile.end();
-      profile.begin(DraftProfile::Conv);
-      residual(l.attention);
-      prepare(l.post, l.mlp);
-      profile.end();
-      profile.begin(DraftProfile::Linear);
-      linear(convolved, Block, l.gate, gate);
-      linear(convolved, Block, l.up, up);
-      swiglu<<<Block * I / Threads, Threads, 0, s>>>(gate, up, gate);
-      linear(gate, Block, l.down, projection);
-      profile.end();
-      profile.begin(DraftProfile::Conv);
-      residual(l.mlp);
-      profile.end();
+    } else if (to_f32) {
+      convert<<<(Block * H + Threads - 1) / Threads, Threads, 0, s>>>(partial_f32, projection, Block * H);
+    }
+  }
+
+  const Bf* forward(const Bf* embeds, const int* position = nullptr) {
+    const int splits = attention_splits();
+    const bool to_f32 = tp_size == 2 && shard_fp32;
+    CUDA_CHECK(cudaMemcpyAsync(x, embeds, Block * H * sizeof(Bf), cudaMemcpyDeviceToDevice, s));
+    for (int i = 0; i < int(layers.size()); ++i) {
+      layer_attn_partial(i, splits, position, to_f32);
+      if (tp_size == 2) reduce_partial(1u + 2u * i, to_f32);
+      layer_mlp_partial(i, to_f32);
+      if (tp_size == 2) reduce_partial(2u + 2u * i, to_f32);
+      layer_mlp_epilogue(i);
+
     }
     profile.begin(DraftProfile::Embedding);
     normalize<<<Block, Threads, 0, s>>>(x, final_norm, H, 1, -1, normed, 0);
@@ -856,11 +1052,15 @@ DFlash2Head::DFlash2Head(TpRuntime& tp, head::Nvfp4Matrix matrix, cudaStream_t s
 }
 DFlash2Head::~DFlash2Head() = default;
 
-void DFlash2Head::run(const Bf* hidden) {
+void DFlash2Head::run(const Bf* hidden, bool replicated, bool run_merge) {
   auto& d = *impl_;
   auto* input = const_cast<Bf*>(hidden);
-  if (!input) input = static_cast<Bf*>(d.hidden.p);
-  d.tp.exchange_draft_head(input, d.hidden.bytes, nullptr, d.stream);
+  if (!replicated) {
+    if (!input) input = static_cast<Bf*>(d.hidden.p);
+    d.tp.exchange_draft_head(input, d.hidden.bytes, nullptr, d.stream);
+  } else if (!input) {
+    throw std::invalid_argument("DFlash2Head::run(replicated=true) requires hidden");
+  }
   auto* logits = static_cast<float*>(d.logits.p);
   auto* pool_values = static_cast<float*>(d.pool_values.p);
   auto* pool_ids = static_cast<int*>(d.pool_ids.p);
@@ -873,7 +1073,7 @@ void DFlash2Head::run(const Bf* hidden) {
   pack_head_candidates<<<1, HeadCandidates, 0, d.stream>>>(
       values, ids, d.matrix.v_begin, static_cast<head::Candidate*>(d.local.p));
   d.tp.exchange_draft_head(d.local.p, d.local.bytes, d.gathered.p, d.stream);
-  if (hidden)
+  if (replicated ? run_merge : (hidden != nullptr))
     merge_head_candidates<<<1, Proposals, 0, d.stream>>>(
         static_cast<const head::Candidate*>(d.gathered.p), ids, values);
   CUDA_CHECK(cudaGetLastError());
@@ -882,9 +1082,14 @@ void DFlash2Head::run(const Bf* hidden) {
 const int* DFlash2Head::ids() const { return static_cast<const int*>(impl_->top_ids.p); }
 const float* DFlash2Head::values() const { return static_cast<const float*>(impl_->top_values.p); }
 
-DFlash2::DFlash2(const std::filesystem::path& path, cudaStream_t stream, bool nvfp4)
-    : impl_(std::make_unique<Impl>(path, stream, nvfp4)) {}
+DFlash2::DFlash2(const std::filesystem::path& path, cudaStream_t stream, bool nvfp4,
+                 TpRuntime* tp, int tp_size, int tp_rank)
+    : impl_(std::make_unique<Impl>(path, stream, nvfp4, tp, tp_size, tp_rank)) {}
 DFlash2::~DFlash2() = default;
+
+bool DFlash2::is_sharded() const { return impl_->tp != nullptr; }
+int DFlash2::tp_size() const { return impl_->tp_size; }
+int DFlash2::tp_rank() const { return impl_->tp_rank; }
 
 void DFlash2::bind_head(head::Nvfp4Matrix matrix, const Bf* embed, const float* embed_norm) {
   auto& d = *impl_;
@@ -911,6 +1116,10 @@ void DFlash2::bind_sharded_head(DFlash2Head& head, const Bf* embed, const float*
   d.bind_embeddings(embed, embed_norm);
 }
 
+void DFlash2::bind_backbone_only(const Bf* embed, const float* embed_norm) {
+  impl_->bind_embeddings(embed, embed_norm);
+}
+
 void DFlash2::warmup() {
   auto& d = *impl_;
   if (!d.device_position) return;  // Proposal dumps use the uncaptured path.
@@ -928,7 +1137,9 @@ void DFlash2::warmup() {
     propose(0, true);
     if (d.gqa) break;
   }
-  if (d.sharded_head) propose_sharded_head();
+  // When sharded (d.tp != nullptr), sharded_head runs inside every captured graph in lockstep.
+  // When unsharded, rank 1 performs a single startup head exchange to match this call.
+  if (d.sharded_head && !d.tp) propose_sharded_head(d.normed + H, false);
   CUDA_CHECK(cudaStreamSynchronize(d.s));
   reset();
 }
@@ -939,7 +1150,8 @@ const int* DFlash2::propose(int anchor) {
 
 const int* DFlash2::propose(int anchor, bool warming_up) {
   auto& d = *impl_;
-  if (!d.embed || anchor < 0 || anchor >= (d.sharded_head ? Vocabulary : d.target_head.rows))
+  const int vocab_limit = d.target_head.codes ? d.target_head.rows : Vocabulary;
+  if (!d.embed || anchor < 0 || anchor >= vocab_limit)
     throw std::invalid_argument("Invalid DFlash2 anchor or missing target head");
   // Reserve a consistent commit span for every graph, including the initial proposal.
   if (d.profile.enabled && d.profile.used == 0) {
@@ -947,13 +1159,20 @@ const int* DFlash2::propose(int anchor, bool warming_up) {
     d.profile.end();
   }
   input_ids<<<1, Block, 0, d.s>>>(d.ids, d.anchor_dev, anchor, d.device_position, d.length);
+  const bool in_graph_sharded_head = d.sharded_head && d.tp != nullptr;
   auto launch = [&](const int* position) {
     d.profile.begin(DraftProfile::Embedding);
     kernels::dense::embed(d.ids, Block, d.embed, d.embed_norm, d.embed_output, false, d.s);
     convert<<<Block * H / Threads, Threads, 0, d.s>>>(d.embed_output, d.embeddings, Block * H);
     d.profile.end();
     const auto* hidden = d.forward(d.embeddings, position);
-    if (d.sharded_head) return;
+    if (in_graph_sharded_head) {
+      // Replicated hidden state across both ranks: skip hidden broadcast and capture the sharded
+      // head + candidate allgather (+ rank-0 selector) right inside the CUDA graph.
+      propose_sharded_head(hidden, true);
+      return;
+    }
+    if (d.sharded_head || !d.target_head.codes) return;
     d.profile.begin(DraftProfile::Head);
     head::project_nvfp4(hidden, Proposals, H, d.target_head, d.unary, d.s);
     kernels::draft::topk_candidates(d.unary, Proposals, d.target_head.rows, nullptr,
@@ -994,7 +1213,7 @@ const int* DFlash2::propose(int anchor, bool warming_up) {
     d.warmed = true;
   }
   const auto* hidden = d.normed + H;
-  if (d.sharded_head && !warming_up) propose_sharded_head();
+  if (d.sharded_head && !in_graph_sharded_head && !warming_up) propose_sharded_head(hidden, false);
   if (!warming_up) d.profile.finish(d.length);
   const auto* tokens = d.tokens;
   if (!d.dump_dir.empty() && !d.dump_written && d.proposal_round++ == d.dump_round) {
@@ -1019,9 +1238,9 @@ const int* DFlash2::propose(int anchor, bool warming_up) {
         const auto& layer = d.layers[i];
         for (const auto& [name, data] : {std::pair{"keys", layer.keys}, {"values", layer.values}}) {
           const auto file = std::string(name) + "-" + std::to_string(i) + ".bf16";
-          d.dump(file.c_str(), data + first_slot * KV, contiguous * KV);
+          d.dump(file.c_str(), data + first_slot * d.kv_dim, contiguous * d.kv_dim);
           if (contiguous < rows)
-            d.dump(file.c_str(), data, (rows - contiguous) * KV, true);
+            d.dump(file.c_str(), data, (rows - contiguous) * d.kv_dim, true);
         }
       }
     }
@@ -1030,20 +1249,36 @@ const int* DFlash2::propose(int anchor, bool warming_up) {
   return tokens;
 }
 
-void DFlash2::propose_sharded_head() {
+void DFlash2::propose_sharded_head(const Bf* hidden, bool replicated) {
   auto& d = *impl_;
   d.profile.begin(DraftProfile::Head);
-  d.sharded_head->run(d.normed + H);
+  d.sharded_head->run(hidden, replicated, d.tp_rank == 0);
   d.profile.end();
-  d.profile.begin(DraftProfile::Selector);
-  select(d.sharded_head->ids(), d.sharded_head->values(), d.anchor_dev);
-  d.profile.end();
+  if (d.tp_rank == 0) {
+    d.profile.begin(DraftProfile::Selector);
+    select(d.sharded_head->ids(), d.sharded_head->values(), d.anchor_dev);
+    d.profile.end();
+  }
 }
 
 const float* DFlash2::confidence() const { return impl_->confidence; }
 
 bool dflash2_full_head() {
   const char* value = std::getenv("INKLING_DFLASH2_FULL_HEAD");
+  return value && std::string_view(value) == "1";
+}
+
+bool dflash2_shard_backbone() {
+  const char* value = std::getenv("INKLING_DFLASH2_SHARD_BACKBONE");
+  return !value || std::string_view(value) != "0";
+}
+
+bool dflash2_gqa() {
+  return std::getenv("INKLING_DFLASH2_GQA") != nullptr;
+}
+
+bool dflash2_shard_fp32() {
+  const char* value = std::getenv("INKLING_DFLASH2_SHARD_FP32");
   return value && std::string_view(value) == "1";
 }
 
@@ -1066,6 +1301,60 @@ const int* DFlash2::select(const int* candidates, const float* unary, const int*
                                           anchor, d.lattice, d.tokens, d.s, d.confidence);
   if (d.cumulative) cumulative_confidence<<<1, 1, 0, d.s>>>(d.confidence);
   return d.tokens;
+}
+
+const Bf* DFlash2::forward_pair(DFlash2& rank0, DFlash2& rank1, const Bf* embeddings,
+                                bool fp32_reduce) {
+  auto& d0 = *rank0.impl_;
+  auto& d1 = *rank1.impl_;
+  if (d0.tp_size != 2 || d0.tp_rank != 0 || d1.tp_size != 2 || d1.tp_rank != 1)
+    throw std::invalid_argument("forward_pair requires rank0 (tp_size=2, rank=0) and rank1 (tp_size=2, rank=1)");
+  if (d0.s != d1.s || d0.length != d1.length)
+    throw std::invalid_argument("forward_pair requires matching stream and committed length");
+  const cudaStream_t s = d0.s;
+  const int splits = d0.attention_splits();
+  CUDA_CHECK(cudaMemcpyAsync(d0.x, embeddings, Block * H * sizeof(Bf), cudaMemcpyDeviceToDevice, s));
+  CUDA_CHECK(cudaMemcpyAsync(d1.x, embeddings, Block * H * sizeof(Bf), cudaMemcpyDeviceToDevice, s));
+  for (int i = 0; i < int(d0.layers.size()); ++i) {
+    d0.layer_attn_partial(i, splits, nullptr, fp32_reduce);
+    d1.layer_attn_partial(i, splits, nullptr, fp32_reduce);
+    if (fp32_reduce)
+      sum_f32_pair_to_bf16<<<(Block * H + Threads - 1) / Threads, Threads, 0, s>>>(
+          d0.partial_f32, d1.partial_f32, d0.projection, d1.projection, Block * H);
+    else
+      sum_bf16_pair<<<(Block * H + Threads - 1) / Threads, Threads, 0, s>>>(
+          d0.projection, d1.projection, d0.projection, d1.projection, Block * H);
+    d0.layer_mlp_partial(i, fp32_reduce);
+    d1.layer_mlp_partial(i, fp32_reduce);
+    if (fp32_reduce)
+      sum_f32_pair_to_bf16<<<(Block * H + Threads - 1) / Threads, Threads, 0, s>>>(
+          d0.partial_f32, d1.partial_f32, d0.projection, d1.projection, Block * H);
+    else
+      sum_bf16_pair<<<(Block * H + Threads - 1) / Threads, Threads, 0, s>>>(
+          d0.projection, d1.projection, d0.projection, d1.projection, Block * H);
+    d0.layer_mlp_epilogue(i);
+    d1.layer_mlp_epilogue(i);
+
+  }
+  normalize<<<Block, Threads, 0, s>>>(d0.x, d0.final_norm, H, 1, -1, d0.normed, 0);
+  normalize<<<Block, Threads, 0, s>>>(d1.x, d1.final_norm, H, 1, -1, d1.normed, 0);
+  CUDA_CHECK(cudaGetLastError());
+  return d0.normed + H;
+}
+
+const int* DFlash2::propose_pair(DFlash2& rank0, DFlash2& rank1, int anchor, bool fp32_reduce) {
+  auto& d0 = *rank0.impl_;
+  if (!d0.embed || !d0.target_head.codes || anchor < 0 || anchor >= d0.target_head.rows)
+    throw std::invalid_argument("propose_pair requires rank0 with full bound head and valid anchor");
+  input_ids<<<1, Block, 0, d0.s>>>(d0.ids, d0.anchor_dev, anchor, nullptr, d0.length);
+  kernels::dense::embed(d0.ids, Block, d0.embed, d0.embed_norm, d0.embed_output, false, d0.s);
+  convert<<<Block * H / Threads, Threads, 0, d0.s>>>(d0.embed_output, d0.embeddings, Block * H);
+  const auto* hidden = forward_pair(rank0, rank1, d0.embeddings, fp32_reduce);
+  head::project_nvfp4(hidden, Proposals, H, d0.target_head, d0.unary, d0.s);
+  kernels::draft::topk_candidates(d0.unary, Proposals, d0.target_head.rows, nullptr,
+                                  d0.pool_values, d0.pool_ids, d0.top_workspace, d0.s);
+  best16<<<Proposals, Threads, 0, d0.s>>>(d0.pool_values, d0.pool_ids, d0.top_values, d0.top_ids);
+  return rank0.select(d0.top_ids, d0.top_values, d0.anchor_dev);
 }
 
 }  // namespace ingine::model

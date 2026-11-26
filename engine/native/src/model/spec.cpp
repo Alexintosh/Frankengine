@@ -41,8 +41,13 @@ SpecLoop::SpecLoop(Runtime& rt, Drafter* drafter, DFlash2* dflash2, DFlash2Head*
     : rt_(rt), drafter_(drafter), dflash2_(dflash2), dflash2_head_(dflash2_head),
       host_verify_(rt.tp() || dflash2 || rt.options().draft_type == "hybrid"),
       width_(sizeof(std::int32_t)), record_(sizeof(VerifyRecord)), forced_window_(kd::BLOCK * sizeof(std::int32_t)) {
-  if ((drafter != nullptr || dflash2 != nullptr) != (rt.options().tp.rank == 0))
-    throw std::invalid_argument("SpecLoop: expected the drafter on rank 0");
+  const bool sharded_dflash2 = dflash2 && dflash2->is_sharded();
+  if (drafter && rt.options().tp.rank != 0)
+    throw std::invalid_argument("SpecLoop: expected the DSpark drafter on rank 0");
+  if (rt.options().tp.rank == 0 && !drafter && !dflash2)
+    throw std::invalid_argument("SpecLoop: expected a drafter on rank 0");
+  if (rt.options().tp.rank != 0 && dflash2 && !sharded_dflash2)
+    throw std::invalid_argument("SpecLoop: unsharded DFlash2 is only valid on rank 0");
   if (drafter && drafter->stream() != rt.stream())
     throw std::invalid_argument("SpecLoop: drafter and runtime streams differ");
   const Widths widths = verify_widths(rt);
@@ -302,7 +307,7 @@ void SpecLoop::generate_host_verified(std::int32_t token, int max_new_tokens, co
     if (drafter_)
       verify_proposal(draft_.conf, draft_.tokens, rt_.options().spec_threshold, widths, stop ? -1 : fixed_width,
                       proposal, stream);
-    if (dflash2_) {
+    if (dflash2_ && (!tp || tp->layout.tp_rank == 0)) {
       const bool hybrid = rt_.options().draft_type == "hybrid";
       const bool adaptive = hybrid || rt_.options().dflash2_adaptive;
       const float threshold = hybrid ? rt_.options().hybrid_dflash2_threshold : rt_.options().spec_threshold;
@@ -357,7 +362,7 @@ void SpecLoop::generate_host_verified(std::int32_t token, int max_new_tokens, co
     const int offset = stats.generated_tokens;
     const int32_t anchor = out.back();
     // Both ranks finish the draft collectives before rank 0 can publish cancellation.
-    if (dflash2_ && (keep_running || dflash2_head_)) {
+    if (dflash2_ && (keep_running || dflash2_head_ || dflash2_->is_sharded())) {
       event(0);
       if (last_width) {
         const int n = last_accepted + 1;

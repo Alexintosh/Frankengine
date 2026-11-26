@@ -216,8 +216,12 @@ void gemv_nvfp4(const __nv_bfloat16* x, int cols, Nvfp4Matrix w, float* out, cud
 
 void project_nvfp4(const __nv_bfloat16* x, int M, int cols, Nvfp4Matrix w, float* out, cudaStream_t stream) {
   const dim3 tiles((w.rows - 1) / Tile + 1);
-  if (cols == 2304)
+  if (cols == 2048)
+    dense::launch_ex(project<2048, 8, false>, tiles, 256, 0, 1, false, stream, x, M, w, out, nullptr);
+  else if (cols == 2304)
     dense::launch_ex(project<2304, 6, false>, tiles, 192, 0, 1, false, stream, x, M, w, out, nullptr);
+  else if (cols == 3456)
+    dense::launch_ex(project<3456, 9, false>, tiles, 288, 0, 1, false, stream, x, M, w, out, nullptr);
   else if (cols == 4096)
     dense::launch_ex(project<4096, 8, false>, tiles, 256, 0, 1, false, stream, x, M, w, out, nullptr);
   else if (cols == 6912)
