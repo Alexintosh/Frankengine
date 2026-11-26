@@ -389,8 +389,8 @@ void BatchDrafter::commit(int n, const std::int32_t* slots, const std::int64_t* 
     ++m;
   }
   if (total == 0) return;
-  std::memcpy(pin_params_.data(), host_params_.data(), host_params_.size() * 4);
-  CUDA_CHECK(cudaMemcpyAsync(d_params_, pin_params_.data(), host_params_.size() * 4, cudaMemcpyHostToDevice, stream_));
+  // pageable source: CUDA stages <= 64 KB synchronously before returning, avoiding races with subsequent draft()
+  CUDA_CHECK(cudaMemcpyAsync(d_params_, host_params_.data(), host_params_.size() * 4, cudaMemcpyHostToDevice, stream_));
   const kbd::CommitSeqs S{d_params_, d_params_ + slots_, d_params_ + 2 * slots_, d_params_ + 3 * slots_, m};
   const __nv_bfloat16* ctx_norm[3] = {layers_[0].ctx_norm, layers_[1].ctx_norm, layers_[2].ctx_norm};
   const __nv_bfloat16* k_norm[3] = {layers_[0].k_norm_ctx, layers_[1].k_norm_ctx, layers_[2].k_norm_ctx};

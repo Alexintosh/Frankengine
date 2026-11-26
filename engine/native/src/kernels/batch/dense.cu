@@ -560,6 +560,262 @@ void launch(const HeadArgs& a, cudaStream_t stream) {
     throw std::runtime_error("batch head_sample: launch failed");
 }
 
+struct HeadNvfp4TopkArgs {
+  const __nv_bfloat16* A;
+  kernels::head::Nvfp4Matrix w;
+  int lda, M, ntiles;
+  kernels::head::Candidate* partials;  // [M, ntiles, 16]
+};
+
+template <class C>
+struct Nvfp4TopkSmem {
+  static constexpr int TILE_BYTES = C::TM * C::TN * int(sizeof(float));
+  static constexpr int BYTES = C::SMEM > TILE_BYTES ? C::SMEM : TILE_BYTES;
+};
+
+template <class C>
+__global__ void __launch_bounds__(C::NT, 2) head_nvfp4_topk16_kernel(const HeadNvfp4TopkArgs p) {
+  extern __shared__ __align__(128) std::uint8_t smem[];
+  constexpr int MF = C::MF, NF = C::NF, TM = C::TM, TN = C::TN, NT = C::NT, STAGES = C::STAGES;
+  const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+  const int grp = lane >> 2, t4 = lane & 3;
+  const int warp_m = warp / C::WN, warp_n = warp % C::WN;
+  const int mtile = blockIdx.x, ntile = blockIdx.y;
+  const __nv_bfloat16* A = p.A + std::size_t(mtile) * TM * p.lda;
+  const std::uint8_t* Wc = p.w.codes + std::size_t(ntile) * TN * (H / 2);
+  const std::uint8_t* Ws = p.w.scales + std::size_t(ntile) * TN * (H / 16);
+  const int m_rows = min(TM, p.M - mtile * TM), n_rows = min(TN, p.w.rows - ntile * TN);
+  constexpr int nk = H / BK;
+
+  auto load_a = [&](int stage, int kt) {
+    std::uint8_t* base = smem + stage * C::STAGE;
+    for (int i = tid; i < TM * 8; i += NT) {
+      const int r = i >> 3, c = i & 7;
+      const bool ok = r < m_rows;
+      cp_async16(smem_addr(base + swz(r, c)), A + std::size_t(ok ? r : 0) * p.lda + kt * BK + c * 8, ok);
+    }
+  };
+  auto load_w = [&](int stage, int kt) {
+    std::uint8_t* wbase = smem + stage * C::STAGE + C::A_BYTES;
+    std::uint8_t* scbase = wbase + C::W_BYTES;
+    {
+      const int r = tid >> 1, c16 = tid & 1;
+      const bool ok = r < n_rows;
+      cp_async16(smem_addr(wbase + r * C::W_STRIDE + (c16 << 4)),
+                 Wc + std::size_t(ok ? r : 0) * (H / 2) + kt * 32 + (c16 << 4), ok);
+    }
+    if (tid < TN) {
+      const bool ok = tid < n_rows;
+      cp_async4(smem_addr(scbase + tid * 4), Ws + std::size_t(ok ? tid : 0) * (H / 16) + kt * 4, ok);
+    }
+  };
+
+  float acc[MF][NF][4];
+#pragma unroll
+  for (int i = 0; i < MF; ++i)
+#pragma unroll
+    for (int j = 0; j < NF; ++j) acc[i][j][0] = acc[i][j][1] = acc[i][j][2] = acc[i][j][3] = 0.f;
+
+#pragma unroll
+  for (int s = 0; s < STAGES - 1; ++s) load_w(s, s);
+#pragma unroll
+  for (int s = 0; s < STAGES - 1; ++s) {
+    load_a(s, s);
+    cp_commit();
+  }
+
+  const float factor = p.w.outer_scale;
+  for (int kt = 0; kt < nk; ++kt) {
+    cp_wait<STAGES - 2>();
+    __syncthreads();
+    const int next = kt + STAGES - 1;
+    if (next < nk) load_a(next % STAGES, next), load_w(next % STAGES, next);
+    cp_commit();
+
+    const std::uint8_t* stage_ptr = smem + (kt % STAGES) * C::STAGE;
+    const std::uint32_t a_base = smem_addr(stage_ptr);
+    const std::uint8_t* w_base = stage_ptr + C::A_BYTES;
+    const std::uint8_t* sc_base = w_base + C::W_BYTES;
+
+    __half2 sc_lo[NF], sc_hi[NF];
+#pragma unroll
+    for (int j = 0; j < NF; ++j) {
+      const int row_n = warp_n * NF * 8 + j * 8 + grp;
+      const std::uint32_t s4 = *reinterpret_cast<const std::uint32_t*>(sc_base + row_n * 4);
+      const std::uint32_t hlo = nvfp4::f16x2_from_e4m3x2(std::uint16_t(s4 & 0xffffu));
+      const std::uint32_t hhi = nvfp4::f16x2_from_e4m3x2(std::uint16_t(s4 >> 16));
+      sc_lo[j] = *reinterpret_cast<const __half2*>(&hlo);
+      sc_hi[j] = *reinterpret_cast<const __half2*>(&hhi);
+    }
+
+#pragma unroll
+    for (int ks = 0; ks < BK / 16; ++ks) {
+      std::uint32_t af[MF][4];
+#pragma unroll
+      for (int i = 0; i < MF; ++i)
+        ldsm_x4(af[i], a_base + swz(warp_m * MF * 16 + i * 16 + (lane & 15), ks * 2 + (lane >> 4)));
+#pragma unroll
+      for (int j = 0; j < NF; ++j) {
+        const int row_n = warp_n * NF * 8 + j * 8 + grp;
+        const std::uint8_t* wr = w_base + row_n * C::W_STRIDE + ks * 8;
+        const __half2 sc_h2 = (ks == 0) ? __low2half2(sc_lo[j])
+                            : (ks == 1) ? __high2half2(sc_lo[j])
+                            : (ks == 2) ? __low2half2(sc_hi[j])
+                                        : __high2half2(sc_hi[j]);
+        const std::uint32_t b0 = decode_e2m1_byte_scaled(wr[t4], sc_h2, factor);
+        const std::uint32_t b1 = decode_e2m1_byte_scaled(wr[4 + t4], sc_h2, factor);
+#pragma unroll
+        for (int i = 0; i < MF; ++i) mma_bf16(acc[i][j], af[i], b0, b1);
+      }
+    }
+  }
+  cp_wait<0>();
+  __syncthreads();
+
+  auto tile_logits = reinterpret_cast<float (*)[TN]>(smem);
+#pragma unroll
+  for (int i = 0; i < MF; ++i) {
+#pragma unroll
+    for (int h = 0; h < 2; ++h) {
+      const int row = warp_m * MF * 16 + i * 16 + grp + h * 8;
+      if (row < m_rows) {
+#pragma unroll
+        for (int j = 0; j < NF; ++j) {
+          const int col = warp_n * NF * 8 + j * 8 + t4 * 2;
+          tile_logits[row][col] = (col < n_rows) ? acc[i][j][2 * h] : -INFINITY;
+          tile_logits[row][col + 1] = (col + 1 < n_rows) ? acc[i][j][2 * h + 1] : -INFINITY;
+        }
+      }
+    }
+  }
+  __syncthreads();
+
+  constexpr int NW = NT / 32;
+  for (int r = warp; r < m_rows; r += NW) {
+    const int grow = mtile * TM + r;
+    float vals[4];
+    int ids[4];
+#pragma unroll
+    for (int c = 0; c < 4; ++c) {
+      const int col = c * 32 + lane;
+      vals[c] = tile_logits[r][col];
+      ids[c] = (col < n_rows) ? (p.w.v_begin + ntile * TN + col) : 0x7fffffff;
+    }
+    auto* out_row = p.partials + (std::size_t(grow) * p.ntiles + ntile) * 16;
+#pragma unroll
+    for (int k = 0; k < 16; ++k) {
+      float bv = vals[0];
+      int bi = ids[0];
+      int bs = 0;
+#pragma unroll
+      for (int c = 1; c < 4; ++c) {
+        if (better(vals[c], ids[c], bv, bi)) {
+          bv = vals[c];
+          bi = ids[c];
+          bs = c;
+        }
+      }
+      float wv = bv;
+      int wi = bi;
+      lanes_best<32>(wv, wi);
+      if (lane == 0) out_row[k] = kernels::head::Candidate{wv, wi};
+      if (bi == wi && bv == wv) vals[bs] = -INFINITY;
+    }
+  }
+}
+
+constexpr int TOPK_RED_THREADS = 128;
+constexpr int TOPK_GROUP_TILES = 32;  // 32 * 16 = 512 candidates per stage-1 CTA
+
+template <int MAX_PER_THREAD, bool FINAL_OUT>
+__global__ void __launch_bounds__(TOPK_RED_THREADS)
+    reduce_topk16_kernel(const kernels::head::Candidate* __restrict__ in, int row_stride_cands, int cands_per_group,
+                         kernels::head::Candidate* __restrict__ stage_out, float* __restrict__ out_vals,
+                         std::int32_t* __restrict__ out_ids) {
+  constexpr int NW = TOPK_RED_THREADS / 32;
+  __shared__ float sw_v[NW];
+  __shared__ int sw_i[NW];
+  const int group = blockIdx.x;
+  const int row = blockIdx.y;
+  const int tid = threadIdx.x;
+  const int warp = tid >> 5, lane = tid & 31;
+  const int start = group * cands_per_group;
+  const int count = min(cands_per_group, row_stride_cands - start);
+  const auto* src = in + std::size_t(row) * row_stride_cands + start;
+
+  float vals[MAX_PER_THREAD];
+  int ids[MAX_PER_THREAD];
+#pragma unroll
+  for (int c = 0; c < MAX_PER_THREAD; ++c) {
+    const int idx = c * TOPK_RED_THREADS + tid;
+    if (idx < count) {
+      const auto cand = src[idx];
+      vals[c] = cand.val;
+      ids[c] = cand.global_id;
+    } else {
+      vals[c] = -INFINITY;
+      ids[c] = 0x7fffffff;
+    }
+  }
+
+  for (int k = 0; k < 16; ++k) {
+    float bv = vals[0];
+    int bi = ids[0];
+    int bs = 0;
+#pragma unroll
+    for (int c = 1; c < MAX_PER_THREAD; ++c) {
+      if (better(vals[c], ids[c], bv, bi)) {
+        bv = vals[c];
+        bi = ids[c];
+        bs = c;
+      }
+    }
+    float wv = bv;
+    int wi = bi;
+    lanes_best<32>(wv, wi);
+    if (lane == 0) {
+      sw_v[warp] = wv;
+      sw_i[warp] = wi;
+    }
+    __syncthreads();
+    if (tid == 0) {
+      float fv = sw_v[0];
+      int fi = sw_i[0];
+#pragma unroll
+      for (int w = 1; w < NW; ++w) {
+        if (better(sw_v[w], sw_i[w], fv, fi)) {
+          fv = sw_v[w];
+          fi = sw_i[w];
+        }
+      }
+      sw_v[0] = fv;
+      sw_i[0] = fi;
+      if constexpr (FINAL_OUT) {
+        out_vals[std::size_t(row) * 16 + k] = fv;
+        out_ids[std::size_t(row) * 16 + k] = fi;
+      } else {
+        stage_out[(std::size_t(row) * gridDim.x + group) * 16 + k] = kernels::head::Candidate{fv, fi};
+      }
+    }
+    __syncthreads();
+    const float fv = sw_v[0];
+    const int fi = sw_i[0];
+    if (bi == fi && bv == fv) vals[bs] = -INFINITY;
+  }
+}
+
+template <class C>
+void launch_nvfp4_topk16(const HeadNvfp4TopkArgs& a, cudaStream_t stream) {
+  constexpr int SMEM = Nvfp4TopkSmem<C>::BYTES;
+  static const bool attr = [] {
+    return cudaFuncSetAttribute(head_nvfp4_topk16_kernel<C>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM) ==
+           cudaSuccess;
+  }();
+  if (!attr) throw std::runtime_error("batch head_topk16_nvfp4: shared memory attribute");
+  head_nvfp4_topk16_kernel<C><<<dim3((a.M + C::TM - 1) / C::TM, a.ntiles), C::NT, SMEM, stream>>>(a);
+  if (cudaGetLastError() != cudaSuccess) throw std::runtime_error("batch head_topk16_nvfp4: launch failed");
+}
+
 template <class C>
 void launch_nvfp4_tiled(const HeadNvfp4Args& a, cudaStream_t stream) {
   static const bool attr = [] {
@@ -659,6 +915,35 @@ void head_sample_nvfp4(const __nv_bfloat16* A, int lda, kernels::head::Nvfp4Matr
     else launch_nvfp4_tiled<Nvfp4Cfg64>(a, stream);
     head_pick_kernel<<<M, PICK_T, 0, stream>>>(partials, ntiles, out, static_cast<int2*>(cand_out));
   }
+}
+
+std::size_t head_topk16_nvfp4_workspace_bytes(int M, int rows) {
+  const int ntiles = (rows + NVFP4_TILED_TN - 1) / NVFP4_TILED_TN;
+  const int groups = (ntiles + TOPK_GROUP_TILES - 1) / TOPK_GROUP_TILES;
+  const std::size_t p_bytes = std::size_t(M) * ntiles * 16 * sizeof(kernels::head::Candidate);
+  const std::size_t s_bytes = std::size_t(M) * groups * 16 * sizeof(kernels::head::Candidate);
+  return ((p_bytes + 255) / 256 * 256) + s_bytes;
+}
+
+void head_topk16_nvfp4(const __nv_bfloat16* A, int lda, kernels::head::Nvfp4Matrix w, int M, void* ws,
+                       float* out_vals, std::int32_t* out_ids, cudaStream_t stream) {
+  if (M <= 0 || !A || !w.codes || !w.scales || w.rows < 16 || lda % 8 || !ws || !out_vals || !out_ids)
+    throw std::invalid_argument("batch head_topk16_nvfp4: unsupported shape");
+  const int ntiles = (w.rows + NVFP4_TILED_TN - 1) / NVFP4_TILED_TN;
+  const int groups = (ntiles + TOPK_GROUP_TILES - 1) / TOPK_GROUP_TILES;
+  if (groups * 16 > TOPK_RED_THREADS * 8)
+    throw std::invalid_argument("batch head_topk16_nvfp4: vocabulary exceeds stage-2 capacity");
+  auto* partials = static_cast<kernels::head::Candidate*>(ws);
+  const std::size_t p_bytes = (std::size_t(M) * ntiles * 16 * sizeof(kernels::head::Candidate) + 255) / 256 * 256;
+  auto* stage1 = reinterpret_cast<kernels::head::Candidate*>(static_cast<std::uint8_t*>(ws) + p_bytes);
+  const HeadNvfp4TopkArgs a{A, w, lda, M, ntiles, partials};
+  if (M <= 32) launch_nvfp4_topk16<Nvfp4Cfg32>(a, stream);
+  else launch_nvfp4_topk16<Nvfp4Cfg64>(a, stream);
+  reduce_topk16_kernel<4, false><<<dim3(groups, M), TOPK_RED_THREADS, 0, stream>>>(
+      partials, ntiles * 16, TOPK_GROUP_TILES * 16, stage1, nullptr, nullptr);
+  reduce_topk16_kernel<8, true><<<dim3(1, M), TOPK_RED_THREADS, 0, stream>>>(
+      stage1, groups * 16, groups * 16, nullptr, out_vals, out_ids);
+  if (cudaGetLastError() != cudaSuccess) throw std::runtime_error("batch head_topk16_nvfp4: reduce launch failed");
 }
 
 void gate_apply(const prefill::GateRows& rows, int G, const float* fg, int T, const float* norm_w, __nv_bfloat16* out,

@@ -11,6 +11,7 @@
 #include "kernels/batch/batch.h"
 #include "kernels/head/head.h"
 #include "model/batch.h"
+#include "model/batch_dflash2.h"
 #include "model/batch_drafter.h"
 #include "model/drafter.h"
 #include "model/dflash2.h"
@@ -136,19 +137,58 @@ class EngineGenerator final : public Generator {
       batch_dec_ = std::make_unique<BatchDecoder>(rt_.weights(), rt_.ablation(), batch_state_, options.max_batch,
                                                   stream, 8, rt_.tp(),
                                                   batch_unembed_.w.data ? &batch_unembed_ : nullptr);
-      const bool shard_batch_drafter = [] {
-        const char* e = std::getenv("INGINE_SHARD_BATCH_DRAFTER");
-        return !e || !*e || std::atoi(e) != 0;
-      }();
-      if (!rt_.tp() || shard_batch_drafter || layout.tp_rank == 0) {
-        std::vector<DeviceBuffer> tmp_head;
-        Dense full_head;
-        if (rt_.tp() || !rt_.weights().unembed.w.data || rt_.weights().unembed.fp8())
-          full_head = load_head(options.model_dir, false, false, stream, tmp_head).dense;
-        batch_drafter_ = std::make_unique<BatchDrafter>(
-            options.model_dir, rt_.weights(), options.max_batch, options.batch_ctx, options.max_batch, stream,
-            BatchDrafter::Precision::MXFP8, full_head.w.data ? &full_head : nullptr,
-            shard_batch_drafter ? rt_.tp() : nullptr);
+      batch_draft_type_ = options.batch_draft_type;
+      if (batch_draft_type_.empty()) {
+        if (const char* env = std::getenv("INGINE_BATCH_DRAFT_TYPE"); env && *env) batch_draft_type_ = env;
+        else if (!options.dflash2_dir.empty() && options.batch_spec >= 5)
+          batch_draft_type_ = (options.draft_type == "hybrid") ? "hybrid" : "dflash2";
+        else batch_draft_type_ = "dspark";
+      }
+      if (batch_draft_type_ != "dspark" && batch_draft_type_ != "dflash2" && batch_draft_type_ != "hybrid")
+        throw std::invalid_argument("batch_draft_type must be dspark, dflash2, or hybrid");
+      const bool use_batch_dspark = batch_draft_type_ == "dspark" || batch_draft_type_ == "hybrid";
+      const bool use_batch_dflash2 = batch_draft_type_ == "dflash2" || batch_draft_type_ == "hybrid";
+      if (use_batch_dspark) {
+        const bool shard_batch_drafter = [] {
+          const char* e = std::getenv("INGINE_SHARD_BATCH_DRAFTER");
+          return !e || !*e || std::atoi(e) != 0;
+        }();
+        if (!rt_.tp() || shard_batch_drafter || layout.tp_rank == 0) {
+          std::vector<DeviceBuffer> tmp_head;
+          Dense full_head;
+          if (rt_.tp() || !rt_.weights().unembed.w.data || rt_.weights().unembed.fp8())
+            full_head = load_head(options.model_dir, false, false, stream, tmp_head).dense;
+          batch_drafter_ = std::make_unique<BatchDrafter>(
+              options.model_dir, rt_.weights(), options.max_batch, options.batch_ctx, options.max_batch, stream,
+              BatchDrafter::Precision::MXFP8, full_head.w.data ? &full_head : nullptr,
+              shard_batch_drafter ? rt_.tp() : nullptr);
+        }
+      }
+      if (use_batch_dflash2) {
+        if (rt_.tp() && options.head_nvfp4 && !dflash2_full_head()) {
+          batch_dflash2_head_ = std::make_unique<BatchDFlash2Head>(
+              *rt_.tp(), rt_.weights().unembed_nvfp4, options.max_batch, stream);
+        }
+        if (!rt_.tp() || layout.tp_rank == 0) {
+          auto dir = options.dflash2_dir;
+          if (dir.empty())
+            if (const char* env = std::getenv("INKLING_DFLASH2_DIR")) dir = env;
+          if (dir.empty()) {
+            const auto sibling = options.model_dir.parent_path() / "Inkling-2-Mini-DFlash2";
+            if (std::filesystem::exists(sibling / "model.safetensors")) dir = sibling;
+          }
+          if (dir.empty()) throw std::invalid_argument("BatchDFlash2 requires --dflash2-dir or INKLING_DFLASH2_DIR");
+          const kernels::head::Nvfp4Matrix* head_ovr = nullptr;
+          kernels::head::Nvfp4Matrix loaded_head{};
+          if (!batch_dflash2_head_ && (rt_.tp() || !rt_.weights().unembed_nvfp4.codes)) {
+            loaded_head = load_head(options.model_dir, false, true, stream, batch_dflash2_head_storage_).nvfp4;
+            head_ovr = &loaded_head;
+          }
+          batch_dflash2_ = std::make_unique<BatchDFlash2>(
+              dir, rt_.weights(), options.max_batch, options.max_batch, stream,
+              BatchDFlash2::default_precision(), BatchDFlash2::default_kv_fp8(),
+              head_ovr, batch_dflash2_head_.get());
+        }
       }
       constexpr int G = BatchDrafter::GAMMA;
       constexpr int TAP_ROW = NUM_TAPS * HIDDEN;
@@ -336,6 +376,7 @@ class EngineGenerator final : public Generator {
     }
     batch_spec_histories_.at(std::size_t(slot)) = tokens_in_state_;
     if (batch_drafter_) batch_drafter_->reset_slot(slot);
+    if (batch_dflash2_) batch_dflash2_->reset_slot(slot);
     if (pending_token >= 0) {
       const std::int32_t slot32 = slot;
       const std::int64_t pos64 = len;
@@ -375,6 +416,7 @@ class EngineGenerator final : public Generator {
     }
     batch_spec_histories_.at(std::size_t(dst_slot)) = src_hist;
     if (batch_drafter_) batch_drafter_->clone_slot(src_slot, dst_slot, len);
+    if (batch_dflash2_) batch_dflash2_->clone_slot(src_slot, dst_slot, len);
     return true;
   }
 
@@ -402,6 +444,7 @@ class EngineGenerator final : public Generator {
         if (!offset) {
           reset_slot(batch_state_, slot, stream);
           if (batch_drafter_) batch_drafter_->reset_slot(slot);
+          if (batch_dflash2_) batch_dflash2_->reset_slot(slot);
           history.clear();
         }
       }
@@ -415,16 +458,19 @@ class EngineGenerator final : public Generator {
       if (tp) tp->full_logits = sampled;
       CUDA_CHECK(cudaMemcpyAsync(chunk_tokens_.p, prompt.data() + offset, std::size_t(count) * sizeof(int32_t),
                                  cudaMemcpyHostToDevice, stream));
+      const bool need_batch_taps = batch_drafter_ || batch_dflash2_;
       Tensor taps;
-      if (batch_drafter_) taps = rm(taps_.p, DType::BF16, {count, NUM_TAPS, HIDDEN});
+      if (need_batch_taps) taps = rm(taps_.p, DType::BF16, {count, NUM_TAPS, HIDDEN});
       prefiller_.run(view, static_cast<const int32_t*>(chunk_tokens_.p), count, offset,
                      !tp || (sampled && options_.tp.rank == 0) ? static_cast<float*>(logits_.p) : nullptr,
-                     batch_drafter_ ? &taps : nullptr, {},
+                     need_batch_taps ? &taps : nullptr, {},
                      tp && !sampled ? static_cast<int32_t*>(logits_.p) : nullptr, final);
-      if (batch_drafter_) {
+      if (need_batch_taps) {
         const std::int32_t slot32 = slot, count32 = count;
         const std::int64_t start64 = offset;
-        batch_drafter_->commit(1, &slot32, &start64, &count32, static_cast<const __nv_bfloat16*>(taps_.p));
+        const auto* tp_ptr = static_cast<const __nv_bfloat16*>(taps_.p);
+        if (batch_drafter_) batch_drafter_->commit(1, &slot32, &start64, &count32, tp_ptr);
+        if (batch_dflash2_) batch_dflash2_->commit(1, &slot32, &start64, &count32, tp_ptr);
       }
       if (tp) tp->wait(stream);
       else CUDA_CHECK(cudaStreamSynchronize(stream));
@@ -538,7 +584,7 @@ class EngineGenerator final : public Generator {
       }
     }
     batch_dec_->accept(keep.data());
-    if (batch_drafter_) {
+    if (batch_drafter_ || batch_dflash2_) {
       constexpr int TAP_ROW = NUM_TAPS * HIDDEN;
       std::vector<std::int32_t> rows_h;
       rows_h.reserve(tok.size());
@@ -547,8 +593,9 @@ class EngineGenerator final : public Generator {
       CUDA_CHECK(cudaMemcpyAsync(batch_rows_.p, rows_h.data(), rows_h.size() * 4, cudaMemcpyHostToDevice, rt_.stream()));
       kernels::batch::gather_rows(batch_dec_->taps(), TAP_ROW, static_cast<const std::int32_t*>(batch_rows_.p),
                                   int(rows_h.size()), static_cast<__nv_bfloat16*>(batch_gathered_.p), rt_.stream());
-      batch_drafter_->commit(n, slot_ids.data(), pos.data(), keep.data(),
-                             static_cast<const __nv_bfloat16*>(batch_gathered_.p));
+      const auto* gptr = static_cast<const __nv_bfloat16*>(batch_gathered_.p);
+      if (batch_drafter_) batch_drafter_->commit(n, slot_ids.data(), pos.data(), keep.data(), gptr);
+      if (batch_dflash2_) batch_dflash2_->commit(n, slot_ids.data(), pos.data(), keep.data(), gptr);
     }
     if (!d_slots.empty()) batch_draft_slots(int(d_slots.size()), d_slots.data(), d_anchors.data(), d_pos.data());
     else if (rt_.tp()) rt_.tp()->wait(rt_.stream());
@@ -1078,39 +1125,83 @@ class EngineGenerator final : public Generator {
 
   void batch_draft_slots(int n, const std::int32_t* slots, const std::int32_t* anchors, const std::int64_t* next_pos) {
     constexpr int G = BatchDrafter::GAMMA;
-    const std::size_t cnt = std::size_t(n) * G;
     const cudaStream_t stream = rt_.stream();
-    std::vector<std::int32_t> dh(cnt);
-    std::vector<float> ch(cnt);
-    if (batch_drafter_) {
-      const BatchDrafter::Drafts d =
-          batch_drafter_->draft(n, slots, anchors, next_pos, 0.f, batch_seed(++batch_draws_), options_.batch_spec);
+    std::vector<int> df_idx, ds_idx;
+    if (batch_draft_type_ == "dflash2") {
+      df_idx.resize(std::size_t(n));
+      for (int i = 0; i < n; ++i) df_idx[std::size_t(i)] = i;
+    } else if (batch_draft_type_ == "hybrid") {
+      for (int i = 0; i < n; ++i) {
+        if (next_pos[i] <= options_.dflash2_max_ctx) df_idx.push_back(i);
+        else ds_idx.push_back(i);
+      }
+    } else {
+      ds_idx.resize(std::size_t(n));
+      for (int i = 0; i < n; ++i) ds_idx[std::size_t(i)] = i;
+    }
+
+    auto gather_sub = [&](const std::vector<int>& idx, std::vector<std::int32_t>& sl, std::vector<std::int32_t>& an,
+                          std::vector<std::int64_t>& np) {
+      sl.resize(idx.size()), an.resize(idx.size()), np.resize(idx.size());
+      for (std::size_t k = 0; k < idx.size(); ++k) {
+        const int i = idx[k];
+        sl[k] = slots[i], an[k] = anchors[i], np[k] = next_pos[i];
+      }
+    };
+
+    auto scatter_sync = [&](const std::vector<int>& idx, const std::int32_t* dev_tok, const float* dev_conf) {
+      const std::size_t cnt = idx.size() * G;
+      std::vector<std::int32_t> dh(cnt);
+      std::vector<float> ch(cnt);
       if (rt_.tp()) {
         auto* base = static_cast<std::byte*>(batch_draft_bcast_.p);
-        if (rt_.tp()->layout.tp_rank == 0) {
-          CUDA_CHECK(cudaMemcpyAsync(base, d.tokens, cnt * 4, cudaMemcpyDeviceToDevice, stream));
-          CUDA_CHECK(cudaMemcpyAsync(base + cnt * 4, d.conf, cnt * 4, cudaMemcpyDeviceToDevice, stream));
+        if (rt_.tp()->layout.tp_rank == 0 && dev_tok) {
+          CUDA_CHECK(cudaMemcpyAsync(base, dev_tok, cnt * 4, cudaMemcpyDeviceToDevice, stream));
+          CUDA_CHECK(cudaMemcpyAsync(base + cnt * 4, dev_conf, cnt * 4, cudaMemcpyDeviceToDevice, stream));
         }
         rt_.tp()->broadcast_proposal(batch_draft_bcast_.p, cnt * 8, stream);
         CUDA_CHECK(cudaMemcpyAsync(dh.data(), base, cnt * 4, cudaMemcpyDeviceToHost, stream));
         CUDA_CHECK(cudaMemcpyAsync(ch.data(), base + cnt * 4, cnt * 4, cudaMemcpyDeviceToHost, stream));
         rt_.tp()->wait(stream);
       } else {
-        CUDA_CHECK(cudaMemcpyAsync(dh.data(), d.tokens, cnt * 4, cudaMemcpyDeviceToHost, stream));
-        CUDA_CHECK(cudaMemcpyAsync(ch.data(), d.conf, cnt * 4, cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaMemcpyAsync(dh.data(), dev_tok, cnt * 4, cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaMemcpyAsync(ch.data(), dev_conf, cnt * 4, cudaMemcpyDeviceToHost, stream));
         CUDA_CHECK(cudaStreamSynchronize(stream));
       }
-    } else if (rt_.tp()) {
-      ++batch_draws_;
-      auto* base = static_cast<std::byte*>(batch_draft_bcast_.p);
-      rt_.tp()->broadcast_proposal(batch_draft_bcast_.p, cnt * 8, stream);
-      CUDA_CHECK(cudaMemcpyAsync(dh.data(), base, cnt * 4, cudaMemcpyDeviceToHost, stream));
-      CUDA_CHECK(cudaMemcpyAsync(ch.data(), base + cnt * 4, cnt * 4, cudaMemcpyDeviceToHost, stream));
-      rt_.tp()->wait(stream);
+      for (std::size_t k = 0; k < idx.size(); ++k) {
+        const int sl = slots[idx[k]];
+        std::copy_n(dh.begin() + std::ptrdiff_t(k) * G, G, batch_drafts_.begin() + std::ptrdiff_t(sl) * G);
+        std::copy_n(ch.begin() + std::ptrdiff_t(k) * G, G, batch_conf_.begin() + std::ptrdiff_t(sl) * G);
+      }
+    };
+
+    if (!df_idx.empty()) {
+      const int ndf = int(df_idx.size());
+      if (batch_dflash2_) {
+        std::vector<std::int32_t> sl, an;
+        std::vector<std::int64_t> np;
+        gather_sub(df_idx, sl, an, np);
+        const BatchDFlash2::Drafts d = batch_dflash2_->propose(ndf, sl.data(), an.data(), np.data());
+        scatter_sync(df_idx, d.tokens, d.conf);
+      } else if (rt_.tp()) {
+        if (batch_dflash2_head_) batch_dflash2_head_->run(ndf, nullptr);
+        scatter_sync(df_idx, nullptr, nullptr);
+      }
     }
-    for (int i = 0; i < n; ++i) {
-      std::copy_n(dh.begin() + std::ptrdiff_t(i) * G, G, batch_drafts_.begin() + std::ptrdiff_t(slots[i]) * G);
-      std::copy_n(ch.begin() + std::ptrdiff_t(i) * G, G, batch_conf_.begin() + std::ptrdiff_t(slots[i]) * G);
+    if (!ds_idx.empty()) {
+      const int nds = int(ds_idx.size());
+      if (batch_drafter_) {
+        std::vector<std::int32_t> sl, an;
+        std::vector<std::int64_t> np;
+        gather_sub(ds_idx, sl, an, np);
+        const BatchDrafter::Drafts d =
+            batch_drafter_->draft(nds, sl.data(), an.data(), np.data(), 0.f, batch_seed(++batch_draws_),
+                                  options_.batch_spec);
+        scatter_sync(ds_idx, d.tokens, d.conf);
+      } else if (rt_.tp()) {
+        ++batch_draws_;
+        scatter_sync(ds_idx, nullptr, nullptr);
+      }
     }
   }
 
@@ -1119,8 +1210,12 @@ class EngineGenerator final : public Generator {
   std::vector<DeviceBuffer> batch_head_storage_;
   Dense batch_unembed_;
   BatchState batch_state_;
+  std::string batch_draft_type_;
   std::unique_ptr<BatchDecoder> batch_dec_;
   std::unique_ptr<BatchDrafter> batch_drafter_;
+  std::vector<DeviceBuffer> batch_dflash2_head_storage_;
+  std::unique_ptr<BatchDFlash2Head> batch_dflash2_head_;
+  std::unique_ptr<BatchDFlash2> batch_dflash2_;
   DeviceBuffer batch_gathered_, batch_rows_, batch_draft_bcast_;
   std::vector<std::int32_t> batch_drafts_;
   std::vector<float> batch_conf_;

@@ -20,6 +20,8 @@
 
 namespace ingine::model {
 
+class BatchDFlash2;
+class BatchDFlash2Head;
 class BatchDrafter;
 class Prefiller;
 
@@ -36,6 +38,11 @@ struct BatchEngineOptions {
   int spec_min = 0;
   bool kv_fp8 = false;             // FP8 E4M3 full-attention caches
   bool head_nvfp4 = false;         // NVFP4 unembedding head
+  // Batched speculative drafter: "dspark", "dflash2", or "hybrid" (empty: INGINE_BATCH_DRAFT_TYPE, or "dflash2" if
+  // dflash2_dir is given, else "dspark").
+  std::string batch_draft_type;
+  std::filesystem::path dflash2_dir;
+  int dflash2_max_ctx = 6144;      // hybrid mode: slots with pos <= dflash2_max_ctx use BatchDFlash2
   TpOptions tp;
   // speculative: a line per sequence and step, "<slot> <drafts verified> <accepted> <conf of the 7 drafts>"
   std::filesystem::path spec_trace;
@@ -71,6 +78,9 @@ class BatchEngine final : public BatchBackend {
   std::uint64_t spec_steps() const { return spec_steps_; }
   std::uint64_t spec_rows() const { return spec_rows_; }
   std::uint64_t spec_accepted() const { return spec_accepted_; }
+  double draft_seconds() const { return draft_seconds_; }
+  double verify_seconds() const { return verify_seconds_; }
+  std::uint64_t draft_calls() const { return draft_calls_; }
 
  private:
   struct Stream {  // destroyed after every member that uses it
@@ -88,7 +98,12 @@ class BatchEngine final : public BatchBackend {
   BatchState st_;
   std::unique_ptr<Prefiller> pf_;
   std::unique_ptr<BatchDecoder> dec_;  // 8 rows per sequence at most (admissions, verify steps)
+  std::string batch_draft_type_;
+  int dflash2_max_ctx_ = 6144;
   std::unique_ptr<BatchDrafter> drafter_;
+  std::vector<DeviceBuffer> dflash2_head_storage_;
+  std::unique_ptr<BatchDFlash2Head> dflash2_head_;
+  std::unique_ptr<BatchDFlash2> dflash2_;
   DeviceBuffer chunk_, logits_, first_;
   DeviceBuffer taps_chunk_;  // speculative: the Prefiller's taps of a chunk
   DeviceBuffer gathered_;    // speculative: the kept rows' taps, by sequence
@@ -96,6 +111,8 @@ class BatchEngine final : public BatchBackend {
   DeviceBuffer draft_bcast_;        // speculative: int32 rows of the step's taps to gather
   std::uint64_t draws_ = 0;  // seeds the noise of sampled tokens: one per sampling call
   std::uint64_t spec_steps_ = 0, spec_rows_ = 0, spec_accepted_ = 0;
+  double draft_seconds_ = 0.0, verify_seconds_ = 0.0;
+  std::uint64_t draft_calls_ = 0;
   std::vector<std::int32_t> drafts_;  // speculative: [slots, GAMMA] drafts after each slot's pending token
   std::vector<float> conf_;            // speculative: [slots, GAMMA] their confidences
   std::vector<std::int32_t> draft_host_;  // speculative: the drafter's [n, GAMMA] output

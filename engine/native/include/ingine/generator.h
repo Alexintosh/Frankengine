@@ -127,6 +127,8 @@ struct RuntimeOptions {
   int batch_spec = 0;  // 0: Track 2a plain batch (1..8); 1..7: Track 3 batched speculative decoding (1..128)
   float batch_spec_threshold = 0.50f;
   int batch_spec_min = 2;
+  // Batched speculative drafter: "dspark", "dflash2", or "hybrid" (empty: INGINE_BATCH_DRAFT_TYPE or "dspark").
+  std::string batch_draft_type;
   std::filesystem::path model_dir, ablation;  // empty ablation: original model
   int max_ctx = 65536;
   // Tokens per prefill chunk. 3072 (the largest the sliding attention takes) reads a long prompt 6-10% faster

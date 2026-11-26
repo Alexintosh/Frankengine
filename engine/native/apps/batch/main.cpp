@@ -55,7 +55,8 @@ int main(int argc, char** argv) {
   int spec_min = 0;
   double temperature = 0.0;
   int seed = 1, tp_size = 0, tp_rank = -1;
-  std::string tp_wire;
+  std::string tp_wire, batch_draft_type, dflash2_dir;
+  int dflash2_max_ctx = 6144;
   bool reference = false, ignore_eos = false, kv_fp8 = false, head_nvfp4 = false, accept_all = false;
 
   ingine::serve::ArgParser ap("ingine-batch-bench", "Many requests at once: aggregate decode throughput on one GPU.");
@@ -87,6 +88,11 @@ int main(int argc, char** argv) {
             "0 = always K)",
             &spec_threshold);
   ap.option("--spec-min", "", "with --spec-threshold: at least this many drafts per sequence", &spec_min);
+  ap.option("--batch-draft-type", "{dspark,dflash2,hybrid}",
+            "batched drafter implementation (default INGINE_BATCH_DRAFT_TYPE or dflash2 if --dflash2-dir is set, else dspark)",
+            &batch_draft_type, {"dspark", "dflash2", "hybrid"});
+  ap.option("--dflash2-dir", "", "DFlash2 checkpoint directory", &dflash2_dir);
+  ap.option("--dflash2-max-ctx", "", "hybrid mode: max context for BatchDFlash2 (default 6144)", &dflash2_max_ctx);
   ap.option("--oracle", "", "with --spec: the drafts are the output tokens of FILE (another run's --out)", &oracle_file);
   ap.option("--spec-trace", "", "with --spec: write the drafts verified, accepted and their confidences per step to FILE",
             &spec_trace);
@@ -224,6 +230,9 @@ int main(int argc, char** argv) {
       options.spec_trace = spec_trace;
       options.spec_threshold = float(spec_threshold);
       options.spec_min = spec_min;
+      options.batch_draft_type = batch_draft_type;
+      options.dflash2_dir = dflash2_dir;
+      options.dflash2_max_ctx = dflash2_max_ctx;
       m::BatchEngine engine(options);
       std::size_t free1 = 0;
       cudaMemGetInfo(&free1, &total);
@@ -276,12 +285,19 @@ int main(int argc, char** argv) {
       std::printf("engine: %d requests, %zu output tokens; admission %.2fs, decode %.2fs in %zu steps (%.1f ms per step "
                   "with all %d)\n", seqs, total_out, prefill_s, decode_s, step_s.size(), full ? full_ms / full : 0.0,
                   seqs);
-      if (spec > 0)
+      if (spec > 0) {
+        const double draft_ms = engine.draft_calls() ? 1e3 * engine.draft_seconds() / double(engine.draft_calls()) : 0.0;
+        const double verify_ms = step_s.empty() ? 0.0 : 1e3 * engine.verify_seconds() / double(step_s.size());
         std::printf("spec: up to %d drafts per step (threshold %.2f), %.3f rows, %.3f tokens per sequence and step "
-                    "(%.3f drafts accepted)\n", spec, spec_threshold,
+                    "(%.3f drafts accepted), draft %.2f ms, verify %.2f ms\n", spec, spec_threshold,
                     double(engine.spec_rows()) / double(engine.spec_steps()),
                     double(total_out - std::size_t(seqs)) / double(seq_steps),
-                    double(engine.spec_accepted()) / double(engine.spec_steps()));
+                    double(engine.spec_accepted()) / double(engine.spec_steps()), draft_ms, verify_ms);
+        report["draft_ms"] = draft_ms;
+        report["verify_ms"] = verify_ms;
+        report["tokens_per_step"] = double(total_out - std::size_t(seqs)) / double(seq_steps);
+        report["accepted_per_step"] = double(engine.spec_accepted()) / double(engine.spec_steps());
+      }
       std::printf("AGGREGATE %.1f tok/s (%zu output tokens / %.2fs from the first prefill to the last token)\n",
                   double(total_out) / wall, total_out, wall);
       report["mode"] = "engine";

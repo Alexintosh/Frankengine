@@ -10,7 +10,7 @@ add_library(ingine_model STATIC
   model_kernels.cu
 )
 # prefill (package Prefill) and the speculative loop (package Spec)
-foreach(src prefill.cpp drafter.cpp spec.cpp dflash2.cu batch.cpp batch_drafter.cpp batch_engine.cpp)
+foreach(src prefill.cpp drafter.cpp spec.cpp dflash2.cu batch.cpp batch_drafter.cpp batch_dflash2.cu batch_engine.cpp)
   if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/${src})
     target_sources(ingine_model PRIVATE ${src})
   endif()
