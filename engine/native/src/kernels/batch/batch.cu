@@ -61,8 +61,9 @@ __global__ void __launch_bounds__(SAMPLE_T) sample_kernel(const float* __restric
     float key = raw ? 30.f * tanhf(bf16r(l[v]) / 30.f) : l[v];  // model.logits
     if (!greedy) {
       // Gumbel-max: argmax_v s_v / T + G_v is a sample of softmax(s / T); u in (0, 1) from 24 random bits
-      const float u = (float(mix64(row_key ^ std::uint64_t(v)) >> 40) + 0.5f) * (1.f / 16777216.f);
-      key = key * inv_t - __logf(-__logf(u));
+      // 23-bit midpoint stays strictly in (0, 1) in FP32; 24-bit (16777215 + 0.5f) rounds to 1.0f -> +inf Gumbel.
+    const float u = (float(mix64(row_key ^ std::uint64_t(v)) >> 41) + 0.5f) * (1.f / 8388608.f);
+      key = key * inv_t - logf(-logf(u));
     }
     if (better(key, v, best, best_v)) best = key, best_v = v;
   }

@@ -123,21 +123,35 @@ void BatchEngine::prefill_one(const Admission& a, std::int32_t& first) {
   const cudaStream_t s = stream_.s;
   const int P = int(a.prompt.size());
   State v = st_.view(a.slot);
+  const bool sampled = a.temperature > 0.f;
   for (int p = 0; p < P; p += prefill_chunk_) {
     const int T = std::min(prefill_chunk_, P - p);
+    const bool final_chunk = (p + T == P);
     CUDA_CHECK(cudaMemcpyAsync(chunk_.p, a.prompt.data() + p, std::size_t(T) * 4, cudaMemcpyHostToDevice, s));
     Tensor taps = rm(taps_chunk_.p, DType::BF16, {T, NUM_TAPS, HIDDEN});
-    pf_->run(v, static_cast<const std::int32_t*>(chunk_.p), T, p, static_cast<float*>(logits_.p),
-             drafter_ ? &taps : nullptr);
+    if (tp_) tp_->full_logits = sampled;
+    float* log_dst = (!tp_ || (sampled && tp_->layout.tp_rank == 0)) ? static_cast<float*>(logits_.p) : nullptr;
+    std::int32_t* grd_dst = (tp_ && !sampled) ? static_cast<std::int32_t*>(first_.p) : nullptr;
+    pf_->run(v, static_cast<const std::int32_t*>(chunk_.p), T, p, log_dst,
+             drafter_ ? &taps : nullptr, {}, grd_dst, final_chunk);
     if (drafter_) {
       const std::int32_t slot = a.slot, count = T;
       const std::int64_t start = p;
       drafter_->commit(1, &slot, &start, &count, static_cast<const __nv_bfloat16*>(taps_chunk_.p));
     }
   }
-  kernels::batch::sample(static_cast<const float*>(logits_.p), UNPADDED_VOCAB, 1, UNPADDED_VOCAB, false, a.temperature,
-                         seed_of(++draws_), static_cast<std::int32_t*>(first_.p), s);
+  const std::uint64_t seed = seed_of(++draws_);
+  if (!tp_) {
+    kernels::batch::sample(static_cast<const float*>(logits_.p), UNPADDED_VOCAB, 1, UNPADDED_VOCAB, false, a.temperature,
+                           seed, static_cast<std::int32_t*>(first_.p), s);
+  } else if (sampled) {
+    if (tp_->layout.tp_rank == 0)
+      kernels::batch::sample(static_cast<const float*>(logits_.p), UNPADDED_VOCAB, 1, UNPADDED_VOCAB, false, a.temperature,
+                             seed, static_cast<std::int32_t*>(first_.p), s);
+    tp_->broadcast_proposal(first_.p, 4, s);
+  }
   CUDA_CHECK(cudaMemcpyAsync(&first, first_.p, 4, cudaMemcpyDeviceToHost, s));
+  if (tp_) tp_->wait(s);
 }
 
 void BatchEngine::prefill_together(std::span<const Admission> requests, std::span<const std::size_t> which,

@@ -61,6 +61,9 @@ class BatchDrafter {
   // Empty draft context of a slot: no valid local-ring rows, f_rnn zero (as a new slot). Stream-ordered.
   void reset_slot(int slot);
 
+  // Copy the committed draft context (first `len` positions + f_rnn) from src_slot to dst_slot. Stream-ordered.
+  void clone_slot(int src_slot, int dst_slot, int len);
+
   // Target taps become draft context: sequence i of n has count[i] >= 0 rows at positions start[i].. of slot
   // slots[i]; feats = device bf16 [sum count, 4, H] (sequence i's rows after those of sequences < i), the
   // Prefiller's taps. Host arrays (read before return); n <= slots, distinct slots.

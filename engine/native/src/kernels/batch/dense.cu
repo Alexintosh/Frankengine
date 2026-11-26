@@ -55,8 +55,9 @@ __device__ __forceinline__ std::uint64_t row_key(std::uint64_t seed, int row) {
 __device__ __forceinline__ float pick_key(float l, bool greedy, float inv_t, std::uint64_t rkey, int v) {
   float key = 30.f * tanhf(bf16r(l) / 30.f);
   if (!greedy) {
-    const float u = (float(mix64(rkey ^ std::uint64_t(v)) >> 40) + 0.5f) * (1.f / 16777216.f);
-    key = key * inv_t - __logf(-__logf(u));
+    // 23-bit midpoint stays strictly in (0, 1) in FP32; 24-bit (16777215 + 0.5f) rounds to 1.0f -> +inf Gumbel.
+    const float u = (float(mix64(rkey ^ std::uint64_t(v)) >> 41) + 0.5f) * (1.f / 8388608.f);
+    key = key * inv_t - logf(-logf(u));
   }
   return key;
 }

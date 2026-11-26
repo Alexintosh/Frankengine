@@ -193,9 +193,11 @@ class Generator {
   virtual int batch_max_ctx() const { return max_model_len(); }
   virtual int batch_spec() const { return 0; }
   virtual int reusable_prefix(int, std::span<const int32_t>) const { return 0; }
-  virtual PrefillChunkResult prefill_slot_chunk(int, std::span<const int32_t>, int, BatchSampling&) {
+  virtual PrefillChunkResult prefill_slot_chunk(int, std::span<const int32_t>, int, BatchSampling&, int /*stop_at*/ = 0) {
     throw std::logic_error("batch prefill unavailable");
   }
+  // Clone a batch slot KV/conv/drafter prefix state into dst_slot (shared-prefix forking).
+  virtual bool clone_slot(int /*src_slot*/, int /*dst_slot*/) { return false; }
   virtual std::vector<int32_t> decode_batch_step(std::span<const BatchSlotStep>) {
     throw std::logic_error("batch decode unavailable");
   }

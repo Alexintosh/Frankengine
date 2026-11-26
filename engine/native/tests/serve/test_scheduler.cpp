@@ -137,10 +137,34 @@ void test_batch_capacity_and_cancel() {
   CHECK(gen.peak.load() == 8 && gen.released.load() == 40);
 }
 
+
+void test_shared_prefix_fork() {
+  BatchGenerator gen(100);
+  gen.spec_ = 4;
+  Scheduler scheduler(gen, {}, 16);
+  std::vector<int32_t> shared(512, 42);
+  std::vector<std::shared_ptr<Job>> jobs;
+  for (int i = 0; i < 6; ++i) {
+    auto p = shared;
+    p.push_back(1000 + i);
+    p.push_back(2000 + i);
+    jobs.push_back(std::make_shared<Job>(std::move(p), 8, Sampling{}));
+    CHECK(scheduler.submit(jobs.back()));
+  }
+  for (auto& job : jobs) CHECK(drain(*job) == std::vector<int32_t>(8, 100));
+  CHECK(gen.cloned.load() >= 4);
+  int cached_hits = 0;
+  for (auto& job : jobs) {
+    if (job->cached_tokens() == 512) ++cached_hits;
+  }
+  CHECK(cached_hits >= 4);
+}
+
 }  // namespace
 
 int main() {
   test_batch_capacity_and_cancel();
+  test_shared_prefix_fork();
   test_cuts();
   test_cancel_fifo_bound();
   test_failure_and_close();

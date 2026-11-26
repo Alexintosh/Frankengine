@@ -135,12 +135,17 @@ class TpGenerator final : public model::Generator {
   }
 
   model::PrefillChunkResult prefill_slot_chunk(int slot, std::span<const int32_t> prompt, int offset,
-                                              model::BatchSampling& sampling) override {
+                                              model::BatchSampling& sampling, int stop_at = 0) override {
     socket_->send_frame(nlohmann::json{
-        {"op", "prefill"}, {"slot", slot}, {"offset", offset},
+        {"op", "prefill"}, {"slot", slot}, {"offset", offset}, {"stop_at", stop_at},
         {"prompt", std::vector<int32_t>(prompt.begin(), prompt.end())},
         {"temperature", sampling.params.temperature}}.dump());
-    return inner_->prefill_slot_chunk(slot, prompt, offset, sampling);
+    return inner_->prefill_slot_chunk(slot, prompt, offset, sampling, stop_at);
+  }
+
+  bool clone_slot(int src_slot, int dst_slot) override {
+    socket_->send_frame(nlohmann::json{{"op", "clone"}, {"src", src_slot}, {"dst", dst_slot}}.dump());
+    return inner_->clone_slot(src_slot, dst_slot);
   }
 
   std::vector<int32_t> decode_batch_step(std::span<const model::BatchSlotStep> rows) override {
@@ -201,6 +206,10 @@ inline void run_tp_worker(model::Generator& generator, TpControl& socket) {
       generator.promote_solo_to_batch(request.at("slot").get<int>(), request.at("token").get<int32_t>());
       continue;
     }
+    if (op == "clone") {
+      generator.clone_slot(request.at("src").get<int>(), request.at("dst").get<int>());
+      continue;
+    }
     if (op == "decode_multi") {
       const auto& packed = request.at("rows");
       std::vector<model::BatchSampling> samples(packed.size());
@@ -231,7 +240,8 @@ inline void run_tp_worker(model::Generator& generator, TpControl& socket) {
       try {
         generator.prefill_slot_chunk(request.at("slot").get<int>(),
                                      request.at("prompt").get<std::vector<int32_t>>(),
-                                     request.at("offset").get<int>(), sample);
+                                     request.at("offset").get<int>(), sample,
+                                     request.value("stop_at", 0));
       } catch (const std::invalid_argument&) {
         // Rank 0 rejects the same invalid prompt before entering a collective.
       }

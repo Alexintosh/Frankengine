@@ -13,6 +13,8 @@ class BatchGenerator final : public ingine::model::Generator {
   std::string model_id() const override { return "batch-test"; }
   int max_model_len() const override { return 8192; }
   int max_batch() const override { return 8; }
+  int batch_spec() const override { return spec_; }
+  int spec_ = 0;
 
   ingine::model::GenerateStats generate(
       std::span<const int32_t>, int limit, const ingine::model::Sampling&, std::span<const int32_t>,
@@ -25,10 +27,16 @@ class BatchGenerator final : public ingine::model::Generator {
   }
 
   ingine::model::PrefillChunkResult prefill_slot_chunk(
-      int, std::span<const int32_t> prompt, int offset, ingine::model::BatchSampling&) override {
+      int, std::span<const int32_t> prompt, int offset, ingine::model::BatchSampling&, int stop_at = 0) override {
     pause();
-    offset = std::min(offset + 2048, int(prompt.size()));
+    const int target = (stop_at > offset && stop_at < int(prompt.size())) ? stop_at : int(prompt.size());
+    offset = std::min(offset + 2048, target);
     return {offset, 0, offset == int(prompt.size()) ? std::optional(token_) : std::nullopt};
+  }
+
+  bool clone_slot(int, int) override {
+    ++cloned;
+    return true;
   }
 
   std::vector<int32_t> decode_batch_step(std::span<const ingine::model::BatchSlotStep> rows) override {
@@ -39,7 +47,7 @@ class BatchGenerator final : public ingine::model::Generator {
 
   void release_slot(int) override { ++released; }
 
-  std::atomic<int> peak{0}, released{0};
+  std::atomic<int> peak{0}, released{0}, cloned{0};
 
  private:
   static void pause() { std::this_thread::sleep_for(std::chrono::milliseconds(4)); }

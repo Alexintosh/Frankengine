@@ -306,6 +306,37 @@ void BatchDrafter::reset_slot(int slot) {
   CUDA_CHECK(cudaMemsetAsync(f_rnn_ + std::size_t(slot) * H, 0, std::size_t(H) * 2, stream_));
 }
 
+void BatchDrafter::clone_slot(int src_slot, int dst_slot, int len) {
+  if (src_slot < 0 || src_slot >= slots_ || dst_slot < 0 || dst_slot >= slots_)
+    throw std::invalid_argument("BatchDrafter::clone_slot: slot out of range");
+  if (src_slot == dst_slot) return;
+  for (const Layer& L : layers_) {
+    const kbd::Ring& R = L.ring;
+    const std::size_t es = R.fp8 ? 1 : 2;
+    const std::size_t head_stride = std::size_t(R.rows) * kd::HEAD_DIM * es;
+    const std::size_t slot_stride = std::size_t(kd::KV_HEADS) * head_stride;
+    const int copy_rows = std::max(0, std::min(len, R.rows));
+    if (copy_rows > 0) {
+      const std::size_t copy_w = std::size_t(copy_rows) * kd::HEAD_DIM * es;
+      auto* k_base = static_cast<std::byte*>(R.k);
+      auto* v_base = static_cast<std::byte*>(R.v);
+      CUDA_CHECK(cudaMemcpy2DAsync(k_base + std::size_t(dst_slot) * slot_stride, head_stride,
+                                   k_base + std::size_t(src_slot) * slot_stride, head_stride,
+                                   copy_w, kd::KV_HEADS, cudaMemcpyDeviceToDevice, stream_));
+      CUDA_CHECK(cudaMemcpy2DAsync(v_base + std::size_t(dst_slot) * slot_stride, head_stride,
+                                   v_base + std::size_t(src_slot) * slot_stride, head_stride,
+                                   copy_w, kd::KV_HEADS, cudaMemcpyDeviceToDevice, stream_));
+    }
+    if (R.pos != nullptr) {
+      CUDA_CHECK(cudaMemcpyAsync(R.pos + std::size_t(dst_slot) * R.rows,
+                                 R.pos + std::size_t(src_slot) * R.rows,
+                                 std::size_t(R.rows) * 4, cudaMemcpyDeviceToDevice, stream_));
+    }
+  }
+  CUDA_CHECK(cudaMemcpyAsync(f_rnn_ + std::size_t(dst_slot) * H, f_rnn_ + std::size_t(src_slot) * H,
+                             std::size_t(H) * 2, cudaMemcpyDeviceToDevice, stream_));
+}
+
 void BatchDrafter::commit(int n, const std::int32_t* slots, const std::int64_t* start, const std::int32_t* count,
                           const __nv_bfloat16* feats) {
   if (n < 0 || n > slots_) throw std::invalid_argument("BatchDrafter::commit: n out of range");

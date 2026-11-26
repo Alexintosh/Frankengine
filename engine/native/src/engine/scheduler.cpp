@@ -260,25 +260,103 @@ void Scheduler::batch_loop() {
       continue;
     }
 
+    constexpr int kMinForkPrefix = 64;
+    const auto common_prefix = [](std::span<const int32_t> a, std::span<const int32_t> b) -> int {
+      const std::size_t n = std::min(a.size(), b.size());
+      std::size_t i = 0;
+      while (i < n && a[i] == b[i]) ++i;
+      return int(i);
+    };
+    const auto fork_from = [&](const ActiveSlot& src) {
+      if (src.offset < kMinForkPrefix || src.emitted || src.done || src.job->cancelled()) return 0;
+      int cloned = 0;
+      for (auto& other : slots_) {
+        if (other.slot == src.slot || other.job->cancelled() || other.done || other.emitted) continue;
+        if (other.offset >= src.offset) continue;
+        if (int(other.job->prompt_ids.size()) <= src.offset) continue;
+        const int lcp = std::min(common_prefix(src.job->prompt_ids, other.job->prompt_ids),
+                                 int(std::min(src.job->prompt_ids.size(), other.job->prompt_ids.size())) - 1);
+        // Only clone once src has reached the full shared-prefix boundary with `other` (avoids redundant mid-chunk clones).
+        if (lcp != src.offset) continue;
+        try {
+          if (generator_.clone_slot(src.slot, other.slot)) {
+            other.offset = src.offset;
+            other.job->cached_tokens_.store(src.offset);
+            ++cloned;
+          }
+        } catch (const std::exception& e) {
+          server_log().error("shared-prefix clone failed ({} -> {}): {}", src.slot, other.slot, e.what());
+        }
+      }
+      if (cloned > 0) {
+        server_log().info("shared-prefix fork: src_slot={} cloned={} lanes at {} tokens",
+                          src.slot, cloned, src.offset);
+      }
+      return cloned;
+    };
+
+    if (generator_.batch_spec() > 0) {
+      for (const auto& src : slots_) {
+        if (src.offset >= kMinForkPrefix && !src.emitted && !src.done && !src.job->cancelled()) {
+          fork_from(src);
+        }
+      }
+    }
+
     int prefill_budget = generator_.batch_spec() > 0 ? 1024 : 1;
     while (prefill_budget > 0) {
       ActiveSlot* prefill = nullptr;
-      for (auto& slot : slots_) {
-        if (slot.job->cancelled() || slot.done || slot.emitted) continue;
-        if (!prefill || slot.offset < prefill->offset) prefill = &slot;
+      if (generator_.batch_spec() > 0) {
+        int best_peers = -1;
+        for (auto& slot : slots_) {
+          if (slot.job->cancelled() || slot.done || slot.emitted) continue;
+          int peers = 0;
+          for (const auto& other : slots_) {
+            if (other.slot == slot.slot || other.job->cancelled() || other.done || other.emitted) continue;
+            const int lcp = std::min(common_prefix(slot.job->prompt_ids, other.job->prompt_ids),
+                                     int(std::min(slot.job->prompt_ids.size(), other.job->prompt_ids.size())) - 1);
+            if (lcp >= kMinForkPrefix && other.offset < lcp && slot.offset < lcp) ++peers;
+          }
+          if (!prefill || peers > best_peers ||
+              (peers == best_peers && peers > 0 && slot.offset > prefill->offset) ||
+              (peers == best_peers && peers == 0 && slot.offset < prefill->offset)) {
+            prefill = &slot;
+            best_peers = peers;
+          }
+        }
+      } else {
+        for (auto& slot : slots_) {
+          if (slot.job->cancelled() || slot.done || slot.emitted) continue;
+          if (!prefill || slot.offset < prefill->offset) prefill = &slot;
+        }
       }
       if (!prefill) break;
       auto& slot = *prefill;
+      int fork_at = 0;
+      if (generator_.batch_spec() > 0) {
+        for (const auto& other : slots_) {
+          if (other.slot == slot.slot || other.job->cancelled() || other.done || other.emitted) continue;
+          const int lcp = std::min(common_prefix(slot.job->prompt_ids, other.job->prompt_ids),
+                                   int(std::min(slot.job->prompt_ids.size(), other.job->prompt_ids.size())) - 1);
+          if (lcp >= kMinForkPrefix && lcp > slot.offset && other.offset < lcp) {
+            if (fork_at == 0 || lcp < fork_at) fork_at = lcp;
+          }
+        }
+      }
       const int before = slot.offset;
       try {
         const auto result = generator_.prefill_slot_chunk(
-            slot.slot, slot.job->prompt_ids, slot.offset, slot.sampling);
+            slot.slot, slot.job->prompt_ids, slot.offset, slot.sampling, fork_at);
         if (!slot.offset) slot.job->cached_tokens_.store(result.reused_tokens);
         slot.offset = result.offset;
         if (result.token) emit(slot, std::span(&*result.token, 1));
       } catch (const std::exception& e) {
         slot.job->fail(e.what());
         slot.done = true;
+      }
+      if (fork_at > 0 && slot.offset == fork_at && !slot.done && !slot.job->cancelled()) {
+        fork_from(slot);
+        continue;
       }
       prefill_budget -= std::max(1, slot.offset - before);
       if (generator_.batch_spec() == 0 || slot.offset < int(slot.job->prompt_ids.size())) break;

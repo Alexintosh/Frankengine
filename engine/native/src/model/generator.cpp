@@ -341,8 +341,40 @@ class EngineGenerator final : public Generator {
     return true;
   }
 
+  bool clone_slot(int src_slot, int dst_slot) override {
+    if (options_.batch_spec == 0) return false;
+    if (src_slot < 0 || src_slot >= options_.max_batch || dst_slot < 0 || dst_slot >= options_.max_batch)
+      return false;
+    if (src_slot == dst_slot) return true;
+    const auto& src_hist = batch_spec_histories_.at(std::size_t(src_slot));
+    const int len = int(src_hist.size());
+    if (len <= 0) return false;
+    const cudaStream_t stream = rt_.stream();
+    const State src = batch_state_.view(src_slot);
+    State dst = batch_state_.view(dst_slot);
+    auto copy_same = [&](const Tensor& s_t, const Tensor& d_t) {
+      CUDA_CHECK(cudaMemcpyAsync(d_t.data, s_t.data, s_t.bytes(), cudaMemcpyDeviceToDevice, stream));
+    };
+    copy_same(src.k_ring, dst.k_ring);
+    copy_same(src.v_ring, dst.v_ring);
+    copy_same(src.ring_pos, dst.ring_pos);
+    copy_same(src.conv_k, dst.conv_k);
+    copy_same(src.conv_v, dst.conv_v);
+    copy_same(src.conv_attn, dst.conv_attn);
+    copy_same(src.conv_mlp, dst.conv_mlp);
+    const std::size_t es = options_.kv_fp8 ? 1 : 2;
+    const std::size_t copy_bytes = std::size_t(len) * std::size_t(batch_state_.kv_dim_local) * es;
+    for (int fi = 0; fi < NUM_FULL_VISITS; ++fi) {
+      CUDA_CHECK(cudaMemcpyAsync(dst.k_full_at(fi).data, src.k_full_at(fi).data, copy_bytes, cudaMemcpyDeviceToDevice, stream));
+      CUDA_CHECK(cudaMemcpyAsync(dst.v_full_at(fi).data, src.v_full_at(fi).data, copy_bytes, cudaMemcpyDeviceToDevice, stream));
+    }
+    batch_spec_histories_.at(std::size_t(dst_slot)) = src_hist;
+    if (batch_drafter_) batch_drafter_->clone_slot(src_slot, dst_slot, len);
+    return true;
+  }
+
   PrefillChunkResult prefill_slot_chunk(int slot, std::span<const int32_t> prompt, int offset,
-                                       BatchSampling& sampling) override {
+                                       BatchSampling& sampling, int stop_at = 0) override {
     const int ctx_lim = options_.batch_spec > 0 ? options_.batch_ctx : options_.max_ctx;
     if (prompt.empty() || int(prompt.size()) + options_.batch_spec + 1 >= ctx_lim ||
         std::any_of(prompt.begin(), prompt.end(), [](int32_t token) {
@@ -368,7 +400,11 @@ class EngineGenerator final : public Generator {
           history.clear();
         }
       }
-      const int count = std::min({2048, options_.prefill_chunk, int(prompt.size()) - offset});
+      if (stop_at > 0 && offset == stop_at && stop_at < int(prompt.size())) {
+        return PrefillChunkResult{offset, reused, std::nullopt};
+      }
+      const int target_end = (stop_at > offset && stop_at < int(prompt.size())) ? stop_at : int(prompt.size());
+      const int count = std::min({2048, options_.prefill_chunk, target_end - offset});
       const bool final = offset + count == int(prompt.size());
       const bool sampled = sampling.params.temperature > 0;
       if (tp) tp->full_logits = sampled;
