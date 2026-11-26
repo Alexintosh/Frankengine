@@ -248,12 +248,12 @@ Status legend: `[TODO]` · `[IN PROGRESS]` · `[DONE]` · `[ON HOLD]` · `[DEFER
   - **32K & 128K Decode Attention Audit:** Full FP8 decode attention **ALREADY sustains `195.5–233.5 GB/s` (`84.5%–100.9%` of GB10's `231.38 GB/s` physical DRAM ceiling!)** across `M=1..8` (`32K`: `1.20–1.37 ms` vs `1.16 ms` floor; `128K`: `4.60–4.83 ms` vs `4.64 ms` floor) → already saturated, kept intact! *(Note: bulk RoCE still averages `~7.4 GB/s` vs `50 GB/s` dual-rail line rate during prefill — future `tp_comm` pipelined multi-chunk RDMA could shave another `~10–12 s` off 128K TTFT!)*
 
 #### `ARCH-09` · Prefill Local SWA 1-Shot + Fused 4-Tap K/V `sconv` & Vectorized Pre/Post Kernels `[TODO — High ROI]`
-- **Origin:** Audited from `tensorfish/squid5090` (`kernels_prefill.cu`, Levers 17–18: `attn_sub 66.7 → 14.0 ms`, `pre_sub 30.6 → 17.2 ms` on RTX 5090) + our own `nsys` `T=2048` prefill profile on GB10 (`92.3 ms` = `15.6%` of total prefill: `69.0 ms` sliding attn + `13.1 ms` full attn + `10.2 ms` `attn_prep`).
+- **Origin:** Audited from `tensorfish/squid5090` (`kernels_prefill.cu`, Levers 17–18: `attn_sub 66.7 → 14.0 ms`, `pre_sub 30.6 → 17.2 ms` on RTX 5090) + `kindlingai/gr8` (`GR8_INK2_PF_FAST_ATTN=1` 64-Q-row overlapped-SMEM TC prefill attn & `GR8_INK2_FAST_RES=1` 1-pass dynamic-SMEM depth-attention) + our own `nsys` `T=2048` prefill profile on GB10 (`92.3 ms` = `15.6%` of total prefill: `69.0 ms` sliding attn + `13.1 ms` full attn + `10.2 ms` `attn_prep`).
 - **Scope (`engine/native/src/kernels/prefill/attention.cu`, `rows.cu`):**
   1. Fuse the 4-tap K/V `sconv` directly into `attn_prep_kernel` (eliminating separate `static_conv_kernel` / `conv_state_kernel` passes and intermediate DRAM traffic).
-  2. Upgrade Local SWA prefill to 1-shot full-GPU tiling (`2048` chunk) with reversed causal `blockIdx.y` (better SM load balancing on the lower triangle), zero-modulo KV slot indexing, `exp2f`, and a branchless `uint4` (`LDS.128`) interior `rel_bias` fast path.
-  3. Vectorize (`float4`) pre/post residual/norm/conv helper kernels (`fused_depth_norm`, controller prep/finish, post-sconv residual).
-- **Target:** Strict-lossless (`KL ≤ baseline`, `330/330` validate PASS); push Dual-Spark cold prefill past **`4,200+ tok/s`** and accelerate RTX 5090 prefill proportionally.
+  2. Upgrade Local SWA & Full prefill attention to 1-shot full-GPU tiling (`2048`/`4096` chunk, 64-Q-row overlapped-SMEM TC pipeline) with reversed causal `blockIdx.y` (better SM load balancing on the lower triangle), zero-modulo KV slot indexing, `exp2f`, and a branchless `uint4` (`LDS.128`) interior `rel_bias` fast path.
+  3. Vectorize (`float4`) pre/post residual/norm/conv helper kernels (`fused_depth_norm` / 1-pass dynamic-SMEM depth-attention, controller prep/finish, post-sconv residual).
+- **Target:** Strict-lossless (`KL ≤ baseline`, `330/330` validate PASS); push Dual-Spark cold prefill past **`4,200+ tok/s`** and lift `1× Spark` 32K prefill above `3,200+ tok/s` without extra weight copies.
 
 #### `ARCH-10` · Opt-in Q4 Global KV Cache (`--kv-q4`) + Host-Pinned Zero-Copy `embed` (`--embed-host`) `[TODO — High ROI for 5090 512K–1M & Dual-Spark Long-Ctx/Batch]`
 - **Origin:** Audited from `tensorfish/squid5090` (`--kv q4` + `--embed-host`).
@@ -272,8 +272,20 @@ Status legend: `[TODO]` · `[IN PROGRESS]` · `[DONE]` · `[ON HOLD]` · `[DEFER
   3. **Content-Addressed Vision Prefix Caching:** Hash decoded RGB image pixels with `SplitMix64` into negative synthetic token IDs so multi-turn conversations referencing the same image hit prefix KV cache automatically (`0.0 ms` vision encode on repeat turns).
 
 #### `QA-01` · 7.7K-Token Exact FP64 Streaming KLD Evaluator `[TODO — Companion Gate for ARCH-10]`
-- **Origin:** Inspired by `tensorfish/squid5090`'s `7,784`-token (`7.6×` past local SWA window) FP64 KLD corpus.
+- **Origin:** Inspired by `tensorfish/squid5090`'s `7,784`-token (`7.6×` past local SWA window) FP64 KLD corpus (and `kindlingai/gr8`'s `40×2K` = `81,920`-token FP64 KLD protocol).
 - **Why needed:** The existing 330-stage `validate` check does not deeply stress the 8 Global KV layers past the `1,024`-token sliding window; an exact FP64 long-context streaming KLD gate is required before shipping `--kv-q4` (`ARCH-10`) or any future long-context KV compression.
+
+#### `ARCH-11` · Adaptive Batch Spec Cost Model + 2-Bit Shortlist Screen for `BatchDFlash2` Head `[TODO — High ROI for Mixed Batch & c=16..32]`
+- **Origin:** Audited from `kindlingai/gr8` (`GR8_S2_ADAPT=1` + `GR8_INK2_S2_COST` 6-param adaptive drafting cost model; `GR8_INK2_DF2_HEAD2=1` 2-bit shortlist screen + exact top-64 rescore for DFlash LM head).
+- **Scope:**
+  1. **Concurrency-Aware Speculative Cost Model:** Replace the static `BATCH_SPEC_THRESHOLD=0.30` gate with a lightweight parametric cost model `f(c, rolling_accept_rate, verify_ms_per_M)` that dynamically selects `K ∈ {0, 2, 4, 7}` per batch round (maximizing gain on code/structured batches while avoiding wasted verify compute on low-acceptance `T=0.7` prose/reasoning batches).
+  2. **2-Bit Draft Head Screen (`BatchDFlash2`):** For large batches (`c=16..32`, `T=128..256` draft rows × `200K` vocab), screen the full vocabulary with a compact 2-bit packed LM head followed by exact NVFP4/FP8 top-64 rescore — shrinking draft-head DRAM traffic by `~2×` on the batched drafter path.
+
+#### `OPS-01` · Host UMA Tuning (`vm.compaction_proactiveness=0`) + Linear VRAM Auto-Sizer (`±8 MiB`) `[TODO — Quick Win / Zero Risk]`
+- **Origin:** Audited from `kindlingai/gr8` (`DEPLOY.md` + `rtx-5090/1x/serve.sh`).
+- **Scope:**
+  1. Verify and apply `vm.compaction_proactiveness = 0` via `/etc/sysctl.d/90-frankengine-no-proactive-compaction.conf` on both DGX Sparks (eliminates Linux proactive UMA compaction stalls during large allocations/serving) and document in `README.md`.
+  2. Add an exact linear VRAM auto-sizing formula to `scripts/serve_tp1.sh` (targeting `~2 GiB` safety headroom on 32 GB RTX 5090 / 96 GB PRO 6000) to auto-pick `MAX_BATCH × BATCH_CTX` or solo `MAX_CTX` without OOM risk.
 
 ---
 
@@ -309,8 +321,9 @@ Status legend: `[TODO]` · `[IN PROGRESS]` · `[DONE]` · `[ON HOLD]` · `[DEFER
 #### `LOSSY-01` · Dynamic `top-k` Expert Pruning (`top-8 → dynamic top-6`) `[DEFERRED]`
 - Drop low-weight tail experts on loop passes `1/2` to cut `E_uniq(8)` by 20–25% (`-3 to -4 ms/round`) with zero weight reformatting. Strict offline KL + coding/reasoning eval required first.
 
-#### `LOSSY-02` · Sub-4-bit MoE Quantization (`EXL3` / `QTIP` / Trellis 2.5–3 bit on Loop Experts `6..17`) `[DEFERRED]`
-- Exploit GB10's idle SM compute to cut `W13 + W2` (`3.52 GB` @ `M=8`) from `4.5 bpw` to `2.5–3.0 bpw` (`-5 to -7 ms/round`).
+#### `LOSSY-02` · Sub-4-bit Loop-Aware Mixed-Bit MoE Quantization (`EXL3` / `QTIP` / `exlr8`-Style 2.25–3.25 bpw) `[DEFERRED]`
+- Exploit GB10's idle SM compute to cut `W13 + W2` (`3.52 GB` @ `M=8`) from `4.5 bpw` to `2.25–3.25 bpw` (`-5 to -7 ms/round`).
+- **Key design insight from `kindlingai/gr8` (`exlr8 bit325` / `bit225`):** Do **NOT** quantize uniformly across layers — protect the 12 **`loop_core` layers (`6..17`, executed 3× per token)** at `+1 bit` above `prelude`/`coda` (`bit225`: `768` loop-core experts at `K3` + `2,304` at `K2` cuts KL by **`-21.3%`** at `0` extra weight bytes; `bit325` achieves `92.80%` vs `93.54%` 4-bit on 1,362 tasks, tying on coding/math with gap isolated to GPQA).
 
 #### `OPT-08` · Context-Gated Verbatim Suffix Lookup `[ON HOLD — Gated After Track 3B NO-GO]`
 - Only revisit for `≥32K` verbatim copy spans (`match_len ≥ 16`), never overriding high-confidence drafter proposals (`p > 0.85`), with exact `M=1` greedy parity.
@@ -375,6 +388,16 @@ Status legend: `[TODO]` · `[IN PROGRESS]` · `[DONE]` · `[ON HOLD]` · `[DEFER
   - **LoopCD-Hidden:** Kept off by default (`omega = 0.0`, confirms our `EXP-030` `p = 1.000` tie).
   - **All-linear `NVFP4` (`--mode nvfp4`):** `KLD 0.0267` (`ΔPPL +0.052`) — outside our strict-lossless budget (`KL ≤ 0.006`).
   - **Prefill negative findings:** cuBLAS `precomp_rel` (`+97.7 ms`), BF16 cuBLAS controllers (`+32.6 ms`), `BK=64` 4-stage NVFP4 MoE (`+9.3 ms`), and fused `HFMA2` Q4 KV unpack (`KLD 0.0094 → 0.0112`).
+
+### E. `kindlingai/gr8` + `exlr8` (`1× DGX Spark` & `1× RTX 5090`, `TP=1` — Audited 2026-11-26)
+- **Measured `1× DGX Spark` (`TP=1`, `gr8` `6b874803`, bundled Q4_0 `DFlash` `MTP=7`, `49–97t` prompts):**
+  - **`k4` (`4.0 bpw`, `18.72 GB`, BF16 non-experts):** `KL 0.010460` (`-27.4%` vs Official NVFP4 `0.014407`), `93.54%` on 1,362 tasks (ties Official W4A4 `p=0.6655`); decode **`64.6` Code / `107.3` Math / `48.6` Prose / `139.1` `C=6`**; `8K` prefill **`3,457 tok/s`**; `1M×1` KV pool; `10.3 s` NVMe boot.
+  - **`bit325` (`3.25 bpw`, `16.43 GB`, default):** `KL 0.015019`, `92.80%` on 1,362 tasks (`91.5%` HE+, `97.8%` MATH-500, `-3%` GPQA); decode **`90.6` Code / `105.2` Math / `49.5` Prose / `160.0` `C=6`** (max `8` sessions); prefill **`3,436` (`4K`) / `3,484` (`8K`) / `3,150` (`32K`) / `2,162` (`128K`)** via `23.5 GiB` cached `PF_MX8_MOE=2` + `64-Q-row` overlapped-SMEM TC attn; `1.18M` (`144K×8`) to `2.10M` KV pool; `9.95 s` boot.
+  - **`bit225-fast` (`2.25 bpw`, `13.37 GB`, lossy `KL 0.041282`):** `768` loop-core `K3` + `2,304` `K2` experts (`-21.3%` KL vs uniform `k2`); decode **`133.5` Code / `160.2` Math / `75.5` Prose / `228.2` `C=6`**; `7.61 s` boot.
+- **Honest Head-to-Head vs Frankengine:**
+  - **At equal quality (`k4`/`bit325` vs Frankengine Official `NVFP4/MXFP8`):** Frankengine `TP=1` is **faster on `c=1` Code (`95.5–155.4` vs `64.6–90.6`) and Chat/Prose (`86.8` vs `48.6–49.5`)**, and far ahead in continuous batching (`c=8..64` `198–601 tok/s` on `1× Spark`, `c=32..128` `846–1,504 tok/s` on `2× Spark` vs `gr8`'s `max 8` sessions `139–228 tok/s`). On `2× Spark TP=2`, strict-lossless Frankengine (`257.5` Code, `263.9` Refactor, `3,761 / 3,579` prefill) outperforms even `gr8`'s lossy `bit225-fast` across every domain.
+  - **Where `gr8` excels:** `k4` KL (`-27%` vs Official NVFP4), `1× Spark` 32K prefill (`3,150 tok/s` with `23.5 GiB` MXFP8 MoE cache), `1M × 1` native KV sizing, and `7–10 s` NVMe boot. Note that on 32 GB RTX 5090 (`PF_MX8_MOE=0`), `gr8` prefill drops to `5,034 tok/s` (`PREFILL=512`), highlighting the structural advantage of Frankengine's native `mxf4nvf4` Tensor Core prefill (zero extra weight copy).
+- **Adopted into Frankengine `[TODO]` Backlog:** `ARCH-09` (64-Q-row overlapped-SMEM TC prefill attn + 1-pass dynamic-SMEM depth-attn), `ARCH-11` (adaptive batch spec cost model + 2-bit shortlist screen for `BatchDFlash2` head), `OPS-01` (`vm.compaction_proactiveness=0` + linear VRAM auto-sizer), and `LOSSY-02` (loop-core `+1 bit` mixed-bit protection rule).
 
 ---
 
