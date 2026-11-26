@@ -247,6 +247,34 @@ Status legend: `[TODO]` · `[IN PROGRESS]` · `[DONE]` · `[ON HOLD]` · `[DEFER
   - **Rejected Prefill Variants:** Prefill-only `BF16 MoE` wire diverged on 2K & 32K continuations and dropped decode speed (`-3.6%` to `-6.7%`) → **REJECTED**; chunk sizes `C=128/256/512/3072` all trailed `C=2048` → **REJECTED**.
   - **32K & 128K Decode Attention Audit:** Full FP8 decode attention **ALREADY sustains `195.5–233.5 GB/s` (`84.5%–100.9%` of GB10's `231.38 GB/s` physical DRAM ceiling!)** across `M=1..8` (`32K`: `1.20–1.37 ms` vs `1.16 ms` floor; `128K`: `4.60–4.83 ms` vs `4.64 ms` floor) → already saturated, kept intact! *(Note: bulk RoCE still averages `~7.4 GB/s` vs `50 GB/s` dual-rail line rate during prefill — future `tp_comm` pipelined multi-chunk RDMA could shave another `~10–12 s` off 128K TTFT!)*
 
+#### `ARCH-09` · Prefill Local SWA 1-Shot + Fused 4-Tap K/V `sconv` & Vectorized Pre/Post Kernels `[TODO — High ROI]`
+- **Origin:** Audited from `tensorfish/squid5090` (`kernels_prefill.cu`, Levers 17–18: `attn_sub 66.7 → 14.0 ms`, `pre_sub 30.6 → 17.2 ms` on RTX 5090) + our own `nsys` `T=2048` prefill profile on GB10 (`92.3 ms` = `15.6%` of total prefill: `69.0 ms` sliding attn + `13.1 ms` full attn + `10.2 ms` `attn_prep`).
+- **Scope (`engine/native/src/kernels/prefill/attention.cu`, `rows.cu`):**
+  1. Fuse the 4-tap K/V `sconv` directly into `attn_prep_kernel` (eliminating separate `static_conv_kernel` / `conv_state_kernel` passes and intermediate DRAM traffic).
+  2. Upgrade Local SWA prefill to 1-shot full-GPU tiling (`2048` chunk) with reversed causal `blockIdx.y` (better SM load balancing on the lower triangle), zero-modulo KV slot indexing, `exp2f`, and a branchless `uint4` (`LDS.128`) interior `rel_bias` fast path.
+  3. Vectorize (`float4`) pre/post residual/norm/conv helper kernels (`fused_depth_norm`, controller prep/finish, post-sconv residual).
+- **Target:** Strict-lossless (`KL ≤ baseline`, `330/330` validate PASS); push Dual-Spark cold prefill past **`4,200+ tok/s`** and accelerate RTX 5090 prefill proportionally.
+
+#### `ARCH-10` · Opt-in Q4 Global KV Cache (`--kv-q4`) + Host-Pinned Zero-Copy `embed` (`--embed-host`) `[TODO — High ROI for 5090 512K–1M & Dual-Spark Long-Ctx/Batch]`
+- **Origin:** Audited from `tensorfish/squid5090` (`--kv q4` + `--embed-host`).
+- **Design:**
+  1. **`--kv-q4` (opt-in; keep FP8 strict-lossless default):** Quantize only the **8 Global Attention KV visits** to symmetric `[-7..7]` INT4 with group-64 FP16 scales (`0.531 B/elem`, cutting global KV footprint & DRAM reads in half: `16.4 → 8.5 KB/tok`). Use exact FP16 unpack `__hmul2(__hsub2(u, 1031), sc)` — **do NOT** fuse into `HFMA2` (documented KLD regression `0.0094 → 0.0112`). Measured quality delta: only **`+0.0034` KLD** over FP8 (`0.0093` vs `0.0059` across `7,784` tokens, `ΔPPL +0.0056`), verbatim needle recall at 512K.
+  2. **`--embed-host` (opt-in for 32 GB GPUs):** Keep the `0.86 GiB` embedding table in host-pinned zero-copy RAM to free VRAM on RTX 5090 for longer contexts (`512K–1M`) or extra `BatchDecoder` slots (`32×8K` vs `16×4K`).
+- **Expected Impact:**
+  - **RTX 5090 (`32 GB`):** Unlocks **512K–1M single-GPU context** and doubles concurrent batch KV capacity.
+  - **Dual-Spark `TP=2` (`GB10`, DRAM-saturated at `32K–128K` Full Attn):** Halves Global KV DRAM reads during long-context decode (`64K–256K`) and doubles `BatchState` capacity (`64×32K` / `32×64K`) in the same UMA footprint.
+
+#### `OPT-09` · Serving Polish: 4K Side-Request Prefix Shield, Post-`[DONE]` Deferred D2H Checkpoint & Content-Addressed Vision Prefix Caching `[TODO — Medium-High ROI]`
+- **Origin:** Audited from `tensorfish/squid5090` and directly complementary to Frankengine's promoted Persistent Prefix Anchor pool (`EXP-038`).
+- **Scope:**
+  1. **4K Side-Request Shield:** Route tiny utility/UI side requests (`≤4K`, e.g. title generation, classifiers, tool summaries) through a dedicated lightweight path/slot policy so they never evict a warm `32K–256K` agent session or prefix anchor.
+  2. **Post-`[DONE]` Deferred D2H Checkpoint:** Defer the host-RAM prefix-cache park/checkpoint D2H copy until *after* emitting the final SSE `[DONE]` frame, hiding snapshot latency from client-perceived turnaround time.
+  3. **Content-Addressed Vision Prefix Caching:** Hash decoded RGB image pixels with `SplitMix64` into negative synthetic token IDs so multi-turn conversations referencing the same image hit prefix KV cache automatically (`0.0 ms` vision encode on repeat turns).
+
+#### `QA-01` · 7.7K-Token Exact FP64 Streaming KLD Evaluator `[TODO — Companion Gate for ARCH-10]`
+- **Origin:** Inspired by `tensorfish/squid5090`'s `7,784`-token (`7.6×` past local SWA window) FP64 KLD corpus.
+- **Why needed:** The existing 330-stage `validate` check does not deeply stress the 8 Global KV layers past the `1,024`-token sliding window; an exact FP64 long-context streaming KLD gate is required before shipping `--kv-q4` (`ARCH-10`) or any future long-context KV compression.
+
 ---
 
 ### Phase C — Unified Strict-Lossless TP=2 Integration, Config Hill-Climbing & Qualification (`inference-optimisation` Skill)
@@ -334,6 +362,19 @@ Status legend: `[TODO]` · `[IN PROGRESS]` · `[DONE]` · `[ON HOLD]` · `[DEFER
   - **Already today (BEFORE DFlash 2!):** Our `2× Spark` M5 with stock DSpark (`118–121` Chat, `127–129` Code, `166–172` 2K coding) **already beats `1× Spark` TensorFold + DFlash 2 (`91` prose / `99.4` coding) by `+29% to +67%`**!
   - **With `ARCH-06a` (`2× Spark` `ingine-tp` + NVFP4 DFlash 2 + `fine2`):** Applying the real GB10 DFlash 2 multiplier (`+44–74%`, with our NVFP4 `227 MB` drafter even lighter than TensorFold's FP8 `384 MB` + our `0.60 ms` TP=2 NVFP4 head!), our Dual-Spark engine projects to **`~165–195 tok/s` Chat/Prose** and **`~185–235 tok/s` Coding** (`~1.8×–2.3×` faster than the fastest `1× Spark` DFlash 2 stack!).
   - **Key engineering lessons confirmed/adopted:** (1) Validates our exact 3-pillar design (quantized DFlash2 backbone + 4-bit draft head + acceptance-guided adaptive verify `fine2`); (2) Confirms Inkling's `embed_norm(embed_tokens(ids))` + `after_correction` softcap + `200,058` valid-vocab clamp + tiny `~42 MiB/stream` 5-layer sliding KV ring; (3) Highlights TensorFold's `~3.2–3.4K tok/s` Blackwell tensor-core prefill as a benchmark target for our `ARCH-08b` prefill optimization.
+
+### D. `tensorfish/squid5090` (`1× RTX 5090`, Single-User `c=1` Blackwell Engine — Audited 2026-11-26)
+- **Scope & Overlap:** Built on the same upstream Blackwell `ingine` foundation as Frankengine (`L2::evict_first`, DSMEM clusters, PDL, native NVFP4/MXFP8 prefill GEMMs, 32K shortlist), focused strictly on **`c=1` single-GPU RTX 5090** (no `TP=2`, no continuous batching, no `DFlash 2` / `BatchDFlash2`).
+- **Adopted into Frankengine `[TODO]` Backlog:**
+  1. **`ARCH-09`:** Prefill Local SWA 1-shot + fused 4-tap K/V `sconv` inside `attn_prep` + `float4` pre/post kernels (`attn_sub 66.7 → 14.0 ms` on 5090; directly targets the remaining `92.3 ms` prefill attention slice in our GB10 `nsys` profile).
+  2. **`ARCH-10`:** Opt-in Q4 Global KV cache (`--kv-q4`, symmetric `[-7..7]` INT4 group-64, exact FP16 unpack, `+0.0034` KLD over FP8, 512K–1M on 32 GB 5090 & 2× long-ctx KV bandwidth/batch capacity on Dual-Spark) + `--embed-host` (`-0.86 GiB` VRAM).
+  3. **`OPT-09`:** 4K side-request prefix-cache shield, post-`[DONE]` deferred D2H checkpointing, and `SplitMix64` content-addressed vision prefix caching (`0.0 ms` repeat image turns).
+  4. **`QA-01`:** 7.7K-token (`7.6×` past local window) exact FP64 streaming KLD evaluator as long-context Global KV gate.
+- **Confirmed `NO-GO` / Do-Not-Import Alignments:**
+  - **Prompt-Lookup / Suffix-Copy Spec:** Also reverted to opt-in and disabled at `T > 0` (confirms our `EXP-025`).
+  - **LoopCD-Hidden:** Kept off by default (`omega = 0.0`, confirms our `EXP-030` `p = 1.000` tie).
+  - **All-linear `NVFP4` (`--mode nvfp4`):** `KLD 0.0267` (`ΔPPL +0.052`) — outside our strict-lossless budget (`KL ≤ 0.006`).
+  - **Prefill negative findings:** cuBLAS `precomp_rel` (`+97.7 ms`), BF16 cuBLAS controllers (`+32.6 ms`), `BK=64` 4-stage NVFP4 MoE (`+9.3 ms`), and fused `HFMA2` Q4 KV unpack (`KLD 0.0094 → 0.0112`).
 
 ---
 
