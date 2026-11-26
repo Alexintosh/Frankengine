@@ -82,7 +82,10 @@ class Prefiller {
   std::uint8_t *moe_a_codes_ = nullptr, *moe_a_scales_ = nullptr;
   float *moe_a_factors_ = nullptr;
   float *partial_ = nullptr, *down_partial_ = nullptr;
-  __nv_bfloat16* wscratch_;  // dequantized FP8 rows of wproj / wo (dense_fp8)
+  __nv_bfloat16* wscratch_;  // dequantized FP8 rows of wproj / wo (BF16 fallback)
+  std::uint8_t* xq_ = nullptr;   // per-row FP8 E4M3 activations for native FP8 dense GEMM
+  float* x_scale_ = nullptr;     // per-row FP32 scales for xq_
+  bool fp8_dense_ = false;
   std::int64_t* ids_;
   int kpos_rows_;
 };

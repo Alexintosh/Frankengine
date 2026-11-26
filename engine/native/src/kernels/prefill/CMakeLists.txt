@@ -4,6 +4,7 @@ add_library(ingine_kernels_prefill STATIC
   wgemm.cu
   rows.cu
   gemm.cpp
+  fp8_gemm.cu
 )
 ingine_cuda_target(ingine_kernels_prefill)
 ingine_internal_includes(ingine_kernels_prefill)

@@ -146,33 +146,80 @@ __global__ void __launch_bounds__(256) attn_prep_kernel(const AttnPrepParams p) 
   }
 }
 
-// ---- rel_logits: 1024 distances x 4 per thread, rel_proj columns in registers; a CTA covers 8 heads of `tpb`
-// consecutive tokens (grid: token groups x 3 head groups, enough CTAs for small chunks)
+// ---- rel_logits: BF16 Tensor Core MMA (m16n8k16) over [M = T*Heads, 16] x [16, 1024] -> [M, 1024]
+// Keeps all 64 columns of bf16(rel_proj) in 16 registers per lane and writes coalesced uint4 stores.
 
-template <int Heads>
-__global__ void __launch_bounds__(256) rel_logits_kernel(const uint16_t* __restrict__ rel,
-                                                         const float* __restrict__ rel_proj, int T, int tpb,
-                                                         uint16_t* __restrict__ out) {
-  const int d = threadIdx.x * 4;
-  float rp[kRel][4];
-#pragma unroll
-  for (int j = 0; j < kRel; ++j) {
-    const float4 v = *reinterpret_cast<const float4*>(rel_proj + j * kRelExtent + d);
-    rp[j][0] = round_bf16(v.x), rp[j][1] = round_bf16(v.y), rp[j][2] = round_bf16(v.z), rp[j][3] = round_bf16(v.w);
+__global__ void __launch_bounds__(128, 4)
+rel_logits_mma_kernel(const uint16_t* __restrict__ rel, const float* __restrict__ rel_proj,
+                      int M, uint16_t* __restrict__ out) {
+  constexpr int BM = 64, BN = 64, R_ITERS = 4;
+  __shared__ __align__(128) uint16_t sB[BN][kRel];
+  __shared__ __align__(128) uint16_t sA[BM][kRel];
+  __shared__ __align__(128) uint16_t sC[BM][BN];
+
+  const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+  const int col0 = blockIdx.x * BN;
+  const int row_group = blockIdx.y * (BM * R_ITERS);
+
+  for (int i = tid; i < 256; i += 128) {
+    const int j = i >> 4;
+    const int c4 = (i & 15) * 4;
+    const float4 v = *reinterpret_cast<const float4*>(rel_proj + j * kRelExtent + col0 + c4);
+    sB[c4 + 0][j] = f2bf_bits(v.x);
+    sB[c4 + 1][j] = f2bf_bits(v.y);
+    sB[c4 + 2][j] = f2bf_bits(v.z);
+    sB[c4 + 3][j] = f2bf_bits(v.w);
   }
-  const int t1 = min(T, (blockIdx.x + 1) * tpb);
-  for (int t = blockIdx.x * tpb; t < t1; ++t) {
-    for (int h = blockIdx.y * 8; h < min(Heads, int(blockIdx.y) * 8 + 8); ++h) {
-      const uint16_t* r = rel + (size_t(t) * Heads + h) * kRel;
-      float acc[4] = {0.f, 0.f, 0.f, 0.f};
+  __syncthreads();
+
+  uint32_t b_reg[8][2];
 #pragma unroll
-      for (int j = 0; j < kRel; ++j) {
-        const float x = bf2f(__ldg(r + j));
+  for (int ni = 0; ni < 4; ++ni) {
+    uint32_t r0, r1, r2, r3;
+    const int br = ni * 16 + (lane & 15);
+    const int bc = (lane >> 4) * 8;
+    ldmatrix_x4(r0, r1, r2, r3, smem_addr(&sB[br][bc]));
+    b_reg[2 * ni][0]     = r0; b_reg[2 * ni][1]     = r2;
+    b_reg[2 * ni + 1][0] = r1; b_reg[2 * ni + 1][1] = r3;
+  }
+
+  const int grp = lane >> 2, t4 = lane & 3;
+  for (int it = 0; it < R_ITERS; ++it) {
+    const int m0 = row_group + it * BM;
+    if (m0 >= M) break;
+    const int r = tid >> 1, c8 = (tid & 1) * 8;
+    if (m0 + r < M)
+      *reinterpret_cast<uint4*>(&sA[r][c8]) = *reinterpret_cast<const uint4*>(rel + size_t(m0 + r) * kRel + c8);
+    else
+      *reinterpret_cast<uint4*>(&sA[r][c8]) = make_uint4(0, 0, 0, 0);
+    __syncthreads();
+
+    uint32_t a[4];
+    ldmatrix_x4(a[0], a[1], a[2], a[3], smem_addr(&sA[warp * 16 + (lane & 15)][(lane >> 4) * 8]));
+
+    const int wr0 = warp * 16 + grp;
+    const int wr1 = wr0 + 8;
 #pragma unroll
-        for (int q = 0; q < 4; ++q) acc[q] = fmaf(x, rp[j][q], acc[q]);
-      }
-      store_bf16x4(out + (size_t(t) * Heads + h) * kRelExtent + d, acc);
+    for (int ni = 0; ni < 8; ++ni) {
+      float d[4] = {0.f, 0.f, 0.f, 0.f};
+      mma_bf16(d, a, b_reg[ni][0], b_reg[ni][1]);
+      const int c = ni * 8 + t4 * 2;
+      *reinterpret_cast<uint32_t*>(&sC[wr0][c]) = pack_bf16x2(d[0], d[1]);
+      *reinterpret_cast<uint32_t*>(&sC[wr1][c]) = pack_bf16x2(d[2], d[3]);
     }
+    __syncthreads();
+
+#pragma unroll
+    for (int u = 0; u < 4; ++u) {
+      const int idx = tid + u * 128;
+      const int sr = idx >> 3;
+      const int sc = (idx & 7) * 8;
+      if (m0 + sr < M) {
+        *reinterpret_cast<uint4*>(out + size_t(m0 + sr) * kRelExtent + col0 + sc) =
+            *reinterpret_cast<const uint4*>(&sC[sr][sc]);
+      }
+    }
+    __syncthreads();
   }
 }
 
@@ -267,6 +314,7 @@ __global__ void __launch_bounds__(ROW_T) gate_apply_kernel(const float* __restri
   store_bf16x4(out + off, {y[0] * r * w4.x, y[1] * r * w4.y, y[2] * r * w4.z, y[3] * r * w4.w});
 }
 
+
 // ---- misc
 
 __global__ void widen_kernel(const int32_t* __restrict__ in, int T, int64_t* __restrict__ out, int32_t negative_as) {
@@ -340,13 +388,12 @@ void attn_prep(const AttnPrepParams& p, cudaStream_t stream) {
 
 void rel_logits(const __nv_bfloat16* rel, const float* rel_proj, int T, __nv_bfloat16* out, cudaStream_t stream,
                 int heads) {
-  const int tpb = std::min(16, std::max(1, T / 128));
-  const dim3 grid((T + tpb - 1) / tpb, (heads + 7) / 8);
-  const auto* in = reinterpret_cast<const uint16_t*>(rel);
-  auto* dst = reinterpret_cast<uint16_t*>(out);
-  if (heads == kHeads) rel_logits_kernel<kHeads><<<grid, 256, 0, stream>>>(in, rel_proj, T, tpb, dst);
-  else if (heads == kHeads / 2) rel_logits_kernel<kHeads / 2><<<grid, 256, 0, stream>>>(in, rel_proj, T, tpb, dst);
-  else throw std::invalid_argument("rel_logits: unsupported head count");
+  if (heads != kHeads && heads != kHeads / 2)
+    throw std::invalid_argument("rel_logits: unsupported head count");
+  const int M = T * heads;
+  const dim3 grid(kRelExtent / 64, (M + 255) / 256);
+  rel_logits_mma_kernel<<<grid, 128, 0, stream>>>(
+      reinterpret_cast<const uint16_t*>(rel), rel_proj, M, reinterpret_cast<uint16_t*>(out));
 }
 
 void static_conv(const __nv_bfloat16* x, int ld, int T, int C, const float* w, const float* state, float* out,
@@ -367,6 +414,7 @@ void gate_apply(const float* h, const float* msg, const float* f, const float* g
                 __nv_bfloat16* out, cudaStream_t stream) {
   gate_apply_kernel<<<T, ROW_T, 0, stream>>>(h, msg, f, g, norm_w, reinterpret_cast<uint16_t*>(out));
 }
+
 
 void widen_ids(const int32_t* in, int T, int64_t* out, int32_t negative_as, cudaStream_t stream) {
   widen_kernel<<<(T + 255) / 256, 256, 0, stream>>>(in, T, out, negative_as);
