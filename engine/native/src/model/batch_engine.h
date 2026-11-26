@@ -59,6 +59,7 @@ struct BatchEngineOptions {
   float spec_threshold = 0.f;
   int spec_min = 0;
   bool kv_fp8 = false;             // FP8 E4M3 full-attention caches
+  bool kv_q4 = false;              // Q4_G64 full-attention caches
   bool head_nvfp4 = false;         // NVFP4 unembedding head
   // Batched speculative drafter: "dspark", "dflash2", or "hybrid" (empty: INGINE_BATCH_DRAFT_TYPE, or "dflash2" if
   // dflash2_dir is given, else "dspark").

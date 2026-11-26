@@ -25,28 +25,38 @@ Tensor State::v_ring_at(int ring) const {
   return rm(ptr<char>(v_ring) + std::size_t(ring) * ring_rows * v_ring.ne[1] * HEAD_DIM * 2, DType::BF16, {ring_rows, v_ring.ne[1], HEAD_DIM});
 }
 std::int64_t* State::ring_pos_at(int ring) const { return ptr<std::int64_t>(ring_pos) + std::size_t(ring) * ring_rows; }
-Tensor State::k_full_at(int full) const {
-  const std::size_t es = kv_fp8 ? 1 : 2;
-  return rm(ptr<char>(k_full) + std::size_t(full) * max_ctx * k_full.ne[1] * HEAD_DIM * es, k_full.dtype, {max_ctx, k_full.ne[1], HEAD_DIM});
+namespace {
+Tensor full_at(const Tensor& cache, int full) {
+  return rm(ptr<char>(cache) + std::size_t(full) * cache.nb[3], cache.dtype,
+            {cache.ne[2], cache.ne[1], cache.ne[0]});
 }
-Tensor State::v_full_at(int full) const {
-  const std::size_t es = kv_fp8 ? 1 : 2;
-  return rm(ptr<char>(v_full) + std::size_t(full) * max_ctx * v_full.ne[1] * HEAD_DIM * es, v_full.dtype, {max_ctx, v_full.ne[1], HEAD_DIM});
-}
+}  // namespace
 
-State make_state(int max_ctx, bool kv_fp8, const TpLayout& layout) {
+Tensor State::k_full_at(int full) const { return full_at(k_full, full); }
+Tensor State::v_full_at(int full) const { return full_at(v_full, full); }
+Tensor State::k_full_scale_at(int full) const { return full_at(k_full_scale, full); }
+Tensor State::v_full_scale_at(int full) const { return full_at(v_full_scale, full); }
+
+State make_state(int max_ctx, bool kv_fp8, const TpLayout& layout, bool kv_q4) {
+  if (kv_fp8 && kv_q4) throw std::invalid_argument("--kv-fp8 and --kv-q4 are mutually exclusive");
   // the attention kernel keeps positions in int32 and caps full caches at 2^30 rows
   if (max_ctx < 1 || max_ctx > (1 << 30)) throw std::invalid_argument("max_ctx must be in 1..2^30");
   State st;
   st.max_ctx = max_ctx;
   st.kv_fp8 = kv_fp8;
-  const DType full = kv_fp8 ? DType::FP8_E4M3FN : DType::BF16;
+  st.kv_q4 = kv_q4;
+  const DType full = kv_q4 ? DType::U8 : kv_fp8 ? DType::FP8_E4M3FN : DType::BF16;
+  const int full_dim = kv_q4 ? HEAD_DIM / 2 : HEAD_DIM;
   st.k_ring = zeros(st.storage, DType::BF16, {NUM_SLIDING_VISITS, WINDOW, layout.hkv_local, HEAD_DIM});
   st.v_ring = zeros(st.storage, DType::BF16, {NUM_SLIDING_VISITS, WINDOW, layout.hkv_local, HEAD_DIM});
   st.ring_pos = zeros(st.storage, DType::I64, {NUM_SLIDING_VISITS, WINDOW});
   CUDA_CHECK(cudaMemset(st.ring_pos.data, 0xff, st.storage.back().bytes));  // -1
-  st.k_full = zeros(st.storage, full, {NUM_FULL_VISITS, max_ctx, layout.hkv_local, HEAD_DIM});
-  st.v_full = zeros(st.storage, full, {NUM_FULL_VISITS, max_ctx, layout.hkv_local, HEAD_DIM});
+  st.k_full = zeros(st.storage, full, {NUM_FULL_VISITS, max_ctx, layout.hkv_local, full_dim});
+  st.v_full = zeros(st.storage, full, {NUM_FULL_VISITS, max_ctx, layout.hkv_local, full_dim});
+  if (kv_q4) {
+    st.k_full_scale = zeros(st.storage, DType::FP16, {NUM_FULL_VISITS, max_ctx, layout.hkv_local, 2});
+    st.v_full_scale = zeros(st.storage, DType::FP16, {NUM_FULL_VISITS, max_ctx, layout.hkv_local, 2});
+  }
   st.conv_k = zeros(st.storage, DType::FP32, {NUM_VISITS, CONV_K - 1, layout.kv_dim_local});
   st.conv_v = zeros(st.storage, DType::FP32, {NUM_VISITS, CONV_K - 1, layout.kv_dim_local});
   st.conv_attn = zeros(st.storage, DType::FP32, {NUM_VISITS, CONV_K - 1, HIDDEN});

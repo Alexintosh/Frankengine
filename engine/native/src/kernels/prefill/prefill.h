@@ -79,6 +79,9 @@ struct AttnPrepParams {
   void* k_out = nullptr;           // out [T, local KV heads, 128]: BF16 or FP8 E4M3 (full caches with out_fp8)
   void* v_out = nullptr;
   bool out_fp8 = false;
+  bool out_q4 = false;
+  void* k_scale_out = nullptr;    // Q4: FP16 [T, local KV heads, 2]
+  void* v_scale_out = nullptr;
   // Optional sliding ring destination, written from the same BF16 results as k_out/v_out. Snapshot the
   // incoming ring before launching attn_prep. Only the last min(T, 1024) rows are published.
   __nv_bfloat16* k_ring = nullptr;
@@ -101,6 +104,9 @@ struct AttnParams {
   const void* k = nullptr;           // key rows [L, 8, 128]: bf16, or fp8 e4m3 (kv_fp8)
   const void* v = nullptr;
   bool kv_fp8 = false;
+  bool kv_q4 = false;
+  const void* k_scale = nullptr;    // Q4: FP16 [L, local KV heads, 2]
+  const void* v_scale = nullptr;
   const int* kpos = nullptr;         // positions of the L keys (padded to tiles with -1), or null: key j at j
   const int4* bounds = nullptr;      // key_tile_bounds of kpos (with kpos)
   int L = 0;

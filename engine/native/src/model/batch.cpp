@@ -66,13 +66,19 @@ State BatchState::view(int s) const {
   v.max_ctx = ctx;
   v.kv_fp8 = kv_fp8;
   v.ring_rows = ring_rows;
-  const std::size_t es = kv_fp8 ? 1 : 2;
+  v.kv_q4 = kv_q4;
+  const std::size_t es = dtype_size(k_full.dtype);
   auto at = [](const Tensor& t, std::size_t bytes) { return static_cast<char*>(t.data) + bytes; };
   v.k_ring = rm(at(k_ring, std::size_t(s) * ring_stride() * 2), DType::BF16, {NUM_SLIDING_VISITS, ring_rows, hkv_local, HEAD_DIM});
   v.v_ring = rm(at(v_ring, std::size_t(s) * ring_stride() * 2), DType::BF16, {NUM_SLIDING_VISITS, ring_rows, hkv_local, HEAD_DIM});
   v.ring_pos = rm(at(ring_pos, std::size_t(s) * kpos_stride() * 8), DType::I64, {NUM_SLIDING_VISITS, ring_rows});
-  v.k_full = rm(at(k_full, std::size_t(s) * full_stride() * es), k_full.dtype, {NUM_FULL_VISITS, ctx, hkv_local, HEAD_DIM});
-  v.v_full = rm(at(v_full, std::size_t(s) * full_stride() * es), v_full.dtype, {NUM_FULL_VISITS, ctx, hkv_local, HEAD_DIM});
+  v.k_full = rm(at(k_full, std::size_t(s) * full_stride() * es), k_full.dtype, {NUM_FULL_VISITS, ctx, hkv_local, k_full.ne[0]});
+  v.v_full = rm(at(v_full, std::size_t(s) * full_stride() * es), v_full.dtype, {NUM_FULL_VISITS, ctx, hkv_local, k_full.ne[0]});
+  if (kv_q4) {
+    const std::size_t bytes = std::size_t(s) * full_scale_stride() * sizeof(std::uint16_t);
+    v.k_full_scale = rm(at(k_full_scale, bytes), DType::FP16, {NUM_FULL_VISITS, ctx, hkv_local, 2});
+    v.v_full_scale = rm(at(v_full_scale, bytes), DType::FP16, {NUM_FULL_VISITS, ctx, hkv_local, 2});
+  }
   v.conv_k = rm(at(conv_k, std::size_t(s) * conv_kv_stride() * 4), DType::FP32, {NUM_VISITS, CONV_K - 1, kv_dim_local});
   v.conv_v = rm(at(conv_v, std::size_t(s) * conv_kv_stride() * 4), DType::FP32, {NUM_VISITS, CONV_K - 1, kv_dim_local});
   v.conv_attn = rm(at(conv_attn, std::size_t(s) * conv_h_stride() * 4), DType::FP32, {NUM_VISITS, CONV_K - 1, H});
@@ -81,23 +87,30 @@ State BatchState::view(int s) const {
   return v;
 }
 
-BatchState make_batch_state(int slots, int ctx, bool kv_fp8, const TpLayout& layout) {
+BatchState make_batch_state(int slots, int ctx, bool kv_fp8, const TpLayout& layout, bool kv_q4) {
+  if (kv_fp8 && kv_q4) throw std::invalid_argument("--kv-fp8 and --kv-q4 are mutually exclusive");
   if (slots < 1 || slots > 4096) throw std::invalid_argument("slots must be in 1..4096");
   if (ctx < 2 || ctx > (1 << 20)) throw std::invalid_argument("slot context must be in 2..2^20");
   BatchState b;
   b.slots = slots;
   b.ctx = ctx;
   b.kv_fp8 = kv_fp8;
+  b.kv_q4 = kv_q4;
   b.ring_rows = std::min(ctx, WINDOW);
   b.hkv_local = layout.hkv_local;
   b.kv_dim_local = layout.kv_dim_local;
-  const DType full = kv_fp8 ? DType::FP8_E4M3FN : DType::BF16;
+  const DType full = kv_q4 ? DType::U8 : kv_fp8 ? DType::FP8_E4M3FN : DType::BF16;
+  const int full_dim = kv_q4 ? HEAD_DIM / 2 : HEAD_DIM;
   b.k_ring = zeros(b.storage, DType::BF16, {slots * NUM_SLIDING_VISITS, b.ring_rows, b.hkv_local, HEAD_DIM});
   b.v_ring = zeros(b.storage, DType::BF16, {slots * NUM_SLIDING_VISITS, b.ring_rows, b.hkv_local, HEAD_DIM});
   b.ring_pos = zeros(b.storage, DType::I64, {slots * NUM_SLIDING_VISITS, b.ring_rows});
   CUDA_CHECK(cudaMemset(b.ring_pos.data, 0xff, b.storage.back().bytes));  // -1
-  b.k_full = zeros(b.storage, full, {slots * NUM_FULL_VISITS, ctx, b.hkv_local, HEAD_DIM});
-  b.v_full = zeros(b.storage, full, {slots * NUM_FULL_VISITS, ctx, b.hkv_local, HEAD_DIM});
+  b.k_full = zeros(b.storage, full, {slots * NUM_FULL_VISITS, ctx, b.hkv_local, full_dim});
+  b.v_full = zeros(b.storage, full, {slots * NUM_FULL_VISITS, ctx, b.hkv_local, full_dim});
+  if (kv_q4) {
+    b.k_full_scale = zeros(b.storage, DType::FP16, {slots * NUM_FULL_VISITS, ctx, b.hkv_local, 2});
+    b.v_full_scale = zeros(b.storage, DType::FP16, {slots * NUM_FULL_VISITS, ctx, b.hkv_local, 2});
+  }
   b.conv_k = zeros(b.storage, DType::FP32, {slots * NUM_VISITS, CONV_K - 1, b.kv_dim_local});
   b.conv_v = zeros(b.storage, DType::FP32, {slots * NUM_VISITS, CONV_K - 1, b.kv_dim_local});
   b.conv_attn = zeros(b.storage, DType::FP32, {slots * NUM_VISITS, CONV_K - 1, H});
@@ -482,6 +495,12 @@ void BatchDecoder::run_body(int n, int T, int M, bool verify, std::uint64_t seed
       a.k_cache = s0.k_full_at(fi).data;
       a.v_cache = s0.v_full_at(fi).data;
       a.cache_fp8 = st_.kv_fp8;
+      a.cache_q4 = st_.kv_q4;
+      if (a.cache_q4) {
+        a.k_scale = s0.k_full_scale_at(fi).data;
+        a.v_scale = s0.v_full_scale_at(fi).data;
+        a.scale_stride = st_.full_scale_stride();
+      }
       a.cache_rows = st_.ctx;
       a.kpos = nullptr;
       a.window = 0;

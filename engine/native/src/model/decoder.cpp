@@ -244,6 +244,11 @@ void Decoder::decode_impl(Buffers& b, const std::int64_t* pos, bool history, cud
         a.k_cache = st.k_full_at(fi).data;
         a.v_cache = st.v_full_at(fi).data;
         a.cache_fp8 = st.kv_fp8;
+        a.cache_q4 = st.kv_q4;
+        if (a.cache_q4) {
+          a.k_scale = st.k_full_scale_at(fi).data;
+          a.v_scale = st.v_full_scale_at(fi).data;
+        }
         a.cache_rows = st.max_ctx;
         a.kpos = nullptr;
         a.window = 0;

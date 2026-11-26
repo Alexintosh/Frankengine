@@ -21,6 +21,8 @@
 // lose to the plain argmax by more than --tie-margin (single positions of this model can move by several
 // logits between kernel widths, so one long path is not evidence either way). Prints the gap distribution.
 // N > 1024 covers the sliding-window ring wrap and the drafter's context buckets.
+// --kv-q4 runs the golden comparisons with Q4 caches. --kv-q4-kld runs FP8 and Q4 on the same
+// token paths and compares their full distributions in FP64 (7700 rows by default).
 #include "ingine/generator.h"
 
 #include "core/arena.h"
@@ -37,6 +39,8 @@
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <memory>
+#include <numeric>
 #include <string>
 #include <vector>
 
@@ -61,6 +65,8 @@ struct Args {
   std::string tp_wire;
   bool dense_fp8 = false, head_nvfp4 = false;
   bool generate = false;
+  bool kv_fp8 = false, kv_q4 = false, kv_q4_kld = false;
+  int kld_tokens = 7700;
   int dflash2_max_ctx = 1536;
   std::string draft_type = "dspark", dflash2_dir;
   bool draft_nvfp4 = false;
@@ -83,6 +89,7 @@ void usage() {
       "usage: ingine-validate [--model-dir DIR] [--ablation FILE] [--golden DIR] [--cases SUBSTR] [--generate [--spec] [--generate-tokens N] [--generate-trace FILE]]\n"
       "                       [--max-batch 1..8] [--spec-widths coarse|fine|fine2] [--draft-nvfp4] [--path N [--spec] [--tie-margin X] [--max-gap-rate R]] [--max-kl X] [--max-mean-kl X]\n"
       "                       [--greedy-witness FILE] [--spec-threshold P]\n"
+      "                       [--kv-fp8 | --kv-q4] [--kv-q4-kld] [--kld-tokens N]\n"
       "                       [--min-top1 F] [--dense-fp8] [--head-nvfp4] [--tp-size N] [--tp-rank N] [--tp-wire bf16|fp32|bf16-moe]\n"
       "--cases takes comma-separated name substrings; --ablation defaults to <golden>/ablation.safetensors, the\n"
       "plain-projection file the goldens of the abliterated model were made with\n");
@@ -190,6 +197,107 @@ void run_pieces(const RuntimeOptions& opt, const std::vector<nlohmann::json>& ca
     }
     std::printf("%-22s decode  (%2d steps):     KL mean %.3e max %.3e  top1 %d/%d  max|dlogit| %.4f\n", name.c_str(),
                 steps, steps ? sum_kl / steps : 0.0, max_kl, agree, steps, max_diff);
+  }
+}
+
+// The paths use golden inputs first, then greedy FP8 tokens. Q4 consumes exactly those inputs,
+// including when its argmax differs. Keep at most one model copy resident by spooling FP8 rows.
+void run_kld(RuntimeOptions opt, const std::vector<nlohmann::json>& cases, std::span<const int> budgets,
+             std::vector<double>& divergences, int& top1) {
+  const bool root = opt.tp.rank == 0;
+  std::unique_ptr<std::FILE, decltype(&std::fclose)> reference(root ? std::tmpfile() : nullptr, std::fclose);
+  if (root && !reference) throw std::runtime_error("cannot create temporary FP8 logit file");
+  std::vector<std::vector<int32_t>> paths(cases.size());
+  for (std::size_t i = 0; i < cases.size(); ++i) {
+    if (budgets[i] == 0) continue;
+    const std::size_t need = cases[i].at("prompt_ids").size() + std::size_t(budgets[i]);
+    if (need > (1u << 30)) throw std::invalid_argument("KLD path exceeds maximum context");
+    opt.max_ctx = std::max(opt.max_ctx, int(need));
+    paths[i].resize(budgets[i] - 1);
+  }
+
+  auto logsumexp = [](const std::vector<float>& row, float max) {
+    double sum = 0.0;
+    for (const float v : row) {
+      if (!std::isfinite(v)) throw std::runtime_error("non-finite logits in Q4 KLD comparison");
+      sum += std::exp(double(v) - double(max));
+    }
+    return double(max) + std::log(sum);
+  };
+
+  for (const bool q4 : {false, true}) {
+    opt.kv_fp8 = !q4;
+    opt.kv_q4 = q4;
+    opt.tp.full_logits = true;
+    opt.spec = false;
+    Runtime rt(opt);
+    Prefiller prefill(rt.weights(), rt.ablation(), opt.prefill_chunk, rt.stream(), rt.tp());
+    DeviceBuffer input(std::size_t(opt.prefill_chunk) * sizeof(int32_t));
+    DeviceBuffer logits(root ? UNPADDED_VOCAB * sizeof(float) : 0);
+    DeviceBuffer proposal(rt.tp() ? sizeof(int32_t) : 0);
+    std::vector<float> host(root ? UNPADDED_VOCAB : 0), fp8(root && q4 ? UNPADDED_VOCAB : 0);
+    if (root && q4 && std::fseek(reference.get(), 0, SEEK_SET) != 0)
+      throw std::runtime_error("cannot rewind temporary FP8 logit file");
+    for (std::size_t i = 0; i < cases.size(); ++i) {
+      if (budgets[i] == 0) continue;
+      const auto prompt = cases[i].at("prompt_ids").get<std::vector<int32_t>>();
+      const auto& decode = cases[i].at("decode");
+      if (prompt.empty()) throw std::invalid_argument("KLD requires a non-empty golden prompt");
+      reset_state(rt.state(), rt.stream());
+      for (int start = 0; start < int(prompt.size()); start += opt.prefill_chunk) {
+        const int rows = std::min(opt.prefill_chunk, int(prompt.size()) - start);
+        CUDA_CHECK(cudaMemcpyAsync(input.p, prompt.data() + start, rows * sizeof(int32_t), cudaMemcpyHostToDevice,
+                                   rt.stream()));
+        prefill.run(rt.state(), static_cast<const int32_t*>(input.p), rows, start, static_cast<float*>(logits.p),
+                    nullptr, {}, nullptr, start + rows == int(prompt.size()));
+      }
+      std::printf("%-22s %s KLD path, %d stages\n", cases[i].at("name").get<std::string>().c_str(),
+                  q4 ? "Q4" : "FP8", budgets[i]);
+      std::fflush(stdout);
+      auto& path = paths[i];
+      for (int k = 0; k < budgets[i]; ++k) {
+        const float* device = k == 0 ? static_cast<const float*>(logits.p)
+                                     : rt.decode_logits(path[k - 1], int(prompt.size()) + k - 1);
+        if (root)
+          CUDA_CHECK(cudaMemcpyAsync(host.data(), device, host.size() * sizeof(float), cudaMemcpyDeviceToHost,
+                                     rt.stream()));
+        if (rt.tp()) rt.tp()->wait(rt.stream());
+        else CUDA_CHECK(cudaStreamSynchronize(rt.stream()));
+        int32_t best = 0;
+        if (root) {
+          best = int32_t(std::max_element(host.begin(), host.end()) - host.begin());
+          if (q4) {
+            if (std::fread(fp8.data(), sizeof(float), fp8.size(), reference.get()) != fp8.size())
+              throw std::runtime_error("cannot read temporary FP8 logits");
+            const auto pbest = std::max_element(fp8.begin(), fp8.end());
+            top1 += pbest - fp8.begin() == best;
+            const double lp = logsumexp(fp8, *pbest), lq = logsumexp(host, host[best]);
+            double kl = 0.0;
+            for (std::size_t j = 0; j < fp8.size(); ++j) {
+              const double p = double(fp8[j]) - lp, q = double(host[j]) - lq;
+              kl += std::exp(p) * (p - q);
+            }
+            divergences.push_back(std::max(0.0, kl));
+          } else if (std::fwrite(host.data(), sizeof(float), host.size(), reference.get()) != host.size()) {
+            throw std::runtime_error("cannot write temporary FP8 logits");
+          }
+        }
+        if (q4 || k + 1 == budgets[i]) continue;
+        if (std::size_t(k) < decode.size()) {
+          path[k] = decode[k].at("input_token").get<int32_t>();
+        } else if (rt.tp()) {
+          if (root)
+            CUDA_CHECK(cudaMemcpyAsync(proposal.p, &best, sizeof(best), cudaMemcpyHostToDevice, rt.stream()));
+          rt.tp()->broadcast_proposal(proposal.p, sizeof(best), rt.stream());
+          CUDA_CHECK(cudaMemcpyAsync(&path[k], proposal.p, sizeof(best), cudaMemcpyDeviceToHost, rt.stream()));
+          rt.tp()->wait(rt.stream());
+        } else {
+          path[k] = best;
+        }
+      }
+    }
+    if (root && !q4 && std::fflush(reference.get()) != 0)
+      throw std::runtime_error("cannot flush temporary FP8 logits");
   }
 }
 
@@ -314,11 +422,13 @@ bool score_greedy_witness(const Args& args, TpOptions tp) {
   bool ok = true;
   tp.full_logits = true;
   for (bool kv_fp8 : {false, true}) {
+    if (args.kv_fp8 && !kv_fp8) continue;
     RuntimeOptions opt;
     opt.model_dir = args.model_dir;
     opt.dense_fp8 = args.dense_fp8;
     opt.head_nvfp4 = args.head_nvfp4;
-    opt.kv_fp8 = kv_fp8;
+    opt.kv_fp8 = kv_fp8 && !args.kv_q4;
+    opt.kv_q4 = args.kv_q4;
     opt.tp = tp;
     opt.max_ctx = 0;
     opt.prefill_chunk = 2048;  // same chunk boundaries as the TP benchmark and chat golden
@@ -409,7 +519,13 @@ int main(int argc, char** argv) {
     else if (k == "--tp-rank") a.tp_rank = std::stoi(val());
     else if (k == "--tp-wire") a.tp_wire = val();
     else if (k == "--dense-fp8") a.dense_fp8 = true;
-    else if (k == "--head-nvfp4") a.head_nvfp4 = true;
+    else if (k == "--kv-fp8") a.kv_fp8 = true;
+    else if (k == "--kv-q4") a.kv_q4 = true;
+    else if (k == "--kv-q4-kld") a.kv_q4_kld = true;
+    else if (k == "--kld-tokens") {
+      a.kld_tokens = std::stoi(val());
+      a.kv_q4_kld = true;
+    } else if (k == "--head-nvfp4") a.head_nvfp4 = true;
     else if (k == "--path") a.path_tokens = std::stoi(val());
     else if (k == "--max-batch") a.max_batch = std::stoi(val());
     else if (k == "--tie-margin") a.tie_margin = std::stod(val());
@@ -424,6 +540,10 @@ int main(int argc, char** argv) {
   }
   if (a.ablation.empty()) a.ablation = a.golden / "ablation.safetensors";
   try {
+    if (a.kv_fp8 && a.kv_q4) throw std::invalid_argument("--kv-fp8 and --kv-q4 are mutually exclusive");
+    if (a.kv_q4_kld && (a.kld_tokens < 1 || a.kv_fp8 || a.generate || a.path_tokens > 0 ||
+                        !a.greedy_witness.empty() || !a.logits_dump.empty()))
+      throw std::invalid_argument("Q4 KLD needs a positive stage count and runs as a standalone comparison");
     if (a.max_batch < 1 || a.max_batch > 8 || (a.max_batch > 1 && !a.generate))
       throw std::invalid_argument("--max-batch must be in [1, 8] and requires --generate above 1");
     auto tp = tp_options(a.tp_size, a.tp_rank, a.tp_wire);
@@ -441,6 +561,7 @@ int main(int argc, char** argv) {
     const nlohmann::json manifest = load_json(a.golden / "manifest.json");
     // one runtime per (ablated, kv_fp8) configuration, loaded one at a time
     std::map<std::pair<bool, bool>, std::vector<nlohmann::json>> groups;
+    int case_count = 0;
     for (const auto& c : manifest.at("cases")) {
       const std::string name = c.at("name");
       if (!a.filter.empty()) {
@@ -452,8 +573,15 @@ int main(int argc, char** argv) {
         }
         if (!hit) continue;
       }
-      groups[{c.at("ablated").get<bool>(), c.at("kv_fp8").get<bool>()}].push_back(
-          load_json(a.golden / c.at("file").get<std::string>()));
+      const bool fp8 = c.at("kv_fp8").get<bool>();
+      if (a.kv_fp8 && !fp8) continue;
+      auto& group = groups[{c.at("ablated").get<bool>(), fp8 && !a.kv_q4_kld}];
+      auto golden = load_json(a.golden / c.at("file").get<std::string>());
+      if (a.kv_q4_kld && std::any_of(group.begin(), group.end(), [&](const auto& prior) {
+            return prior.at("prompt_ids") == golden.at("prompt_ids");
+          })) continue;
+      group.push_back(std::move(golden));
+      ++case_count;
     }
     if (groups.empty()) {
       std::printf("no golden cases selected\n");
@@ -461,11 +589,14 @@ int main(int argc, char** argv) {
     }
     Totals tot;
     Gaps gaps;
+    std::vector<double> divergences;
+    int kld_top1 = 0, case_index = 0;
     for (const auto& [key, cases] : groups) {
       RuntimeOptions opt;
       opt.model_dir = a.model_dir;
       opt.ablation = key.first ? a.ablation : fs::path();
-      opt.kv_fp8 = key.second;
+      opt.kv_fp8 = key.second && !a.kv_q4;
+      opt.kv_q4 = a.kv_q4;
       opt.dense_fp8 = a.dense_fp8 || manifest.value("dense_fp8", true);
       opt.head_nvfp4 = a.head_nvfp4;
       opt.tp = tp;
@@ -478,13 +609,31 @@ int main(int argc, char** argv) {
       opt.draft_type = a.draft_type;
       opt.dflash2_max_ctx = a.dflash2_max_ctx;
       opt.dflash2_dir = a.dflash2_dir;
+      if (a.kv_q4_kld) {
+        std::vector<int> budgets(cases.size());
+        for (int& n : budgets) n = a.kld_tokens / case_count + (case_index++ < a.kld_tokens % case_count);
+        if (std::any_of(budgets.begin(), budgets.end(), [](int n) { return n > 0; }))
+          run_kld(opt, cases, budgets, divergences, kld_top1);
+        continue;
+      }
       std::printf("== %s model, %s full-attention KV\n", key.first ? "abliterated" : "original",
-                  key.second ? "FP8" : "BF16");
+                  opt.kv_q4 ? (key.second ? "Q4 / FP8 golden" : "Q4 / BF16 golden") : key.second ? "FP8" : "BF16");
       if (a.path_tokens > 0) run_path(opt, cases, a, tot, gaps);
       else if (a.generate) run_generate(opt, cases, a, tot);
       else run_pieces(opt, cases, tot, logits_dump.is_open() ? &logits_dump : nullptr);
     }
     if (tp.rank != 0) return 0;
+    if (a.kv_q4_kld) {
+      std::sort(divergences.begin(), divergences.end());
+      const std::size_t n = divergences.size();
+      if (n != std::size_t(a.kld_tokens)) throw std::runtime_error("incomplete Q4 KLD comparison");
+      const double mean = std::accumulate(divergences.begin(), divergences.end(), 0.0) / n;
+      const double p95 = divergences[n - n / 20 - 1], max = divergences.back(), top1 = double(kld_top1) / n;
+      const bool ok = mean <= a.max_mean_kl && max <= a.max_kl && top1 >= a.min_top1;
+      std::printf("%s: %zu stages, mean_kl_fp64 %.17g p95_kl_fp64 %.17g max_kl_fp64 %.17g top1_match %.17g (%d/%zu)\n",
+                  ok ? "PASS" : "FAIL", n, mean, p95, max, top1, kld_top1, n);
+      return ok ? 0 : 1;
+    }
     const double top1 = tot.stages ? double(tot.top1) / tot.stages : 0.0;
     const double mean_kl = tot.stages ? tot.sum_kl / tot.stages : 0.0;
     const bool no_kl = a.generate || a.path_tokens > 0;

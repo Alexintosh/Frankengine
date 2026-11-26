@@ -73,7 +73,7 @@ int main(int argc, char** argv) {
   int port = 8003, max_ctx = 65536, max_queue = 4, max_batch = 1, max_model_len = 0, park_mb = -1;
   int batch_ctx = 32768, batch_spec = 0, batch_spec_min = 2;
   double batch_spec_threshold = 0.50;
-  bool engine = false, fake = false, dense_fp8 = false, kv_fp8 = false, spec = false, no_vision = false;
+  bool engine = false, fake = false, dense_fp8 = false, kv_fp8 = false, kv_q4 = false, spec = false, no_vision = false;
   int image_max_tokens = 4096, max_images = 16, max_image_tokens = 32768;
   bool draft_nvfp4 = false, head_nvfp4 = false;
   bool tp_profile = false;
@@ -103,6 +103,7 @@ int main(int argc, char** argv) {
   ap.flag("--spec", "DSpark speculative decoding (mtp.safetensors drafter)", &spec);
   ap.flag("--kv-fp8", "FP8 E4M3 full-attention KV caches (half the memory; needed for 262144 positions on 32 GB)",
           &kv_fp8);
+  ap.flag("--kv-q4", "Q4_G64 INT4 full-attention KV caches", &kv_q4);
   ap.option("--spec-widths", "{coarse,fine,fine2}", "verify widths: 2/4/8, 1..8 or 2..8", &spec_widths, {"coarse", "fine", "fine2"});
   ap.option("--draft-type", "", "Drafter implementation", &draft_type, {"dspark", "dflash2", "hybrid"});
   ap.flag("--dflash2-adaptive", "Choose verify width using DFlash2 selector confidence", &dflash2_adaptive);
@@ -178,6 +179,7 @@ int main(int argc, char** argv) {
   std::signal(SIGPIPE, SIG_IGN);
 
   try {
+    if (kv_fp8 && kv_q4) throw std::invalid_argument("--kv-fp8 and --kv-q4 are mutually exclusive");
     std::unique_ptr<ingine::model::Generator> generator;
     std::optional<ingine::text::ChatFormat> format;
     if (fake) {
@@ -199,6 +201,7 @@ int main(int argc, char** argv) {
       options.batch_draft_type = batch_draft_type;
       options.dense_fp8 = dense_fp8;
       options.kv_fp8 = kv_fp8;
+      options.kv_q4 = kv_q4;
       options.spec = spec;
       options.spec_threshold = float(spec_threshold);
       options.spec_widths = ingine::model::parse_spec_widths(

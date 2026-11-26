@@ -24,9 +24,13 @@ struct DecodeArgs {
   float* conv_k_state = nullptr;    // fp32 [3, hkv*128]
   float* conv_v_state = nullptr;
   bool conv_write = true;
-  void* k_cache = nullptr;          // [rows, hkv, 128] bf16, or float8_e4m3fn (full layers only)
+  void* k_cache = nullptr;          // [rows, hkv, 128] BF16/FP8, or [rows, hkv, 64] packed Q4
   void* v_cache = nullptr;
   bool cache_fp8 = false;
+  bool cache_q4 = false;
+  void* k_scale = nullptr;          // Q4: FP16 [rows, hkv, 2]
+  void* v_scale = nullptr;
+  std::int64_t scale_stride = 0;    // per slot, in FP16 elements
   std::int64_t cache_rows = 0;      // 1024 (sliding) or max_ctx (full), at most 2^30
   std::int64_t* kpos = nullptr;     // sliding: int64 [1024] slot positions (-1 = empty); full: unused
   const std::int64_t* pos = nullptr;  // int64 device, pos[0] = position of the first token
@@ -59,6 +63,8 @@ struct BatchAttnSlot {
   float* conv_v_state;
   std::int64_t* kpos;
   std::int64_t position;
+  void* k_scale = nullptr;
+  void* v_scale = nullptr;
 };
 
 void attn_decode_batch(const DecodeArgs& common, const BatchAttnSlot* slots, int batch, cudaStream_t stream);

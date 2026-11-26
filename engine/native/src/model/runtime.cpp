@@ -16,6 +16,7 @@ namespace {
 constexpr int kMaxWidth = 8;
 
 TpLayout runtime_layout(const RuntimeOptions& options) {
+  if (options.kv_fp8 && options.kv_q4) throw std::invalid_argument("--kv-fp8 and --kv-q4 are mutually exclusive");
   if (options.tp.size != 1 && options.tp.size != 2)
     throw std::invalid_argument("runtime supports TP sizes 1 and 2");
   if (options.tp.size == 2 && options.vision)
@@ -92,6 +93,7 @@ Runtime::Runtime(const RuntimeOptions& options, Weights weights, Ablation ablati
     : options_(options), weights_(std::move(weights)), ablation_(std::move(ablation)) {
   if (options.tp.size != 1 || options.tp.rank != 0)
     throw std::invalid_argument("Runtime over caller-supplied weights requires TP=1");
+  runtime_layout(options);
   if (options.max_ctx < 16) throw std::invalid_argument("max_ctx must be at least 16");
   CUDA_CHECK(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking));
   init();
@@ -105,7 +107,7 @@ void Runtime::init() {
   if (options.batch_spec == 0 && options.max_batch > 1 && options.tp.size > 1 && (!options.tp.serve || options.tp.profile))
     throw std::invalid_argument("TP batch graphs require unprofiled serving mode");
   const auto layout = runtime_layout(options);
-  state_ = make_state(options.max_ctx, options.kv_fp8, layout);
+  state_ = make_state(options.max_ctx, options.kv_fp8, layout, options.kv_q4);
   if (layout.tp_size > 1) tp_ = std::make_unique<TpRuntime>(options);
   decoder_ = std::make_unique<Decoder>(weights_, ablation_, state_, true, nullptr, tp_.get());
   pos_ = DeviceBuffer(sizeof(std::int64_t));
@@ -185,6 +187,10 @@ void Runtime::set_batch_inputs(std::span<const BatchInput> rows) {
       if (const int full = FULL_INDEX[v]; full >= 0) {
         entry.k_cache = state.k_full_at(full).data;
         entry.v_cache = state.v_full_at(full).data;
+        if (state.kv_q4) {
+          entry.k_scale = state.k_full_scale_at(full).data;
+          entry.v_scale = state.v_full_scale_at(full).data;
+        }
         entry.kpos = nullptr;
       } else {
         const int ring = RING_INDEX[v];
@@ -202,7 +208,7 @@ void Runtime::set_batch_inputs(std::span<const BatchInput> rows) {
 void Runtime::init_batch(const TpLayout& layout) {
   decoder_->allocate_batch_workspace(options_.max_batch);
   for (int i = 1; i < options_.max_batch; ++i)
-    extra_slots_.push_back(make_state(options_.max_ctx, options_.kv_fp8, layout));
+    extra_slots_.push_back(make_state(options_.max_ctx, options_.kv_fp8, layout, options_.kv_q4));
   batch_table_ = DeviceBuffer(sizeof(BatchSlotTable));
   host_batch_table_ = MappedHostBuffer(sizeof(BatchSlotTable));
   std::memset(host_batch_table_.data(), 0, sizeof(BatchSlotTable));
@@ -403,31 +409,31 @@ std::size_t Runtime::full_rows_bytes(int n) const {
   if (n < 0 || n > options_.max_ctx)
     throw std::invalid_argument("full_rows_bytes: n = " + std::to_string(n) + " outside [0, max_ctx = " +
                                 std::to_string(options_.max_ctx) + "]");
-  const std::size_t row = state_.k_full.bytes() / NUM_FULL_VISITS / std::size_t(options_.max_ctx);
+  const std::size_t row = state_.k_full.nb[2] + (state_.kv_q4 ? state_.k_full_scale.nb[2] : 0);
   return 2 * std::size_t(NUM_FULL_VISITS) * row * std::size_t(n);
 }
 
 // one 2D copy per cache: NUM_FULL_VISITS rows of n positions, pitch max_ctx positions in the cache, packed in
-// the parked copy (k visits, then v visits)
+// the parked copy (K visits, V visits, then K and V scales for Q4).
 void Runtime::save_full_rows(void* dst, int n) {
-  const std::size_t bytes = full_rows_bytes(n) / 2, width = bytes / NUM_FULL_VISITS;
-  if (n == 0) return;
-  const std::size_t pitch = state_.k_full.bytes() / NUM_FULL_VISITS;
+  if (!full_rows_bytes(n)) return;
   char* p = static_cast<char*>(dst);
-  for (const Tensor* t : {&state_.k_full, &state_.v_full}) {
-    CUDA_CHECK(cudaMemcpy2DAsync(p, width, t->data, pitch, width, NUM_FULL_VISITS, cudaMemcpyDefault, stream_));
-    p += bytes;
+  for (const Tensor* t : {&state_.k_full, &state_.v_full, &state_.k_full_scale, &state_.v_full_scale}) {
+    if (!t->data) continue;
+    const std::size_t width = std::size_t(n) * t->nb[2];
+    CUDA_CHECK(cudaMemcpy2DAsync(p, width, t->data, t->nb[3], width, NUM_FULL_VISITS, cudaMemcpyDefault, stream_));
+    p += width * NUM_FULL_VISITS;
   }
 }
 
 void Runtime::restore_full_rows(const void* src, int n) {
-  const std::size_t bytes = full_rows_bytes(n) / 2, width = bytes / NUM_FULL_VISITS;
-  if (n == 0) return;
-  const std::size_t pitch = state_.k_full.bytes() / NUM_FULL_VISITS;
+  if (!full_rows_bytes(n)) return;
   const char* p = static_cast<const char*>(src);
-  for (const Tensor* t : {&state_.k_full, &state_.v_full}) {
-    CUDA_CHECK(cudaMemcpy2DAsync(t->data, pitch, p, width, width, NUM_FULL_VISITS, cudaMemcpyDefault, stream_));
-    p += bytes;
+  for (const Tensor* t : {&state_.k_full, &state_.v_full, &state_.k_full_scale, &state_.v_full_scale}) {
+    if (!t->data) continue;
+    const std::size_t width = std::size_t(n) * t->nb[2];
+    CUDA_CHECK(cudaMemcpy2DAsync(t->data, t->nb[3], p, width, width, NUM_FULL_VISITS, cudaMemcpyDefault, stream_));
+    p += width * NUM_FULL_VISITS;
   }
 }
 

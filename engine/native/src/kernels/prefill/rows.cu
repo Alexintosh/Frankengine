@@ -3,6 +3,7 @@
 // reference operation by operation (separately rounded products/sums where torch runs separate kernels;
 // divisions by Python scalars as multiplications by the FP32 reciprocal, as torch does).
 #include "kernels/prefill/common.cuh"
+#include "kernels/common/q4_g64.cuh"
 #include "kernels/prefill/prefill.h"
 
 #include <algorithm>
@@ -38,7 +39,7 @@ __device__ __forceinline__ void store_bf16x4(uint16_t* p, const float (&f)[4]) {
 
 // ---- attn_prep: one CTA (8 warps) per token
 
-template <int KvHeads, bool WriteRing>
+template <int KvHeads, bool WriteRing, bool Q4 = false>
 __global__ void __launch_bounds__(256) attn_prep_kernel(const AttnPrepParams p) {
   constexpr int Heads = KvHeads * (kHeads / kKvHeads), KvDim = KvHeads * kHeadDim;
   constexpr int OffRel = 2 * Heads * kHeadDim, OffK = OffRel + Heads * (kRel + 1);
@@ -140,7 +141,16 @@ __global__ void __launch_bounds__(256) attn_prep_kernel(const AttnPrepParams p) 
       for (int q = 0; q < 4; ++q) y[q] = round_bf16(y[q] * r);
     }
     void* dst = kv == 0 ? p.k_out : p.v_out;
-    if (p.out_fp8) {  // State.full_store: saturate to +-448, E4M3 round to nearest even
+    if constexpr (Q4) {
+      const size_t head = size_t(t) * KvHeads + warp;
+      __half scale;
+      const uint16_t bits = q4_g64::pack4(y, scale);
+      static_cast<uint16_t*>(dst)[head * (q4_g64::head_bytes / 2) + lane] = bits;
+      if ((lane & 15) == 0) {
+        auto* scales = static_cast<__half*>(kv == 0 ? p.k_scale_out : p.v_scale_out);
+        scales[head * q4_g64::groups + (lane >> 4)] = scale;
+      }
+    } else if (p.out_fp8) {  // State.full_store: saturate to +-448, E4M3 round to nearest even
       const uint32_t b = uint32_t(f2e4m3(y[0])) | (uint32_t(f2e4m3(y[1])) << 8) | (uint32_t(f2e4m3(y[2])) << 16) |
                          (uint32_t(f2e4m3(y[3])) << 24);
       *reinterpret_cast<uint32_t*>(static_cast<uint8_t*>(dst) + size_t(t) * KvDim + c) = b;
@@ -471,10 +481,13 @@ void attn_prep(const AttnPrepParams& p, cudaStream_t stream) {
   if (p.T <= 0 || !p.proj || !p.q || !p.rel || !p.k_out || !p.v_out || !p.conv_k || !p.conv_v)
     throw std::invalid_argument("attn_prep: missing argument");
   const bool ring = p.k_ring || p.v_ring || p.ring_pos;
+  if (p.out_q4 && (!p.full || p.out_fp8 || !p.k_scale_out || !p.v_scale_out))
+    throw std::invalid_argument("attn_prep: Q4 needs full-attention K/V scale destinations");
   if (ring && (p.full || p.out_fp8 || !p.k_ring || !p.v_ring || !p.ring_pos))
     throw std::invalid_argument("attn_prep: ring needs all BF16 sliding cache destinations");
   auto dispatch = [&]<int KvHeads>() {
-    if (ring) attn_prep_kernel<KvHeads, true><<<p.T, 256, 0, stream>>>(p);
+    if (p.out_q4) attn_prep_kernel<KvHeads, false, true><<<p.T, 256, 0, stream>>>(p);
+    else if (ring) attn_prep_kernel<KvHeads, true><<<p.T, 256, 0, stream>>>(p);
     else attn_prep_kernel<KvHeads, false><<<p.T, 256, 0, stream>>>(p);
   };
   if (p.hkv == kKvHeads) dispatch.template operator()<kKvHeads>();

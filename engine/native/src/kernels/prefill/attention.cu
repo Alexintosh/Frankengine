@@ -20,6 +20,7 @@
 // The fused sliding path uses a single shared K/V tile. Relative bias uses the retired K buffer after
 // Q.K^T, then the next K tile is copied asynchronously while the current P.V runs.
 #include "kernels/prefill/common.cuh"
+#include "kernels/common/q4_g64.cuh"
 #include "kernels/prefill/prefill.h"
 
 #include <cmath>
@@ -78,10 +79,28 @@ struct KvRegs {
   int kp;
 };
 
-template <bool FP8, bool EXPLICIT, int KvHeads>
-__device__ __forceinline__ void load_tile(const AttnParams& p, int g, int j0, KvRegs<FP8>& r) {
+struct Q4Regs {
+  uint4 k, v;
+  float ks, vs;
+};
+static_assert(BK * (D / 32) == NT && sizeof(Smem<false>) <= 101376);
+
+template <bool FP8, bool EXPLICIT, int KvHeads, bool Q4>
+__device__ __forceinline__ void load_tile(const AttnParams& p, int g, int j0, std::conditional_t<Q4, Q4Regs, KvRegs<FP8>>& r) {
   const int tid = threadIdx.x;
-  if constexpr (FP8) {
+  if constexpr (Q4) {
+    const int j = j0 + tid / 4, c = tid % 4;
+    r = {};
+    if (j < p.L) {
+      const size_t head = size_t(j) * KvHeads + g;
+      r.k = __ldg(static_cast<const uint4*>(p.k) + head * 4 + c);
+      r.v = __ldg(static_cast<const uint4*>(p.v) + head * 4 + c);
+      const __half2 ks = __ldg(static_cast<const __half2*>(p.k_scale) + head);
+      const __half2 vs = __ldg(static_cast<const __half2*>(p.v_scale) + head);
+      r.ks = c >= 2 ? __high2float(ks) : __low2float(ks);
+      r.vs = c >= 2 ? __high2float(vs) : __low2float(vs);
+    }
+  } else if constexpr (FP8) {
     const uint8_t* K = static_cast<const uint8_t*>(p.k);
     const uint8_t* V = static_cast<const uint8_t*>(p.v);
 #pragma unroll
@@ -124,10 +143,18 @@ __device__ __forceinline__ uint32_t e4m3x2_to_bf16x2(uint16_t u) {
   return pack_bf16x2(f.x, f.y);
 }
 
-template <bool FP8, bool EXPLICIT>
-__device__ __forceinline__ void store_tile(Smem<false>& s, int buf, const KvRegs<FP8>& r) {
+template <bool FP8, bool EXPLICIT, bool Q4>
+__device__ __forceinline__ void store_tile(Smem<false>& s, int buf, const std::conditional_t<Q4, Q4Regs, KvRegs<FP8>>& r) {
   const int tid = threadIdx.x;
-  if constexpr (FP8) {
+  if constexpr (Q4) {
+    const int row = tid / 4, c = tid % 4;
+    const uint32_t kw[4] = {r.k.x, r.k.y, r.k.z, r.k.w}, vw[4] = {r.v.x, r.v.y, r.v.z, r.v.w};
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      *reinterpret_cast<uint4*>(s.keys(buf) + swz<DCH>(row, 4 * c + i)) = q4_g64::expand8<false>(kw[i], r.ks);
+      *reinterpret_cast<uint4*>(s.values(buf) + swz<DCH>(row, 4 * c + i)) = q4_g64::expand8<true>(vw[i], r.vs);
+    }
+  } else if constexpr (FP8) {
 #pragma unroll
     for (int i = 0; i < r.N; ++i) {
       const int id = tid + i * NT, row = id >> 3, c = id & 7;
@@ -253,7 +280,7 @@ __device__ __forceinline__ void local_scores(Smem<true>& s, const AttnParams& p,
   }
 }
 
-template <bool FP8, bool EXPLICIT, int KvHeads, bool Local>
+template <bool FP8, bool EXPLICIT, int KvHeads, bool Local, bool Q4>
 __global__ void __launch_bounds__(NT, 1) attn_kernel(const AttnParams p) {
   extern __shared__ __align__(128) unsigned char smem_raw[];
   auto& s = *reinterpret_cast<Smem<Local>*>(smem_raw);
@@ -351,15 +378,15 @@ __global__ void __launch_bounds__(NT, 1) attn_kernel(const AttnParams p) {
   for (int i = 0; i < D / 8; ++i) o[i][0] = o[i][1] = o[i][2] = o[i][3] = 0.f;
   float m[2] = {-INFINITY, -INFINITY}, l[2] = {0.f, 0.f};
 
-  KvRegs<FP8> regs;
+  std::conditional_t<Q4, Q4Regs, KvRegs<FP8>> regs;
   if (ntiles > 0) {
     if constexpr (Local) {
       load_local_tile<true, KvHeads>(s, p, g, tile_at(0) * BK);
       load_local_tile<false, KvHeads>(s, p, g, tile_at(0) * BK);
       cp_wait<0>();
     } else {
-      load_tile<FP8, EXPLICIT, KvHeads>(p, g, tile_at(0) * BK, regs);
-      store_tile<FP8, EXPLICIT>(s, 0, regs);
+      load_tile<FP8, EXPLICIT, KvHeads, Q4>(p, g, tile_at(0) * BK, regs);
+      store_tile<FP8, EXPLICIT, Q4>(s, 0, regs);
     }
   }
   __syncthreads();
@@ -369,7 +396,7 @@ __global__ void __launch_bounds__(NT, 1) attn_kernel(const AttnParams p) {
     const int kt = tile_at(i), buf = Local ? 0 : i & 1;
     const bool more = i + 1 < ntiles;
     if constexpr (!Local) {
-      if (more) load_tile<FP8, EXPLICIT, KvHeads>(p, g, tile_at(i + 1) * BK, regs);
+      if (more) load_tile<FP8, EXPLICIT, KvHeads, Q4>(p, g, tile_at(i + 1) * BK, regs);
     }
 
     // tile class (uniform over the CTA)
@@ -415,7 +442,7 @@ __global__ void __launch_bounds__(NT, 1) attn_kernel(const AttnParams p) {
     // stage the next tile now (its buffer was last read before the previous barrier): the conversion and the
     // shared stores overlap the Q.K^T MMAs in flight instead of trailing the P.V MMAs
     if constexpr (!Local) {
-      if (more) store_tile<FP8, EXPLICIT>(s, buf ^ 1, regs);
+      if (more) store_tile<FP8, EXPLICIT, Q4>(s, buf ^ 1, regs);
     }
 
     // ---- scores (log2 units), bias, mask
@@ -536,14 +563,14 @@ __global__ void __launch_bounds__(NT, 1) attn_kernel(const AttnParams p) {
   }
 }
 
-template <bool FP8, bool EXPLICIT, int KvHeads, bool Local = false>
+template <bool FP8, bool EXPLICIT, int KvHeads, bool Local = false, bool Q4 = false>
 void launch(const AttnParams& p, cudaStream_t stream) {
   constexpr int shared_bytes = sizeof(Smem<Local>);
   static const cudaError_t attr =
-      cudaFuncSetAttribute(attn_kernel<FP8, EXPLICIT, KvHeads, Local>, cudaFuncAttributeMaxDynamicSharedMemorySize, shared_bytes);
+      cudaFuncSetAttribute(attn_kernel<FP8, EXPLICIT, KvHeads, Local, Q4>, cudaFuncAttributeMaxDynamicSharedMemorySize, shared_bytes);
   if (attr != cudaSuccess) throw std::runtime_error("prefill attention: shared memory attribute failed");
   const dim3 grid((GQA * p.T + BR - 1) / BR, KvHeads);
-  attn_kernel<FP8, EXPLICIT, KvHeads, Local><<<grid, NT, shared_bytes, stream>>>(p);
+  attn_kernel<FP8, EXPLICIT, KvHeads, Local, Q4><<<grid, NT, shared_bytes, stream>>>(p);
 }
 
 // ---- sliding-visit key rows
@@ -607,8 +634,12 @@ void attention(const AttnParams& p, cudaStream_t stream) {
     throw std::invalid_argument("prefill attention: explicit keys need bounds and at most 64 tiles");
   if (local && (!p.rel_query || !p.rel_proj || !expl || p.kv_fp8 || p.window != kRelExtent))
     throw std::invalid_argument("prefill attention: tiled bias requires explicit BF16 sliding keys");
+  if (p.kv_q4 && (p.kv_fp8 || expl || local || p.window != 0 || !p.k_scale || !p.v_scale))
+    throw std::invalid_argument("prefill attention: Q4 needs implicit full-attention K/V scales");
   auto dispatch = [&]<int KvHeads>() {
-    if (local) {
+    if (p.kv_q4) {
+      launch<false, false, KvHeads, false, true>(p, stream);
+    } else if (local) {
       launch<false, true, KvHeads, true>(p, stream);
     } else if (p.kv_fp8) {
       if (expl) launch<true, true, KvHeads>(p, stream);

@@ -4,6 +4,7 @@
 
 #include "kernels/attn/attn.h"
 #include "kernels/common/l2.cuh"
+#include "kernels/common/q4_g64.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -31,6 +32,11 @@ inline void require(bool ok, const char* what) {
     if (!ok) throw std::invalid_argument(std::string("attn: ") + what);
 }
 
+inline void check_q4(const DecodeArgs& a, bool slot_table = false) {
+    require(!a.cache_q4 || (!a.cache_fp8 && a.window == 0), "Q4 requires full attention and excludes FP8");
+    require(!a.cache_q4 || slot_table || (a.k_scale && a.v_scale), "Q4 requires K/V scales");
+}
+
 // The DecodeArgs contract both launchers share (the workspace size is checked by each).
 inline void check_args(const DecodeArgs& a) {
     require(a.window == 0 || a.window == WIN, "window must be 0 (full layer) or 1024 (sliding layer)");
@@ -42,6 +48,8 @@ inline void check_args(const DecodeArgs& a) {
                 a.k_cache && a.v_cache && a.pos && a.workspace && a.out,
             "null argument");
     require(full || !a.cache_fp8, "float8_e4m3fn caches are supported on full layers (window = 0) only");
+    check_q4(a);
+    require(!a.cache_q4 || (a.batch == 1 && !a.slots) || a.scale_stride > 0, "Q4 needs the slot scale stride");
     // device positions and loop bounds are int32; 2^30 leaves headroom for the tile strides
     require(a.cache_rows >= 1 && a.cache_rows <= (int64_t(1) << 30), "caches hold 1..2^30 positions");
     if (!full) {
@@ -160,6 +168,24 @@ __device__ __forceinline__ uint2 ld_kv8(const void* ptr, std::uint64_t pol) {
     else
         asm volatile("ld.global.L1::no_allocate.v2.u32 {%0,%1}, [%2];" : "=r"(v.x), "=r"(v.y) : "l"(ptr) : "memory");
     return v;
+}
+
+__device__ __forceinline__ uint32_t ld_kv4(const void* ptr, std::uint64_t pol) {
+    uint32_t v;
+    if constexpr (l2::hinted<KV_L2>)
+        asm volatile("ld.global.L1::no_allocate.L2::cache_hint.u32 %0, [%1], %2;"
+                     : "=r"(v) : "l"(ptr), "l"(pol) : "memory");
+    else
+        asm volatile("ld.global.L1::no_allocate.u32 %0, [%1];" : "=r"(v) : "l"(ptr) : "memory");
+    return v;
+}
+
+template <bool Values>
+__device__ __forceinline__ uint4 load_q4(const void* data, const void* scales, size_t head, int c8, std::uint64_t pol) {
+    const uint32_t bits = ld_kv4(static_cast<const uint8_t*>(data) + head * q4_g64::head_bytes + c8 * 4, pol);
+    const uint32_t both = ld_kv4(static_cast<const uint32_t*>(scales) + head, pol);
+    const float scale = __half2float(__ushort_as_half(static_cast<uint16_t>(both >> (c8 >= 8 ? 16 : 0))));
+    return q4_g64::expand8<Values>(bits, scale);
 }
 
 __device__ __forceinline__ long long ld_s64(const long long* ptr) {

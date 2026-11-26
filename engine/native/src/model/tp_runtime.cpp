@@ -98,7 +98,8 @@ comm::CommPlan make_plan(const RuntimeOptions& options) {
       (std::uint64_t(options.max_ctx) << 17) | (std::uint64_t(options.prefill_chunk) << 5) |
       (options.spec << 4) | (options.head_nvfp4 << 3) | (options.dense_fp8 << 2) | (options.kv_fp8 << 1) | options.tp.full_logits;
   const std::uint64_t wire_hash = bf16 ? 0x200b : options.tp.wire == TpWire::Bf16Moe ? 0x200c : 0x200f;
-  const std::uint64_t layout_hash = wire_hash | (std::uint64_t(options.max_batch - 1) << 16);
+  const std::uint64_t layout_hash = wire_hash | (std::uint64_t(options.kv_q4) << 15) |
+                                    (std::uint64_t(options.max_batch - 1) << 16);
   const auto gather_bytes = kVocabularyShard * sizeof(float) * options.max_batch;
   const bool dflash2_active = options.draft_type != "dspark";
   const bool shard_dflash2 = dflash2_active && dflash2_shard_backbone();

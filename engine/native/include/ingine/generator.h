@@ -135,6 +135,7 @@ struct RuntimeOptions {
   // than 2048 for 0.38 GB more scratch; results differ between chunk sizes only by rounding.
   int prefill_chunk = 3072;
   bool dense_fp8 = true, kv_fp8 = false, spec = false;
+  bool kv_q4 = false;  // Q4_G64 full-attention caches
   float spec_threshold = 0.8f;
   SpecWidths spec_widths = SpecWidths::Coarse;
   std::string draft_type = "dspark";

@@ -49,6 +49,25 @@ const RuntimeOptions& without_spec(const RuntimeOptions& options) {
   return options;
 }
 
+// Copy committed rows between cache views that may have different context capacities.
+void copy_full_prefix(const State& src, const State& dst, int len, cudaStream_t stream) {
+  if (len == 0) return;
+  auto copy = [&](const Tensor& from, const Tensor& to) {
+    const std::size_t bytes = std::size_t(len) * from.nb[2];
+    for (int visit = 0; visit < NUM_FULL_VISITS; ++visit) {
+      const auto* src_rows = ptr<const char>(from) + std::size_t(visit) * from.nb[3];
+      auto* dst_rows = ptr<char>(to) + std::size_t(visit) * to.nb[3];
+      CUDA_CHECK(cudaMemcpyAsync(dst_rows, src_rows, bytes, cudaMemcpyDeviceToDevice, stream));
+    }
+  };
+  copy(src.k_full, dst.k_full);
+  copy(src.v_full, dst.v_full);
+  if (src.kv_q4) {
+    copy(src.k_full_scale, dst.k_full_scale);
+    copy(src.v_full_scale, dst.v_full_scale);
+  }
+}
+
 class EngineGenerator final : public Generator {
  public:
   explicit EngineGenerator(const RuntimeOptions& options)
@@ -139,7 +158,7 @@ class EngineGenerator final : public Generator {
         batch_unembed_ = load_head(options.model_dir, /*dense_fp8=*/false, /*head_nvfp4=*/false, stream,
                                    batch_head_storage_, layout).dense;
       }
-      batch_state_ = make_batch_state(options.max_batch, options.batch_ctx, options.kv_fp8, layout);
+      batch_state_ = make_batch_state(options.max_batch, options.batch_ctx, options.kv_fp8, layout, options.kv_q4);
       batch_dec_ = std::make_unique<BatchDecoder>(rt_.weights(), rt_.ablation(), batch_state_, options.max_batch,
                                                   stream, 8, rt_.tp(),
                                                   batch_unembed_.w.data ? &batch_unembed_ : nullptr);
@@ -396,15 +415,7 @@ class EngineGenerator final : public Generator {
     copy_same(src.conv_v, dst.conv_v);
     copy_same(src.conv_attn, dst.conv_attn);
     copy_same(src.conv_mlp, dst.conv_mlp);
-    if (len > 0) {
-      const std::size_t es = options_.kv_fp8 ? 1 : 2;
-      const std::size_t row_bytes = std::size_t(batch_state_.kv_dim_local) * es;
-      const std::size_t copy_bytes = std::size_t(len) * row_bytes;
-      for (int fi = 0; fi < NUM_FULL_VISITS; ++fi) {
-        CUDA_CHECK(cudaMemcpyAsync(dst.k_full_at(fi).data, src.k_full_at(fi).data, copy_bytes, cudaMemcpyDeviceToDevice, stream));
-        CUDA_CHECK(cudaMemcpyAsync(dst.v_full_at(fi).data, src.v_full_at(fi).data, copy_bytes, cudaMemcpyDeviceToDevice, stream));
-      }
-    }
+    copy_full_prefix(src, dst, len, stream);
     batch_spec_histories_.at(std::size_t(slot)) = tokens_in_state_;
     reset_batch_spec_cost(slot);
     if (batch_drafter_) batch_drafter_->reset_slot(slot);
@@ -440,12 +451,7 @@ class EngineGenerator final : public Generator {
     copy_same(src.conv_v, dst.conv_v);
     copy_same(src.conv_attn, dst.conv_attn);
     copy_same(src.conv_mlp, dst.conv_mlp);
-    const std::size_t es = options_.kv_fp8 ? 1 : 2;
-    const std::size_t copy_bytes = std::size_t(len) * std::size_t(batch_state_.kv_dim_local) * es;
-    for (int fi = 0; fi < NUM_FULL_VISITS; ++fi) {
-      CUDA_CHECK(cudaMemcpyAsync(dst.k_full_at(fi).data, src.k_full_at(fi).data, copy_bytes, cudaMemcpyDeviceToDevice, stream));
-      CUDA_CHECK(cudaMemcpyAsync(dst.v_full_at(fi).data, src.v_full_at(fi).data, copy_bytes, cudaMemcpyDeviceToDevice, stream));
-    }
+    copy_full_prefix(src, dst, len, stream);
     batch_spec_histories_.at(std::size_t(dst_slot)) = src_hist;
     reset_batch_spec_cost(dst_slot);
     if (batch_drafter_) batch_drafter_->clone_slot(src_slot, dst_slot, len);

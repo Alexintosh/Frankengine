@@ -336,9 +336,19 @@ void Prefiller::run(State& st, const std::int32_t* tokens, int T, int pos0, floa
     at.hkv = layout_.hkv_local;
     if (layer.full) {
       const int fi = FULL_INDEX[v];
-      const std::size_t es = st.kv_fp8 ? 1 : 2, off = std::size_t(pos0) * kv * es;
-      void* kc = st.k_full_at(fi).data;
-      void* vc = st.v_full_at(fi).data;
+      const Tensor k = st.k_full_at(fi), value = st.v_full_at(fi);
+      const std::size_t off = std::size_t(pos0) * k.nb[2];
+      void* kc = k.data;
+      void* vc = value.data;
+      if (st.kv_q4) {
+        const Tensor ks = st.k_full_scale_at(fi), vs = st.v_full_scale_at(fi);
+        const std::size_t scale_off = std::size_t(pos0) * ks.nb[2];
+        ap.out_q4 = at.kv_q4 = true;
+        ap.k_scale_out = ptr<char>(ks) + scale_off;
+        ap.v_scale_out = ptr<char>(vs) + scale_off;
+        at.k_scale = ks.data;
+        at.v_scale = vs.data;
+      }
       ap.k_out = static_cast<char*>(kc) + off, ap.v_out = static_cast<char*>(vc) + off, ap.out_fp8 = st.kv_fp8;
       pk::attn_prep(ap, s);
       at.k = kc, at.v = vc, at.kv_fp8 = st.kv_fp8, at.kpos = nullptr, at.bounds = nullptr, at.L = pos0 + T;

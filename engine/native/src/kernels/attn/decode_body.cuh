@@ -5,14 +5,18 @@
                   OFF_SINK = layout.activation_offset(model::SEG_SINK), OFF_K = layout.activation_offset(model::SEG_K),
                   OFF_V = layout.activation_offset(model::SEG_V), OFF_KDYN = layout.activation_offset(model::SEG_K_DYN),
                   OFF_VDYN = layout.activation_offset(model::SEG_V_DYN);
-    static_assert(FULL || !F8, "FP8 caches are full-layer only");
+    static_assert(FULL || (!F8 && !Q4), "quantized caches are full-layer only");
+    static_assert(!F8 || !Q4);
     using CT = std::conditional_t<F8, __nv_fp8_storage_t, __nv_bfloat16>;  // cache element
     using KV = std::conditional_t<F8, uint2, uint4>;                        // 8 dims of a cache row
     constexpr int KW = 8, ROWS = GQA * M;  // KW: key-slice warps of the M = 1 path
-    using L = Smem<CS, M, F8>;
+    using L = Smem<CS, M, F8, Q4>;
     constexpr int OD = L::OD;
     extern __shared__ __align__(16) float sm[];
     __nv_bfloat16(*s_nkv)[M][D] = reinterpret_cast<__nv_bfloat16(*)[M][D]>(sm + L::NKV);
+
+    auto* const new_q4 = reinterpret_cast<uint16_t*>(reinterpret_cast<char*>(sm) + L::Q4_PACKED);
+    auto* const new_scale = reinterpret_cast<__half*>(reinterpret_cast<char*>(sm) + L::Q4_SCALE);
 
     const int g = blockIdx.y, rank = blockIdx.x;  // cluster = the CS blocks of KV head g
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, half = lane >> 4, c = lane & 15;
@@ -54,7 +58,11 @@
             b.kp[u] = -1;
             if (j < old_end) {
                 const size_t off = (size_t(j) * HKV + g) * D + c * 8;
-                if constexpr (F8) {
+                if constexpr (Q4) {
+                    const size_t head = size_t(j) * HKV + g;
+                    b.k[u] = detail::load_q4<false>(p.k_cache, p.k_scale, head, c, kvpol);
+                    b.v[u] = detail::load_q4<true>(p.v_cache, p.v_scale, head, c, kvpol);
+                } else if constexpr (F8) {
                     b.k[u] = ld_kv8(kc + off, kvpol);
                     b.v[u] = ld_kv8(vc + off, kvpol);
                 } else {
@@ -97,9 +105,19 @@
         for (int i = tid; i < KT * 2 * (D / 8); i += NT) {
             const int key = i / (2 * (D / 8)), kv = (i / (D / 8)) % 2, ch = i % (D / 8), j = base + key;
             const bool ok = j < L_old;
-            cp16z(reinterpret_cast<float*>(kvs + kv_off(st, key, kv, ch)),
-                  reinterpret_cast<const float*>((kv ? vc : kc) + (size_t(ok ? j : 0) * HKV + g) * D + ch * 8), ok,
-                  kvpol);
+            if constexpr (Q4) {
+                uint4 packed{};
+                if (ok) {
+                    const size_t head = size_t(j) * HKV + g;
+                    packed = kv ? detail::load_q4<true>(p.v_cache, p.v_scale, head, ch, kvpol)
+                                : detail::load_q4<false>(p.k_cache, p.k_scale, head, ch, kvpol);
+                }
+                *reinterpret_cast<uint4*>(kvs + kv_off(st, key, kv, ch)) = packed;
+            } else {
+                cp16z(reinterpret_cast<float*>(kvs + kv_off(st, key, kv, ch)),
+                      reinterpret_cast<const float*>((kv ? vc : kc) + (size_t(ok ? j : 0) * HKV + g) * D + ch * 8), ok,
+                      kvpol);
+            }
         }
         if constexpr (!FULL) {
             for (int i = tid; i < KT; i += NT)  // low word of the int64 position
@@ -316,7 +334,20 @@
 #pragma unroll
                 for (int e = 0; e < 4; ++e) y[e] = e4m3r(bf16r(y[e]));
             }
-            const uint2 v = make_uint2(pack2(y[0], y[1]), pack2(y[2], y[3]));
+            uint2 v;
+            if constexpr (Q4) {
+#pragma unroll
+                for (int e = 0; e < 4; ++e) y[e] = bf16r(y[e]);
+                __half scale;
+                const uint16_t bits = q4_g64::pack4(y, scale);
+                new_q4[pr * (D / 4) + lane] = bits;
+                if ((lane & 15) == 0) new_scale[pr * q4_g64::groups + (lane >> 4)] = scale;
+                const float f = __half2float(scale);
+                v = kv ? make_uint2(q4_g64::expand_pair<true>(bits, 0, f), q4_g64::expand_pair<true>(bits, 2, f))
+                       : make_uint2(q4_g64::expand_pair<false>(bits, 0, f), q4_g64::expand_pair<false>(bits, 2, f));
+            } else {
+                v = make_uint2(pack2(y[0], y[1]), pack2(y[2], y[3]));
+            }
             reinterpret_cast<uint2*>(&s_nkv[kv][m][0])[lane] = v;
         }
         __syncthreads();
@@ -386,7 +417,17 @@
             float vf[8];
             // a masked key's value may be anything (an unused cache slot): keep NaN/Inf out of 0 * v
             using V = std::decay_t<decltype(b.v[0])>;
-            unpack8(valid[u] ? b.v[u] : V{}, vf);
+            if constexpr (Q4) {
+                const uint4 bits = valid[u] ? b.v[u] : V{};
+                const uint32_t pairs[4] = {bits.x, bits.y, bits.z, bits.w};
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    vf[2 * i] = __half2float(__ushort_as_half(static_cast<uint16_t>(pairs[i])));
+                    vf[2 * i + 1] = __half2float(__ushort_as_half(static_cast<uint16_t>(pairs[i] >> 16)));
+                }
+            } else {
+                unpack8(valid[u] ? b.v[u] : V{}, vf);
+            }
 #pragma unroll
             for (int i = 0; i < GQA; ++i) {
                 const float pu = exp2f(s[u][i] - mrun[i]);
@@ -698,7 +739,7 @@
                 const int key = i / (2 * (D / 8)), kv = (i / (D / 8)) % 2, ch = i % (D / 8);
                 uint4 u = make_uint4(0u, 0u, 0u, 0u);
                 if (key < M) u = reinterpret_cast<const uint4*>(&s_nkv[kv][key][0])[ch];
-                if (kv) u = make_uint4(to_half(u.x), to_half(u.y), to_half(u.z), to_half(u.w));
+                if (!Q4 && kv) u = make_uint4(to_half(u.x), to_half(u.y), to_half(u.z), to_half(u.w));
                 uint4* dst = F8 ? reinterpret_cast<uint4*>(wv + (kv ? 0 : 32 * D) + roff(key, ch))
                                 : reinterpret_cast<uint4*>(kvs + kv_off(1, key, kv, ch));
                 *dst = u;
@@ -726,7 +767,7 @@
             int st = 0;
             for (int base = rank * KT; base < L_old; base += CS * KT, st ^= 1) {
                 asm volatile("cp.async.wait_group 0;" ::: "memory");  // tile `base` (the only one in flight)
-                convert_v(st);
+                if constexpr (!Q4) convert_v(st);
                 __syncthreads();  // tile landed for everyone; the previous tile's P V is done
                 if (base + CS * KT < L_old) issue(st ^ 1, base + CS * KT);
                 consume([&](int key, int ch) { return kvs + kv_off(st, key, 0, ch); },
@@ -796,15 +837,23 @@
         for (int idx = tid; idx < 2 * M * 16; idx += NT) {  // new K/V rows
             const int kv = idx / (M * 16), m = (idx / 16) % M, c8 = idx % 16;
             const int row = FULL ? p0 + m : (p0 + m) & (WIN - 1);
-            const uint4 u = reinterpret_cast<const uint4*>(&s_nkv[kv][m][0])[c8];
-            CT* const dst = (kv ? vc : kc) + (size_t(row) * HKV + g) * D;
-            if constexpr (F8) {  // exact: the values are E4M3 already
+            const size_t head = size_t(row) * HKV + g;
+            if constexpr (Q4) {
+                auto* dst = static_cast<uint32_t*>(kv ? p.v_cache : p.k_cache);
+                auto* scales = static_cast<__half*>(kv ? p.v_scale : p.k_scale);
+                const int pr = kv * M + m;
+                dst[head * (D / 8) + c8] = reinterpret_cast<const uint32_t*>(new_q4)[pr * (D / 8) + c8];
+                if (c8 < q4_g64::groups)
+                    scales[head * q4_g64::groups + c8] = new_scale[pr * q4_g64::groups + c8];
+            } else if constexpr (F8) {  // exact: the values are E4M3 already
                 float f[8];
-                unpack8(u, f);
-                reinterpret_cast<uint2*>(dst)[c8] = make_uint2(pack_e4m3x2(f[0], f[1]) | pack_e4m3x2(f[2], f[3]) << 16,
+                unpack8(reinterpret_cast<const uint4*>(&s_nkv[kv][m][0])[c8], f);
+                auto* dst = reinterpret_cast<uint2*>((kv ? vc : kc) + head * D);
+                dst[c8] = make_uint2(pack_e4m3x2(f[0], f[1]) | pack_e4m3x2(f[2], f[3]) << 16,
                                                                pack_e4m3x2(f[4], f[5]) | pack_e4m3x2(f[6], f[7]) << 16);
             } else {
-                reinterpret_cast<uint4*>(dst)[c8] = u;
+                auto* dst = reinterpret_cast<uint4*>((kv ? vc : kc) + head * D);
+                dst[c8] = reinterpret_cast<const uint4*>(&s_nkv[kv][m][0])[c8];
             }
         }
         for (int idx = tid; idx < 3 * 2 * D; idx += NT) {  // conv states of this head's channels

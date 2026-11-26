@@ -29,11 +29,12 @@ namespace ingine::model {
 // rows, conv states. Slot s's memory is slot 0's plus s times the slot stride of each tensor.
 struct BatchState {
   int slots = 0, ctx = 0, ring_rows = 0;
-  bool kv_fp8 = false;
+  bool kv_fp8 = false, kv_q4 = false;
   int hkv_local = KV_HEADS, kv_dim_local = KV_DIM;
   Tensor k_ring, v_ring;       // bf16 [slots * 40, ring_rows, 8, 128]
   Tensor ring_pos;             // int64 [slots * 40, ring_rows], -1 = empty
-  Tensor k_full, v_full;       // bf16 or fp8 e4m3 [slots * 8, ctx, 8, 128]
+  Tensor k_full, v_full;       // [slots * full visits, ctx, local KV heads, 128 (BF16/FP8) or 64 (Q4)]
+  Tensor k_full_scale, v_full_scale;  // Q4 only: FP16 [slots * full visits, ctx, local KV heads, 2]
   Tensor conv_k, conv_v;       // fp32 [slots * 48, 3, 1024]
   Tensor conv_attn, conv_mlp;  // fp32 [slots * 48, 3, H]
   std::vector<DeviceBuffer> storage;
@@ -41,7 +42,8 @@ struct BatchState {
   // slot strides, in elements
   std::int64_t ring_stride() const { return std::int64_t(NUM_SLIDING_VISITS) * ring_rows * kv_dim_local; }
   std::int64_t kpos_stride() const { return std::int64_t(NUM_SLIDING_VISITS) * ring_rows; }
-  std::int64_t full_stride() const { return std::int64_t(NUM_FULL_VISITS) * ctx * kv_dim_local; }
+  std::int64_t full_stride() const { return std::int64_t(NUM_FULL_VISITS) * ctx * hkv_local * k_full.ne[0]; }
+  std::int64_t full_scale_stride() const { return std::int64_t(NUM_FULL_VISITS) * ctx * hkv_local * 2; }
   std::int64_t conv_kv_stride() const { return std::int64_t(NUM_VISITS) * (CONV_K - 1) * kv_dim_local; }
   std::int64_t conv_h_stride() const { return std::int64_t(NUM_VISITS) * (CONV_K - 1) * HIDDEN; }
   std::size_t device_bytes() const;
@@ -50,7 +52,7 @@ struct BatchState {
   State view(int s) const;
 };
 
-BatchState make_batch_state(int slots, int ctx, bool kv_fp8, const TpLayout& layout = TpLayout{});
+BatchState make_batch_state(int slots, int ctx, bool kv_fp8, const TpLayout& layout = TpLayout{}, bool kv_q4 = false);
 // model.State.reset for one slot: ring positions -1, conv states 0. Stream-ordered.
 void reset_slot(BatchState& st, int s, cudaStream_t stream);
 

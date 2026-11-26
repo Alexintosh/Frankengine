@@ -142,7 +142,7 @@ int main(int argc, char** argv) {
   int tp_size = 0, tp_rank = -1, prefill_chunk = 0;
   std::string tp_wire;
   bool tp_profile = false, cold_prefill = false;
-  bool dense_fp8 = false, kv_fp8 = false, spec = false, head_nvfp4 = false;
+  bool dense_fp8 = false, kv_fp8 = false, kv_q4 = false, spec = false, head_nvfp4 = false;
   bool draft_nvfp4 = false;
   std::string spec_widths = "coarse";
   bool spec_timing = false;
@@ -171,6 +171,7 @@ int main(int argc, char** argv) {
   ap.flag("--dense-fp8", "", &dense_fp8);
   ap.flag("--head-nvfp4", "Packed NVFP4 unembedding", &head_nvfp4);
   ap.flag("--kv-fp8", "FP8 full-attention KV caches", &kv_fp8);
+  ap.flag("--kv-q4", "Q4_G64 INT4 full-attention KV caches", &kv_q4);
   ap.flag("--spec", "DSpark speculative decoding", &spec);
   ap.option("--spec-widths", "{coarse,fine,fine2}", "verify widths: 2/4/8, 1..8 or 2..8", &spec_widths, {"coarse", "fine", "fine2"});
   ap.option("--draft-type", "", "Drafter implementation", &draft_type, {"dspark", "dflash2", "hybrid"});
@@ -194,6 +195,7 @@ int main(int argc, char** argv) {
   ap.parse(argc, argv);
 
   try {
+    if (kv_fp8 && kv_q4) throw std::invalid_argument("--kv-fp8 and --kv-q4 are mutually exclusive");
     using Clock = std::chrono::steady_clock;
     cudaFree(nullptr);  // create the context before measuring the model's memory
     size_t free0 = 0, total = 0;
@@ -214,6 +216,7 @@ int main(int argc, char** argv) {
     options.dense_fp8 = dense_fp8;
     options.head_nvfp4 = head_nvfp4;
     options.kv_fp8 = kv_fp8;
+    options.kv_q4 = kv_q4;
     options.spec = spec;
     options.spec_threshold = float(spec_threshold);
     options.spec_widths = ingine::model::parse_spec_widths(

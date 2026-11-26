@@ -57,7 +57,7 @@ int main(int argc, char** argv) {
   int seed = 1, tp_size = 0, tp_rank = -1;
   std::string tp_wire, batch_draft_type, dflash2_dir;
   int dflash2_max_ctx = 6144;
-  bool reference = false, ignore_eos = false, kv_fp8 = false, head_nvfp4 = false, accept_all = false;
+  bool reference = false, ignore_eos = false, kv_fp8 = false, kv_q4 = false, head_nvfp4 = false, accept_all = false;
 
   ingine::serve::ArgParser ap("ingine-batch-bench", "Many requests at once: aggregate decode throughput on one GPU.");
   ap.option("--model-dir", "", "", &model_dir);
@@ -77,6 +77,7 @@ int main(int argc, char** argv) {
   ap.option("--out", "", "write every request's output tokens and text to FILE (JSON)", &out_file);
   ap.flag("--ignore-eos", "always generate --tokens tokens", &ignore_eos);
   ap.flag("--kv-fp8", "FP8 full-attention caches", &kv_fp8);
+  ap.flag("--kv-q4", "Q4_G64 INT4 full-attention KV caches", &kv_q4);
   ap.flag("--head-nvfp4", "NVFP4 unembedding head", &head_nvfp4);
   ap.flag("--reference", "the same prompts one at a time through the single-request Generator", &reference);
   ap.option("--forced", "",
@@ -107,6 +108,7 @@ int main(int argc, char** argv) {
   }
 
   try {
+    if (kv_fp8 && kv_q4) throw std::invalid_argument("--kv-fp8 and --kv-q4 are mutually exclusive");
     namespace m = ingine::model;
     std::vector<std::string> prompts;
     {
@@ -189,6 +191,7 @@ int main(int argc, char** argv) {
       o.max_ctx = ctx;
       o.dense_fp8 = false;
       o.kv_fp8 = kv_fp8;
+      o.kv_q4 = kv_q4;
     o.tp = m::tp_options(ap.given("--tp-size") ? std::optional<int>(tp_size) : std::nullopt,
                          ap.given("--tp-rank") ? std::optional<int>(tp_rank) : std::nullopt, tp_wire);
       o.spec = false;
@@ -226,6 +229,7 @@ int main(int argc, char** argv) {
       options.prefill_chunk = prefill_chunk;
       options.spec = spec;
       options.kv_fp8 = kv_fp8;
+      options.kv_q4 = kv_q4;
       options.head_nvfp4 = head_nvfp4;
       options.spec_trace = spec_trace;
       options.spec_threshold = float(spec_threshold);
@@ -315,7 +319,7 @@ int main(int argc, char** argv) {
       CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
       m::Weights w = m::load_weights(model_dir, /*dense_fp8=*/false, stream, head_nvfp4);
       m::Ablation abl = m::load_ablation(ablation);
-      m::BatchState st = m::make_batch_state(slots, ctx, kv_fp8);
+      m::BatchState st = m::make_batch_state(slots, ctx, kv_fp8, m::TpLayout{}, kv_q4);
       m::Prefiller pf(w, abl, prefill_chunk, stream);
       m::BatchDecoder dec(w, abl, st, seqs, stream, spec + 1);
       if (!forced_file.empty()) dec.keep_logits(true);  // the misses' margins

@@ -49,7 +49,7 @@ Ablation load_ablation(const std::filesystem::path& path);  // empty path: Ablat
 HeadWeights load_head(const std::filesystem::path& model_dir, bool dense_fp8, bool head_nvfp4, cudaStream_t stream,
                       std::vector<DeviceBuffer>& storage, const TpLayout& tp = TpLayout{});
 
-State make_state(int max_ctx, bool kv_fp8, const TpLayout& layout = TpLayout{});
+State make_state(int max_ctx, bool kv_fp8, const TpLayout& layout = TpLayout{}, bool kv_q4 = false);
 Buffers make_buffers(int m, const TpLayout& tp = TpLayout{}, bool full_logits = false, bool mixed = false);
 
 // model.State.reset: ring_pos = -1, conv states = 0, length = 0 (caches keep their contents).

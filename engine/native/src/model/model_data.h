@@ -225,10 +225,11 @@ struct Ablation {
 struct State {
   int max_ctx = 0;
   int ring_rows = WINDOW;
-  bool kv_fp8 = false;
+  bool kv_fp8 = false, kv_q4 = false;
   Tensor k_ring, v_ring;      // bf16 [40, 1024, local KV heads, 128] (sliding visits, RING_INDEX)
   Tensor ring_pos;            // int64 [40, 1024], absolute position per slot, -1 = empty
-  Tensor k_full, v_full;      // bf16 or fp8 e4m3 [8, max_ctx, local KV heads, 128] (full visits, FULL_INDEX)
+  Tensor k_full, v_full;      // [full visits, max_ctx, local KV heads, 128 (BF16/FP8) or 64 (Q4)]
+  Tensor k_full_scale, v_full_scale;  // Q4 only: FP16 [full visits, max_ctx, local KV heads, 2]
   Tensor conv_k, conv_v;      // fp32 [48, 3, local KV channels] previous 3 inputs (oldest first)
   Tensor conv_attn, conv_mlp; // fp32 [48, 3, H]
   int length = 0;             // tokens in the context (host copy; decode steps do not advance it)
@@ -241,6 +242,8 @@ struct State {
   std::int64_t* ring_pos_at(int ring) const;
   Tensor k_full_at(int full) const;
   Tensor v_full_at(int full) const;
+  Tensor k_full_scale_at(int full) const;
+  Tensor v_full_scale_at(int full) const;
   float* conv_k_at(int v) const { return ptr<float>(conv_k) + std::size_t(v) * 3 * conv_k.ne[0]; }
   float* conv_v_at(int v) const { return ptr<float>(conv_v) + std::size_t(v) * 3 * conv_v.ne[0]; }
   float* conv_attn_at(int v) const { return ptr<float>(conv_attn) + std::size_t(v) * 3 * HIDDEN; }

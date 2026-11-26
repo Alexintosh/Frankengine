@@ -115,6 +115,8 @@ struct Params {
     float* conv_v;
     void* k_cache;  // __nv_bfloat16, or E4M3 bytes (F8)
     void* v_cache;
+    void* k_scale;
+    void* v_scale;
     long long* kpos;
     const long long* pos;
     int* counter;               // [batch][CNT]
@@ -123,7 +125,7 @@ struct Params {
     __nv_bfloat16* out;
     const int* slots;
     const int* rows;  // ragged rows [batch + 1] (null: M per sequence)
-    long long cache_stride, kpos_stride, conv_stride;
+    long long cache_stride, kpos_stride, conv_stride, scale_stride;
     int zero;  // 0 at run time, opaque to the compiler (fenced griddepcontrol.wait)
     int conv_write;  // write the advanced conv states
 };
@@ -141,7 +143,7 @@ __device__ __forceinline__ void split_half2(float a, float b, uint32_t& hi, uint
 }
 
 // RAG: ragged rows (p.rows); without, every per-sequence row bound folds to the compile-time M
-template <int HKV_L, int M, bool FULL, bool F8, bool RAG>
+template <int HKV_L, int M, bool FULL, bool F8, bool RAG, bool Q4 = false>
 __global__ void __launch_bounds__(NT, 4) attn_batch_kernel(const Params p) {
     constexpr int HQ_L = HKV_L * GQA;
     constexpr int CONV_C_L = HKV_L * D;
@@ -152,7 +154,8 @@ __global__ void __launch_bounds__(NT, 4) attn_batch_kernel(const Params p) {
     constexpr int OFF_V_L = OFF_K_L + HKV_L * D;
     constexpr int OFF_KDYN_L = OFF_V_L + HKV_L * D;
     constexpr int OFF_VDYN_L = OFF_KDYN_L + HKV_L * 4;
-    static_assert(FULL || !F8, "FP8 caches are full-layer only");
+    static_assert(FULL || (!F8 && !Q4), "quantized caches are full-layer only");
+    static_assert(!F8 || !Q4);
     using CT = std::conditional_t<F8, __nv_fp8_storage_t, __nv_bfloat16>;  // cache element
     using L = Lay<M, F8>;
     constexpr int ROWS = L::ROWS, MT = L::MT, KT = L::KT, NSTG = L::NSTG;
@@ -171,8 +174,16 @@ __global__ void __launch_bounds__(NT, 4) attn_batch_kernel(const Params p) {
     const int R = p.R;
     // this sequence's slot: the slot table is written before the step, never by the kernels before this one
     const long long slot = p.slots ? (long long)p.slots[z] : (long long)z;
-    CT* const kc = static_cast<CT*>(p.k_cache) + slot * p.cache_stride;
-    CT* const vc = static_cast<CT*>(p.v_cache) + slot * p.cache_stride;
+    using Cache = std::conditional_t<Q4, uint8_t, CT>;
+    Cache* const kc = static_cast<Cache*>(p.k_cache) + slot * p.cache_stride;
+    Cache* const vc = static_cast<Cache*>(p.v_cache) + slot * p.cache_stride;
+    __half* const ks = Q4 ? static_cast<__half*>(p.k_scale) + slot * p.scale_stride : nullptr;
+    __half* const vs = Q4 ? static_cast<__half*>(p.v_scale) + slot * p.scale_stride : nullptr;
+    // Q4 widens one tile at a time. The second BF16 tile's region keeps the packed
+    // rows the owner produces until the end of attention.
+    static_assert(2 * M * (q4_g64::head_bytes + q4_g64::groups * sizeof(__half)) <= L::T16);
+    auto* const new_q4 = reinterpret_cast<uint16_t*>(smem + L::T16);
+    auto* const new_scale = reinterpret_cast<__half*>(new_q4 + 2 * M * (D / 4));
     long long* const kpos_z = p.kpos ? p.kpos + slot * p.kpos_stride : nullptr;
     int* const counter_z = p.counter + size_t(z) * CNT;
 
@@ -282,7 +293,7 @@ __global__ void __launch_bounds__(NT, 4) attn_batch_kernel(const Params p) {
             for (int c = 0; c < NC; ++c) {
                 const int j = kb + ckey(c);
                 const bool ok = j < end;
-                const CT* const src = (ckv(c) ? vc : kc) + (size_t(ok ? j : 0) * HKV_L + g) * D + cch * CE;
+                const Cache* const src = (ckv(c) ? vc : kc) + (size_t(ok ? j : 0) * HKV_L + g) * D + cch * CE;
                 cp16z(cdst(c, st), reinterpret_cast<const float*>(src), ok, kvpol);
             }
             if constexpr (!FULL) {  // low word of the int64 position, keys 8 (warp / 2) ..
@@ -295,15 +306,16 @@ __global__ void __launch_bounds__(NT, 4) attn_batch_kernel(const Params p) {
 #pragma unroll
             for (int c = 0; c < NC; ++c) {
                 const int key = ckey(c), kv = ckv(c), m = key < mb ? key : 0;
-                const CT* const src =
-                    defer ? reinterpret_cast<const CT*>(p.nkv + ((size_t(z * HKV_L + g) * 2 + kv) * M + m) * D)
+                const Cache* const src =
+                    defer ? reinterpret_cast<const Cache*>(p.nkv + ((size_t(z * HKV_L + g) * 2 + kv) * M + m) * D)
                           : (kv ? vc : kc) + (size_t(FULL ? p0 + m : (p0 + m) & (WIN - 1)) * HKV_L + g) * D;
                 cp16z(cdst(c, st), reinterpret_cast<const float*>(src + cch * CE), key < mb, kvpol);
             }
         }
         asm volatile("cp.async.commit_group;" ::: "memory");
     };
-    for (int t = 0; t < NSTG; ++t) issue(t, false);
+    if constexpr (!Q4)
+        for (int t = 0; t < NSTG; ++t) issue(t, false);
     // the own keys' tile is among those: it goes out after the prologue, in a group of its own
     const bool late = s == 0 && ntile < NSTG;
 
@@ -439,20 +451,30 @@ __global__ void __launch_bounds__(NT, 4) attn_batch_kernel(const Params p) {
 #pragma unroll
                 for (int e = 0; e < 4; ++e) v[e] = e4m3r(bf16r(v[e]));
             }
-            const uint2 u = make_uint2(pack2(v[0], v[1]), pack2(v[2], v[3]));
-            if (defer) {
-                __stcg(reinterpret_cast<uint2*>(p.nkv + ((size_t(z * HKV_L + g) * 2 + kv) * M + m) * D + 4 * lane), u);
+            if constexpr (Q4) {
+#pragma unroll
+                for (int e = 0; e < 4; ++e) v[e] = bf16r(v[e]);
+                const int pr = kv * M + m;
+                __half scale;
+                new_q4[pr * (D / 4) + lane] = q4_g64::pack4(v, scale);
+                if ((lane & 15) == 0) new_scale[pr * q4_g64::groups + (lane >> 4)] = scale;
             } else {
-                const int row = FULL ? p0 + m : (p0 + m) & (WIN - 1);
-                CT* const dst = (kv ? vc : kc) + (size_t(row) * HKV_L + g) * D + 4 * lane;
-                if constexpr (F8) __stcg(reinterpret_cast<uint32_t*>(dst), pack_e4m3x2(v[0], v[1]) | pack_e4m3x2(v[2], v[3]) << 16);
-                else __stcg(reinterpret_cast<uint2*>(dst), u);
+                const uint2 u = make_uint2(pack2(v[0], v[1]), pack2(v[2], v[3]));
+                if (defer) {
+                    __stcg(reinterpret_cast<uint2*>(p.nkv + ((size_t(z * HKV_L + g) * 2 + kv) * M + m) * D + 4 * lane), u);
+                } else {
+                    const int row = FULL ? p0 + m : (p0 + m) & (WIN - 1);
+                    CT* const dst = (kv ? vc : kc) + (size_t(row) * HKV_L + g) * D + 4 * lane;
+                    if constexpr (F8) __stcg(reinterpret_cast<uint32_t*>(dst), pack_e4m3x2(v[0], v[1]) | pack_e4m3x2(v[2], v[3]) << 16);
+                    else __stcg(reinterpret_cast<uint2*>(dst), u);
+                }
             }
         }
         if (!FULL && !defer && g == 0 && kv == 0 && lane < mb) kpos_z[(p0 + lane) & (WIN - 1)] = p0 + lane;
     }
     __syncthreads();
-    if (late) issue(ntile, true);
+    if constexpr (!Q4)
+        if (late) issue(ntile, true);
     // dependents may launch (they wait for this grid's completion before reading its output)
     asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
 
@@ -621,9 +643,29 @@ __global__ void __launch_bounds__(NT, 4) attn_batch_kernel(const Params p) {
     for (int t = 0; t < nt; ++t) {
         const int st = t % NSTG;
         rwv = win_load(t + 1);
-        // this thread's part of tile t; with the own keys' late group: everything
-        if (late) asm volatile("cp.async.wait_all;" ::: "memory");
-        else asm volatile("cp.async.wait_group %0;" ::"n"(NSTG - 1) : "memory");
+        if constexpr (Q4) {
+#pragma unroll
+            for (int c = 0; c < NC; ++c) {
+                const int key = ckey(c), kv = ckv(c), j = begin + t * KT + key;
+                uint4 u{};
+                if (t == ntile) {
+                    if (key < mb) {
+                        const int pr = kv * M + key;
+                        const uint32_t bits = reinterpret_cast<const uint32_t*>(new_q4)[pr * (D / 8) + cch];
+                        const float scale = __half2float(new_scale[pr * q4_g64::groups + (cch >= 8)]);
+                        u = kv ? q4_g64::expand8<true>(bits, scale) : q4_g64::expand8<false>(bits, scale);
+                    }
+                } else if (j < end) {
+                    const size_t head = size_t(j) * HKV_L + g;
+                    u = kv ? load_q4<true>(vc, vs, head, cch, kvpol) : load_q4<false>(kc, ks, head, cch, kvpol);
+                }
+                *reinterpret_cast<uint4*>(stg + toff(key, kv, cch)) = u;
+            }
+        } else {
+            // This thread's part of tile t, including the late group for the own keys.
+            if (late) asm volatile("cp.async.wait_all;" ::: "memory");
+            else asm volatile("cp.async.wait_group %0;" ::"n"(NSTG - 1) : "memory");
+        }
         if constexpr (F8) {  // this thread's E4M3 chunks -> K bf16, V fp16 (exact) in the 16-bit tile
 #pragma unroll
             for (int c = 0; c < NC; ++c) {
@@ -642,7 +684,7 @@ __global__ void __launch_bounds__(NT, 4) attn_batch_kernel(const Params p) {
                 }
             }
             issue(t + NSTG, true);  // its raw chunks are widened (full layers: no kpos)
-        } else {  // this thread's V chunks to fp16
+        } else if constexpr (!Q4) {  // this thread's V chunks to fp16
 #pragma unroll
             for (int c = 2; c < NC; ++c) {
                 uint4* const q = reinterpret_cast<uint4*>(cdst(c, st));
@@ -651,7 +693,7 @@ __global__ void __launch_bounds__(NT, 4) attn_batch_kernel(const Params p) {
             }
         }
         __syncthreads();  // the warp's copies are visible to it; every warp is done with the previous exchange
-        const __nv_bfloat16* const tile = stg + (F8 ? 0 : st * (L::T16 / 2));
+        const __nv_bfloat16* const tile = stg + (F8 || Q4 ? 0 : st * (L::T16 / 2));
 #pragma unroll
         for (int mt = 0; mt < MT; ++mt) {
             if (mt * 16 >= rb) break;
@@ -659,12 +701,28 @@ __global__ void __launch_bounds__(NT, 4) attn_batch_kernel(const Params p) {
             consume(tile, mt, st, t == ntile, begin + t * KT, wbase(t));
         }
         win_store(rwv);  // every warp is past its bias of tile t
-        if constexpr (!F8) {
+        if constexpr (Q4) {
+            __syncthreads();  // the single expanded tile can now be overwritten
+        } else if constexpr (!F8) {
             __syncwarp();  // the warp is done with its part of the stage
             issue(t + NSTG, true);
         }
     }
-    asm volatile("cp.async.wait_all;" ::: "memory");
+    if constexpr (Q4) {
+        if (s == 0) {
+            for (int i = tid; i < 2 * mb * (D / 8); i += NT) {
+                const int kv = i / (mb * (D / 8)), m = (i / (D / 8)) % mb, c8 = i % (D / 8);
+                const int pr = kv * M + m;
+                const size_t head = size_t(p0 + m) * HKV_L + g;
+                auto* dst = reinterpret_cast<uint32_t*>(kv ? vc : kc);
+                __half* const scale = kv ? vs : ks;
+                __stcg(dst + head * (D / 8) + c8, reinterpret_cast<const uint32_t*>(new_q4)[pr * (D / 8) + c8]);
+                if (c8 < q4_g64::groups) scale[head * q4_g64::groups + c8] = new_scale[pr * q4_g64::groups + c8];
+            }
+        }
+    } else {
+        asm volatile("cp.async.wait_all;" ::: "memory");
+    }
 
     // ---- output: bf16(bf16(o / (sum + e^sink)) * sigmoid(gate)) for rows 3 t + h, head 3 g + h, from the merged
     // (max, sum, o) of the row (log2 domain); the gates are fetched first, all in flight together
@@ -826,38 +884,39 @@ struct Kernel {
     int smem;
 };
 
-template <int HKV_L, int M, bool FULL, bool F8, bool RAG>
+template <int HKV_L, int M, bool FULL, bool F8, bool RAG, bool Q4 = false>
 Kernel kernel_of() {
     static const Kernel k = [] {
-        const KernelFn f = attn_batch_kernel<HKV_L, M, FULL, F8, RAG>;
+        const KernelFn f = attn_batch_kernel<HKV_L, M, FULL, F8, RAG, Q4>;
         CUDA_CHECK(cudaFuncSetAttribute(f, cudaFuncAttributeMaxDynamicSharedMemorySize, Lay<M, F8>::BYTES));
         return Kernel{f, Lay<M, F8>::BYTES};
     }();
     return k;
 }
 
-template <int HKV_L, bool FULL, bool F8, bool RAG>
+template <int HKV_L, bool FULL, bool F8, bool RAG, bool Q4 = false>
 Kernel select_m(int M) {
     switch (M) {
-        case 1: return kernel_of<HKV_L, 1, FULL, F8, RAG>();
-        case 2: return kernel_of<HKV_L, 2, FULL, F8, RAG>();
-        case 3: return kernel_of<HKV_L, 3, FULL, F8, RAG>();
-        case 4: return kernel_of<HKV_L, 4, FULL, F8, RAG>();
-        case 5: return kernel_of<HKV_L, 5, FULL, F8, RAG>();
-        case 6: return kernel_of<HKV_L, 6, FULL, F8, RAG>();
-        case 7: return kernel_of<HKV_L, 7, FULL, F8, RAG>();
-        default: return kernel_of<HKV_L, 8, FULL, F8, RAG>();
+        case 1: return kernel_of<HKV_L, 1, FULL, F8, RAG, Q4>();
+        case 2: return kernel_of<HKV_L, 2, FULL, F8, RAG, Q4>();
+        case 3: return kernel_of<HKV_L, 3, FULL, F8, RAG, Q4>();
+        case 4: return kernel_of<HKV_L, 4, FULL, F8, RAG, Q4>();
+        case 5: return kernel_of<HKV_L, 5, FULL, F8, RAG, Q4>();
+        case 6: return kernel_of<HKV_L, 6, FULL, F8, RAG, Q4>();
+        case 7: return kernel_of<HKV_L, 7, FULL, F8, RAG, Q4>();
+        default: return kernel_of<HKV_L, 8, FULL, F8, RAG, Q4>();
     }
 }
 
-template <int HKV_L, bool FULL, bool F8 = false>
+template <int HKV_L, bool FULL, bool F8 = false, bool Q4 = false>
 Kernel select_one(int M, bool ragged) {
-    return ragged ? select_m<HKV_L, FULL, F8, true>(M) : select_m<HKV_L, FULL, F8, false>(M);
+    return ragged ? select_m<HKV_L, FULL, F8, true, Q4>(M) : select_m<HKV_L, FULL, F8, false, Q4>(M);
 }
 
 template <int HKV_L>
-Kernel select_hkv(int M, bool full, bool f8, bool rag) {
+Kernel select_hkv(int M, bool full, bool f8, bool q4, bool rag) {
     if (!full) return select_one<HKV_L, false, false>(M, rag);
+    if (q4) return select_one<HKV_L, true, false, true>(M, rag);
     return f8 ? select_one<HKV_L, true, true>(M, rag) : select_one<HKV_L, true, false>(M, rag);
 }
 
@@ -872,8 +931,8 @@ int sm_count() {
 }
 
 // splits per (sequence, KV head) without the cache-size cap: as many as keep every block resident at once
-Kernel select(int hkv, int M, bool full, bool f8, bool rag) {
-    return hkv == 4 ? select_hkv<4>(M, full, f8, rag) : select_hkv<8>(M, full, f8, rag);
+Kernel select(int hkv, int M, bool full, bool f8, bool q4, bool rag) {
+    return hkv == 4 ? select_hkv<4>(M, full, f8, q4, rag) : select_hkv<8>(M, full, f8, q4, rag);
 }
 
 int max_splits(int batch, int hkv) {
@@ -926,6 +985,8 @@ void attn_decode_batched(const DecodeArgs& a, cudaStream_t stream) {
     p.conv_v = a.conv_v_state;
     p.k_cache = a.k_cache;
     p.v_cache = a.v_cache;
+    p.k_scale = a.k_scale;
+    p.v_scale = a.v_scale;
     p.kpos = full ? nullptr : reinterpret_cast<long long*>(a.kpos);
     p.pos = reinterpret_cast<const long long*>(a.pos);
     // Keep persistent zero-reset split counters at [0, cb) and place transient nkv/part buffers at the top of the
@@ -938,10 +999,11 @@ void attn_decode_batched(const DecodeArgs& a, cudaStream_t stream) {
     p.slots = a.slots;
     p.rows = a.rows;
     p.cache_stride = a.cache_stride;
+    p.scale_stride = a.scale_stride;
     p.kpos_stride = a.kpos_stride;
     p.conv_stride = a.conv_stride;
     const bool rag = a.rows != nullptr;
-    const Kernel k = select(a.hkv, M, full, a.cache_fp8, rag);
+    const Kernel k = select(a.hkv, M, full, a.cache_fp8, a.cache_q4, rag);
     // programmatic dependent launch (the kernel waits with griddepcontrol.wait before touching anything an
     // earlier kernel may write; a no-op without PDL)
     cudaLaunchAttribute attr{};
