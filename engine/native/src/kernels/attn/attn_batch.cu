@@ -441,12 +441,12 @@ __global__ void __launch_bounds__(NT, 4) attn_batch_kernel(const Params p) {
             }
             const uint2 u = make_uint2(pack2(v[0], v[1]), pack2(v[2], v[3]));
             if (defer) {
-                reinterpret_cast<uint2*>(p.nkv + ((size_t(z * HKV_L + g) * 2 + kv) * M + m) * D + 4 * lane)[0] = u;
+                __stcg(reinterpret_cast<uint2*>(p.nkv + ((size_t(z * HKV_L + g) * 2 + kv) * M + m) * D + 4 * lane), u);
             } else {
                 const int row = FULL ? p0 + m : (p0 + m) & (WIN - 1);
                 CT* const dst = (kv ? vc : kc) + (size_t(row) * HKV_L + g) * D + 4 * lane;
-                if constexpr (F8) *reinterpret_cast<uint32_t*>(dst) = pack_e4m3x2(v[0], v[1]) | pack_e4m3x2(v[2], v[3]) << 16;
-                else *reinterpret_cast<uint2*>(dst) = u;
+                if constexpr (F8) __stcg(reinterpret_cast<uint32_t*>(dst), pack_e4m3x2(v[0], v[1]) | pack_e4m3x2(v[2], v[3]) << 16);
+                else __stcg(reinterpret_cast<uint2*>(dst), u);
             }
         }
         if (!FULL && !defer && g == 0 && kv == 0 && lane < mb) kpos_z[(p0 + lane) & (WIN - 1)] = p0 + lane;
@@ -905,8 +905,9 @@ void attn_decode_batched(const DecodeArgs& a, cudaStream_t stream) {
     require(a.hkv == 8 || a.hkv == 4, "hkv must be 8 or 4");
     const int M = a.M, S = batched_splits(a.batch, a.cache_rows, a.hkv);
     const size_t cb = ws_counter_bytes(a.batch), nb = ws_nkv_bytes(M, a.batch, a.hkv);
-    require(a.workspace_size >= cb + nb + ws_part_bytes(M, size_t(a.batch) * S, a.hkv),
-            "workspace too small: need workspace_bytes(M, batch)");
+    const size_t pb = ws_part_bytes(M, size_t(a.batch) * S, a.hkv);
+    const size_t end = a.workspace_size & ~size_t(63);
+    require(end >= cb + nb + pb, "workspace too small: need workspace_bytes(M, batch)");
     require(S <= 65535, "too many key splits");
 
     Params p{};
@@ -927,10 +928,12 @@ void attn_decode_batched(const DecodeArgs& a, cudaStream_t stream) {
     p.v_cache = a.v_cache;
     p.kpos = full ? nullptr : reinterpret_cast<long long*>(a.kpos);
     p.pos = reinterpret_cast<const long long*>(a.pos);
+    // Keep persistent zero-reset split counters at [0, cb) and place transient nkv/part buffers at the top of the
+    // workspace so a smaller dynamic batch never overwrites the zeroed counters of higher sequence indices z >= batch.
     char* const ws = static_cast<char*>(a.workspace);
     p.counter = reinterpret_cast<int*>(ws);
-    p.nkv = reinterpret_cast<__nv_bfloat16*>(ws + cb);
-    p.part = reinterpret_cast<float*>(ws + cb + nb);
+    p.nkv = reinterpret_cast<__nv_bfloat16*>(ws + end - pb - nb);
+    p.part = reinterpret_cast<float*>(ws + end - pb);
     p.out = a.out;
     p.slots = a.slots;
     p.rows = a.rows;

@@ -323,6 +323,80 @@ std::vector<int64_t> ring(const std::string& kind, int& p0) {
   return kpos;
 }
 
+
+// Regression test: dynamic batch size growth (batch=2 followed by batch=6 with nact > 1)
+// must never overwrite zero-initialized split-K counters of higher sequence indices z >= batch.
+bool test_dynamic_batch_workspace(Rng& rng) {
+  constexpr int max_batch = 8, max_m = 5, hkv = 4, hq = hkv * 3, c_local = hkv * D;
+  constexpr int R = 8664 * hkv / 8;
+  constexpr int p0 = 600, ctx = 1024;
+  DeviceArray<uint8_t> ws(attn::workspace_bytes_batched(max_m, max_batch, hkv));
+  INGINE_TEST_CUDA(cudaMemset(ws.get(), 0, ws.count));
+
+  std::vector<float> q_scale(hq * D, 1.0f), r_scale(hq * DREL, 1.0f);
+  std::vector<float> rel_proj(DREL * EXT, 0.0f), kconv(4 * c_local, 0.0f), vconv(4 * c_local, 0.0f);
+  std::vector<__nv_bfloat16> proj(size_t(max_batch) * max_m * R);
+  for (auto& x : proj) x = __float2bfloat16_rn(float(rng.normal() * 0.25));
+  std::vector<__nv_bfloat16> kc(size_t(max_batch) * ctx * c_local), vc(size_t(max_batch) * ctx * c_local);
+  for (size_t i = 0; i < kc.size(); ++i) {
+    kc[i] = __float2bfloat16_rn(float(rng.normal() * 0.1));
+    vc[i] = __float2bfloat16_rn(float(rng.normal() * 0.1));
+  }
+  std::vector<float> ck(size_t(max_batch) * 3 * c_local, 0.0f), cv(size_t(max_batch) * 3 * c_local, 0.0f);
+  std::vector<int64_t> pos(max_batch, p0);
+  std::vector<int> slots(max_batch);
+  for (int i = 0; i < max_batch; ++i) slots[i] = i;
+
+  DeviceArray<float> d_qs(q_scale), d_rs(r_scale), d_rp(rel_proj), d_kw(kconv), d_vw(vconv);
+  DeviceArray<float> d_ck(ck), d_cv(cv);
+  DeviceArray<__nv_bfloat16> d_proj(proj), d_kc(kc), d_vc(vc);
+  DeviceArray<__nv_bfloat16> d_out_fresh(size_t(max_batch) * max_m * hq * D);
+  DeviceArray<__nv_bfloat16> d_out_after(size_t(max_batch) * max_m * hq * D);
+  DeviceArray<int64_t> d_pos(pos);
+  DeviceArray<int> d_slots(slots);
+
+  auto make_args = [&](int batch, __nv_bfloat16* out_ptr) {
+    attn::DecodeArgs a{};
+    a.proj16 = d_proj.get();
+    a.conv_write = false;
+    a.M = max_m;
+    a.hkv = hkv;
+    a.batch = batch;
+    a.q_scale = d_qs.get(); a.r_scale = d_rs.get(); a.rel_proj = d_rp.get();
+    a.k_conv = d_kw.get(); a.v_conv = d_vw.get();
+    a.conv_k_state = d_ck.get(); a.conv_v_state = d_cv.get();
+    a.k_cache = d_kc.get(); a.v_cache = d_vc.get();
+    a.cache_fp8 = false; a.cache_rows = ctx; a.window = 0; a.log_scaling = true;
+    a.pos = d_pos.get(); a.slots = d_slots.get();
+    a.cache_stride = int64_t(ctx) * c_local;
+    a.conv_stride = int64_t(3) * c_local;
+    a.workspace = ws.get(); a.workspace_size = ws.count;
+    a.out = out_ptr;
+    return a;
+  };
+
+  // Reference: batch=6 on a pristine zeroed workspace
+  INGINE_TEST_CUDA(cudaMemset(d_out_fresh.get(), 0x5a, d_out_fresh.count * sizeof(__nv_bfloat16)));
+  attn::attn_decode(make_args(6, d_out_fresh.get()), g_stream);
+  INGINE_TEST_CUDA(cudaStreamSynchronize(g_stream));
+  const auto ref = d_out_fresh.download();
+
+  // Trigger: run batch=2 (nact > 1) on same workspace, then batch=6 into sentinel-filled output
+  attn::attn_decode(make_args(2, d_out_after.get()), g_stream);
+  INGINE_TEST_CUDA(cudaMemset(d_out_after.get(), 0x5a, d_out_after.count * sizeof(__nv_bfloat16)));
+  attn::attn_decode(make_args(6, d_out_after.get()), g_stream);
+  INGINE_TEST_CUDA(cudaStreamSynchronize(g_stream));
+  const auto got = d_out_after.download();
+
+  int bad = 0;
+  for (size_t i = 0; i < size_t(6) * max_m * hq * D; ++i) {
+    if (__bfloat16_as_ushort(got[i]) != __bfloat16_as_ushort(ref[i])) ++bad;
+  }
+  std::printf("%s dynamic-batch workspace (batch=2 -> batch=6, hkv=4, p0=600): mismatched=%d\n",
+              bad == 0 ? "PASS" : "FAIL", bad);
+  return bad == 0;
+}
+
 }  // namespace
 
 int main() {
@@ -359,6 +433,7 @@ int main() {
     c.name = "full fp8 p0=4637 M=" + std::to_string(M);
     ok &= run(rng, c);
   }
+  ok &= test_dynamic_batch_workspace(rng);
   INGINE_TEST_CUDA(cudaStreamDestroy(g_stream));
   std::printf("%s\n", ok ? "ALL PASS" : "SOME FAILED");
   return ok ? 0 : 1;
