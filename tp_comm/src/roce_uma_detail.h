@@ -17,6 +17,10 @@ constexpr unsigned kRails = 2;
 constexpr unsigned kHeaderBytes = 64;
 constexpr unsigned kTinyBytes = 256;
 constexpr unsigned kControlAlignment = 128;
+constexpr std::uint32_t kLargeThresholdBytesF32 = 1u << 20;    // 1 MiB: empirically optimal 1-CTA->48-CTA crossover on 2-node Dual-Spark FP32
+constexpr std::uint32_t kLargeThresholdBytesBf16 = 512u << 10; // 512 KiB: empirically optimal 1-CTA->48-CTA crossover on 2-node Dual-Spark BF16
+constexpr std::uint32_t kBulkPipeThresholdBytes = 8u << 20;    // 8 MiB: pipelined K=4 bulk RDMA wins cleanly on 9.44 MiB BF16 & 18.87 MiB FP32 prefill
+constexpr unsigned kMaxBulkSlices = 16;
 
 inline void cuda_check(cudaError_t error, const char* operation) {
     if (error != cudaSuccess)
@@ -80,6 +84,7 @@ struct Operation {
     std::uint64_t stride = 0;
     Kind kind;
     std::uint8_t root = 0;
+    std::uint8_t slices = 1;
 };
 
 struct WireHeader {
@@ -95,7 +100,8 @@ struct WireHeader {
     std::uint8_t src_rank;
     std::uint8_t rail;
     std::uint8_t slot;
-    std::uint8_t reserved[7];
+    std::uint8_t slices;
+    std::uint8_t reserved[6];
 };
 static_assert(sizeof(WireHeader) == kHeaderBytes);
 
@@ -120,6 +126,8 @@ struct SharedControl {
     RxNotice consumed;
     EpochWord host_failed;
     EpochWord gpu_failed;
+    EpochWord bulk_tx_slice;  // (epoch << 8) | packed_slices  (GPU -> host proxy)
+    EpochWord bulk_rx_slice;  // (epoch << 8) | arrived_slices (host proxy -> GPU)
 };
 
 struct Buffers {
@@ -157,12 +165,26 @@ INKLING_HOST_DEVICE inline unsigned slot_for(std::uint64_t epoch) {
     return static_cast<unsigned>(epoch % kSlots);
 }
 
+INKLING_HOST_DEVICE inline Stripe slice_of(std::uint32_t rail_bytes, unsigned slice, unsigned slices) {
+    if (slices <= 1) return {0, rail_bytes};
+    const std::uint32_t chunk = ((rail_bytes / slices) + 15u) & ~15u;
+    const std::uint32_t offset = slice * chunk;
+    if (offset >= rail_bytes) return {rail_bytes, 0};
+    const std::uint32_t end =
+        (slice + 1 == slices || offset + chunk > rail_bytes) ? rail_bytes : (offset + chunk);
+    return {offset, end - offset};
+}
+
+INKLING_HOST_DEVICE inline std::uint64_t pack_slice_word(std::uint64_t epoch, unsigned count) {
+    return (epoch << 8) | static_cast<std::uint64_t>(count & 0xffu);
+}
+
 INKLING_HOST_DEVICE inline WireHeader make_header(std::uint64_t session, const Operation& op,
                                                   int rank, unsigned rail, std::uint64_t epoch,
                                                   unsigned slot, std::uint32_t bytes) {
     return {session, epoch, op.stride, op.site, {op.bytes[0], op.bytes[1]},
             {op.columns[0], op.columns[1]}, bytes, op.kind, op.root, static_cast<std::uint8_t>(rank),
-            static_cast<std::uint8_t>(rail), static_cast<std::uint8_t>(slot), {}};
+            static_cast<std::uint8_t>(rail), static_cast<std::uint8_t>(slot), op.slices, {}};
 }
 
 #undef INKLING_HOST_DEVICE

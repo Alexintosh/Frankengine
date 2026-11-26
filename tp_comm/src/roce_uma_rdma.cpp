@@ -20,7 +20,7 @@
 namespace inkling::comm::detail {
 namespace {
 constexpr std::uint64_t kProtocol = 0x494e4b4c494e4701ULL;
-constexpr unsigned kQueueDepth = 4;
+constexpr unsigned kQueueDepth = 32;
 
 std::uint64_t load(const EpochWord& word) {
     return __atomic_load_n(&word.value, __ATOMIC_ACQUIRE);
@@ -324,19 +324,24 @@ public:
         ibv_modify_qp(qp_, &error, IBV_QP_STATE);
     }
 
-    void post(const std::byte* data, std::uint32_t bytes, unsigned slot, std::uint64_t epoch, std::uint32_t tag) {
+    void post_at(const std::byte* data, std::uint32_t remote_offset, std::uint32_t bytes, unsigned slot,
+                 std::uint64_t wr_id, std::uint32_t tag) {
         ibv_sge sge{reinterpret_cast<std::uintptr_t>(data), bytes, region_->lkey};
         ibv_send_wr wr{};
-        wr.wr_id = epoch;
+        wr.wr_id = wr_id;
         wr.sg_list = &sge;
         wr.num_sge = 1;
         wr.opcode = IBV_WR_RDMA_WRITE_WITH_IMM;
         wr.send_flags = IBV_SEND_SIGNALED;
         wr.imm_data = htonl(tag);
-        wr.wr.rdma.remote_addr = remote_.address[slot];
+        wr.wr.rdma.remote_addr = remote_.address[slot] + remote_offset;
         wr.wr.rdma.rkey = remote_.rkey;
         ibv_send_wr* bad = nullptr;
         verbs_check(ibv_post_send(qp_, &wr, &bad), "ibv_post_send");
+    }
+
+    void post(const std::byte* data, std::uint32_t bytes, unsigned slot, std::uint64_t epoch, std::uint32_t tag) {
+        post_at(data, 0, bytes, slot, epoch, tag);
     }
 
     bool sent(std::uint64_t epoch) {
@@ -392,13 +397,18 @@ std::uint32_t immediate(std::uint64_t epoch, unsigned rail, unsigned slot) {
     return (static_cast<std::uint32_t>(epoch) << 2) | (rail << 1) | slot;
 }
 
+std::uint32_t immediate_slice(std::uint64_t epoch, unsigned rail, unsigned slot, unsigned slice) {
+    return (static_cast<std::uint32_t>(epoch) << 6) | ((slice & 0xfu) << 2) | (rail << 1) | slot;
+}
+
 bool same_header(const WireHeader& a, const WireHeader& b) {
     return a.session == b.session && a.epoch == b.epoch && a.stride == b.stride &&
            a.site.schedule_id == b.site.schedule_id && a.site.op_index == b.site.op_index &&
            a.bytes[0] == b.bytes[0] && a.bytes[1] == b.bytes[1] &&
            a.columns[0] == b.columns[0] && a.columns[1] == b.columns[1] &&
            a.stripe_bytes == b.stripe_bytes && a.kind == b.kind && a.root == b.root &&
-           a.src_rank == b.src_rank && a.rail == b.rail && a.slot == b.slot;
+           a.src_rank == b.src_rank && a.rail == b.rail && a.slot == b.slot &&
+           a.slices == b.slices;
 }
 
 int choose_cpu(int requested) {
@@ -581,7 +591,147 @@ private:
         }
     }
 
+    bool exchange_pipelined(std::uint64_t epoch, const Operation& op) {
+        const unsigned slices = op.slices;
+        require(slices >= 2 && slices <= kMaxBulkSlices, "invalid pipelined bulk slice count");
+        const unsigned slot = slot_for(epoch);
+        const unsigned rank = options_.rank;
+        const unsigned peer = 1 - rank;
+        const unsigned sends = rails_for(wire_bytes(op, rank), options_.rail_count);
+        const unsigned receives = rails_for(wire_bytes(op, peer), options_.rail_count);
+        const auto deadline = Clock::now() + options_.timeout;
+        CommTrace trace{epoch, op.site};
+        if (options_.trace) trace.gpu_publish_ns = control_->tx.publish_ns;
+
+        if (tests_.stall_ms && epoch == 1) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(tests_.stall_ms));
+            if (load(control_->gpu_failed))
+                throw std::runtime_error("GPU timed out waiting for peer_ready_epoch");
+        }
+        if (tests_.rank_gap_us && epoch % 3 == 0) busy_delay(tests_.rank_gap_us);
+        const bool stagger = tests_.rail_gap_us && sends == 2;
+        const unsigned first_send = stagger ? epoch % kRails : 0;
+        const unsigned poll_first = epoch % kRails;
+
+        unsigned tx_posted = 0;
+        unsigned tx_acked[kRails]{0, 0};
+        unsigned rx_done[kRails]{0, 0};
+        unsigned rx_published = 0;
+        unsigned spins = 0;
+
+        auto all_tx_acked = [&]() {
+            for (unsigned r = 0; r < sends; ++r)
+                if (tx_acked[r] < slices) return false;
+            return true;
+        };
+
+        while (tx_posted < slices || !all_tx_acked() || rx_published < slices) {
+            if (tx_posted < slices) {
+                const auto packed_word = load(control_->bulk_tx_slice);
+                const unsigned packed =
+                    (packed_word >> 8) == epoch ? static_cast<unsigned>(packed_word & 0xffu) : 0u;
+                while (tx_posted < packed && tx_posted < slices) {
+                    const unsigned s = tx_posted;
+                    for (unsigned i = 0; i < sends; ++i) {
+                        const unsigned rail = i ^ first_send;
+                        try {
+                            const auto rail_bytes = stripe(wire_bytes(op, rank), rail, options_.rail_count).bytes;
+                            const auto sl = slice_of(rail_bytes, s, slices);
+                            const std::uint32_t offset = s == 0 ? 0u : (kHeaderBytes + sl.offset);
+                            const std::uint32_t length = s == 0 ? (kHeaderBytes + sl.bytes) : sl.bytes;
+                            if (s == 0 && tests_.stale_epoch == epoch) {
+                                const auto stale = epoch - 1;
+                                std::memcpy(dma_.tx[slot][rail] + offsetof(WireHeader, epoch), &stale, sizeof(stale));
+                            }
+                            auto tag = immediate_slice(epoch, rail, slot, s);
+                            if (s == 0 && tests_.bad_tag_epoch == epoch) tag ^= 4u;
+                            rails_[rail].post_at(dma_.tx[slot][rail] + offset, offset, length, slot,
+                                                 (epoch << 4) | s, tag);
+                            tx_bytes_[rail].fetch_add(length, std::memory_order_relaxed);
+                        } catch (const std::exception& error) {
+                            throw std::runtime_error("rail " + std::to_string(rail + 1) + " post: " + error.what());
+                        }
+                        if (s == 0 && stagger && i == 0) busy_delay(tests_.rail_gap_us);
+                    }
+                    ++tx_posted;
+                }
+            }
+
+            for (unsigned i = 0; i < kRails; ++i) {
+                const unsigned rail = i ^ poll_first;
+                try {
+                    if (rail < receives && rx_done[rail] < slices) {
+                        const unsigned s = rx_done[rail];
+                        const auto rail_bytes = stripe(wire_bytes(op, peer), rail, options_.rail_count).bytes;
+                        const auto sl = slice_of(rail_bytes, s, slices);
+                        const std::uint32_t length = s == 0 ? (kHeaderBytes + sl.bytes) : sl.bytes;
+                        if (rails_[rail].received(immediate_slice(epoch, rail, slot, s), length)) {
+                            dma_read_barrier();
+                            if (s == 0) {
+                                WireHeader actual;
+                                std::memcpy(&actual, dma_.rx[slot][rail], sizeof(actual));
+                                if (!same_header(actual, make_header(session_, op, peer, rail, epoch, slot, rail_bytes)))
+                                    throw std::runtime_error("wire header session, epoch, site, shape or slot mismatch");
+                            }
+                            rx_bytes_[rail].fetch_add(length, std::memory_order_relaxed);
+                            if (options_.visibility == VisibilityMode::host_bounce && sl.bytes) {
+                                std::memcpy(visible_.rx[slot][rail] + kHeaderBytes + sl.offset,
+                                            dma_.rx[slot][rail] + kHeaderBytes + sl.offset, sl.bytes);
+                            }
+                            ++rx_done[rail];
+                            if (rx_done[rail] == slices) {
+                                if (options_.trace) trace.host_rx_cq_ns[rail] = clock_ns(CLOCK_MONOTONIC);
+                                if (receives == 2 && rx_done[1 - rail] < slices)
+                                    first_rx_[rail].fetch_add(1, std::memory_order_relaxed);
+                            }
+                        }
+                    }
+                    if (rail < sends && tx_acked[rail] < tx_posted) {
+                        const unsigned s = tx_acked[rail];
+                        if (rails_[rail].sent((epoch << 4) | s)) {
+                            ++tx_acked[rail];
+                            if (tx_acked[rail] == slices && options_.trace)
+                                trace.host_tx_cq_ns[rail] = clock_ns(CLOCK_MONOTONIC);
+                        }
+                    }
+                } catch (const std::exception& error) {
+                    throw std::runtime_error("rail " + std::to_string(rail + 1) + " CQ: " + error.what());
+                }
+            }
+
+            unsigned min_rx = slices;
+            for (unsigned rail = 0; rail < receives; ++rail)
+                if (rx_done[rail] < min_rx) min_rx = rx_done[rail];
+            if (min_rx > rx_published) {
+                rx_published = min_rx;
+                store(control_->bulk_rx_slice, pack_slice_word(epoch, rx_published));
+            }
+
+            if ((tx_posted < slices || !all_tx_acked() || rx_published < slices) && (++spins & 63u) == 0) {
+                if (stop_.load(std::memory_order_acquire)) return false;
+                if (load(control_->gpu_failed))
+                    throw std::runtime_error("GPU timed out waiting for peer_ready_epoch");
+                if (socket_.peer_closed()) throw std::runtime_error("peer connection closed during RDMA");
+                if (Clock::now() >= deadline)
+                    throw std::runtime_error("RDMA pipelined completion timeout, posted=" +
+                                             std::to_string(tx_posted) + "/" + std::to_string(slices) +
+                                             ", rx_published=" + std::to_string(rx_published));
+            }
+            spin_hint();
+        }
+
+        if (options_.trace) {
+            trace.host_ready_ns = clock_ns(CLOCK_MONOTONIC);
+            std::lock_guard lock(trace_mutex_);
+            trace_ = trace;
+        }
+        completed_.store(epoch, std::memory_order_relaxed);
+        store(control_->ready, epoch);
+        return true;
+    }
+
     bool exchange(std::uint64_t epoch, const Operation& op) {
+        if (op.slices > 1) return exchange_pipelined(epoch, op);
         const unsigned slot = slot_for(epoch);
         const unsigned rank = options_.rank;
         const unsigned peer = 1 - rank;
