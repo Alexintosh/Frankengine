@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <stdexcept>
+#include <string>
 
 namespace ingine::kernels::prefill {
 namespace {
@@ -132,9 +133,15 @@ int moe_tile_rows(int T) {
   static const int forced = [] {
     const char* e = std::getenv("INGINE_MOE_TILE_ROWS");
     const int v = e ? std::atoi(e) : 0;
-    return v == 32 || v == 128 ? v : 0;
+    return v == 32 || v == 128 || v == 256 ? v : 0;
   }();
-  return forced ? forced : T <= 512 ? 32 : 128;
+  static const bool bf16 = [] {
+    const char* e = std::getenv("INGINE_PREFILL_MMA");
+    return e && std::string(e) == "bf16";
+  }();
+  if (forced) return (bf16 && forced == 256) ? 128 : forced;
+  if (bf16) return T <= 512 ? 32 : 128;
+  return 128;
 }
 
 int moe_tiles_capacity(int max_T) { return std::max(moe_max_tiles(std::min(max_T, 512)), moe_max_tiles(max_T)); }

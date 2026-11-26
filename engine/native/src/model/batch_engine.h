@@ -35,6 +35,7 @@ struct BatchEngineOptions {
   float spec_threshold = 0.f;
   int spec_min = 0;
   bool kv_fp8 = false;             // FP8 E4M3 full-attention caches
+  bool head_nvfp4 = false;         // NVFP4 unembedding head
   TpOptions tp;
   // speculative: a line per sequence and step, "<slot> <drafts verified> <accepted> <conf of the 7 drafts>"
   std::filesystem::path spec_trace;

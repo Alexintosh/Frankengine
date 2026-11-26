@@ -56,7 +56,7 @@ int main(int argc, char** argv) {
   double temperature = 0.0;
   int seed = 1, tp_size = 0, tp_rank = -1;
   std::string tp_wire;
-  bool reference = false, ignore_eos = false, kv_fp8 = false, accept_all = false;
+  bool reference = false, ignore_eos = false, kv_fp8 = false, head_nvfp4 = false, accept_all = false;
 
   ingine::serve::ArgParser ap("ingine-batch-bench", "Many requests at once: aggregate decode throughput on one GPU.");
   ap.option("--model-dir", "", "", &model_dir);
@@ -76,6 +76,7 @@ int main(int argc, char** argv) {
   ap.option("--out", "", "write every request's output tokens and text to FILE (JSON)", &out_file);
   ap.flag("--ignore-eos", "always generate --tokens tokens", &ignore_eos);
   ap.flag("--kv-fp8", "FP8 full-attention caches", &kv_fp8);
+  ap.flag("--head-nvfp4", "NVFP4 unembedding head", &head_nvfp4);
   ap.flag("--reference", "the same prompts one at a time through the single-request Generator", &reference);
   ap.option("--forced", "",
             "feed the output tokens of FILE (another run's --out) and report where this run's argmax differs from them",
@@ -219,6 +220,7 @@ int main(int argc, char** argv) {
       options.prefill_chunk = prefill_chunk;
       options.spec = spec;
       options.kv_fp8 = kv_fp8;
+      options.head_nvfp4 = head_nvfp4;
       options.spec_trace = spec_trace;
       options.spec_threshold = float(spec_threshold);
       options.spec_min = spec_min;
@@ -295,7 +297,7 @@ int main(int argc, char** argv) {
     } else {
       cudaStream_t stream;
       CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
-      m::Weights w = m::load_weights(model_dir, /*dense_fp8=*/false, stream);
+      m::Weights w = m::load_weights(model_dir, /*dense_fp8=*/false, stream, head_nvfp4);
       m::Ablation abl = m::load_ablation(ablation);
       m::BatchState st = m::make_batch_state(slots, ctx, kv_fp8);
       m::Prefiller pf(w, abl, prefill_chunk, stream);

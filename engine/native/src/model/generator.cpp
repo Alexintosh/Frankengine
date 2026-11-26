@@ -128,7 +128,7 @@ class EngineGenerator final : public Generator {
         throw std::invalid_argument("batch_ctx must be in [1024, max_ctx]");
       const TpLayout layout = rt_.tp() ? rt_.tp()->layout : TpLayout{};
       const cudaStream_t stream = rt_.stream();
-      if (!rt_.weights().unembed.w.data || rt_.weights().unembed.fp8()) {
+      if (!rt_.weights().unembed_nvfp4.codes && (!rt_.weights().unembed.w.data || rt_.weights().unembed.fp8())) {
         batch_unembed_ = load_head(options.model_dir, /*dense_fp8=*/false, /*head_nvfp4=*/false, stream,
                                    batch_head_storage_, layout).dense;
       }
@@ -136,14 +136,19 @@ class EngineGenerator final : public Generator {
       batch_dec_ = std::make_unique<BatchDecoder>(rt_.weights(), rt_.ablation(), batch_state_, options.max_batch,
                                                   stream, 8, rt_.tp(),
                                                   batch_unembed_.w.data ? &batch_unembed_ : nullptr);
-      if (!rt_.tp() || layout.tp_rank == 0) {
+      const bool shard_batch_drafter = [] {
+        const char* e = std::getenv("INGINE_SHARD_BATCH_DRAFTER");
+        return !e || !*e || std::atoi(e) != 0;
+      }();
+      if (!rt_.tp() || shard_batch_drafter || layout.tp_rank == 0) {
         std::vector<DeviceBuffer> tmp_head;
         Dense full_head;
         if (rt_.tp() || !rt_.weights().unembed.w.data || rt_.weights().unembed.fp8())
           full_head = load_head(options.model_dir, false, false, stream, tmp_head).dense;
         batch_drafter_ = std::make_unique<BatchDrafter>(
             options.model_dir, rt_.weights(), options.max_batch, options.batch_ctx, options.max_batch, stream,
-            BatchDrafter::Precision::MXFP8, full_head.w.data ? &full_head : nullptr);
+            BatchDrafter::Precision::MXFP8, full_head.w.data ? &full_head : nullptr,
+            shard_batch_drafter ? rt_.tp() : nullptr);
       }
       constexpr int G = BatchDrafter::GAMMA;
       constexpr int TAP_ROW = NUM_TAPS * HIDDEN;
@@ -1082,8 +1087,10 @@ class EngineGenerator final : public Generator {
           batch_drafter_->draft(n, slots, anchors, next_pos, 0.f, batch_seed(++batch_draws_), options_.batch_spec);
       if (rt_.tp()) {
         auto* base = static_cast<std::byte*>(batch_draft_bcast_.p);
-        CUDA_CHECK(cudaMemcpyAsync(base, d.tokens, cnt * 4, cudaMemcpyDeviceToDevice, stream));
-        CUDA_CHECK(cudaMemcpyAsync(base + cnt * 4, d.conf, cnt * 4, cudaMemcpyDeviceToDevice, stream));
+        if (rt_.tp()->layout.tp_rank == 0) {
+          CUDA_CHECK(cudaMemcpyAsync(base, d.tokens, cnt * 4, cudaMemcpyDeviceToDevice, stream));
+          CUDA_CHECK(cudaMemcpyAsync(base + cnt * 4, d.conf, cnt * 4, cudaMemcpyDeviceToDevice, stream));
+        }
         rt_.tp()->broadcast_proposal(batch_draft_bcast_.p, cnt * 8, stream);
         CUDA_CHECK(cudaMemcpyAsync(dh.data(), base, cnt * 4, cudaMemcpyDeviceToHost, stream));
         CUDA_CHECK(cudaMemcpyAsync(ch.data(), base + cnt * 4, cnt * 4, cudaMemcpyDeviceToHost, stream));

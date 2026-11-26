@@ -7,6 +7,7 @@
 #include "model/runtime.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 
@@ -33,7 +34,7 @@ static std::unique_ptr<TpRuntime> make_batch_tp(const BatchEngineOptions& o) {
   ro.max_ctx = o.ctx;
   ro.dense_fp8 = false;
   ro.kv_fp8 = o.kv_fp8;
-  ro.head_nvfp4 = false;
+  ro.head_nvfp4 = o.head_nvfp4;
   ro.spec = o.spec > 0;
   ro.tp = o.tp;
   ro.tp.full_logits = false;
@@ -48,7 +49,7 @@ BatchEngine::BatchEngine(const BatchEngineOptions& o)
       spec_threshold_(o.spec_threshold),
       spec_min_(std::max(0, std::min(o.spec_min, o.spec))),
       tp_(make_batch_tp(o)),
-      w_(load_weights(o.model_dir, /*dense_fp8=*/false, stream_.s, /*head_nvfp4=*/false,
+      w_(load_weights(o.model_dir, /*dense_fp8=*/false, stream_.s, o.head_nvfp4,
                       tp_ ? tp_->layout : TpLayout{})),
       abl_(load_ablation(o.ablation)),
       st_(make_batch_state(o.slots, o.ctx, o.kv_fp8, tp_ ? tp_->layout : TpLayout{})),
@@ -61,12 +62,18 @@ BatchEngine::BatchEngine(const BatchEngineOptions& o)
   if (!(spec_threshold_ >= 0.f && spec_threshold_ < 1.f))
     throw std::invalid_argument("BatchEngine: spec_threshold must be in [0, 1)");
   if (spec_ > 0) {
-    if (!tp_ || tp_->layout.tp_rank == 0) {
+    const bool shard_batch_drafter = [] {
+      const char* e = std::getenv("INGINE_SHARD_BATCH_DRAFTER");
+      return !e || !*e || std::atoi(e) != 0;
+    }();
+    if (!tp_ || shard_batch_drafter || tp_->layout.tp_rank == 0) {
       std::vector<DeviceBuffer> tmp_head;
       Dense full_head;
-      if (tp_) full_head = load_head(o.model_dir, false, false, stream_.s, tmp_head).dense;
+      if (tp_ || !w_.unembed.w.data || w_.unembed.fp8())
+        full_head = load_head(o.model_dir, false, false, stream_.s, tmp_head).dense;
       drafter_ = std::make_unique<BatchDrafter>(o.model_dir, w_, o.slots, o.ctx, o.slots, stream_.s,
-                                                BatchDrafter::Precision::MXFP8, tp_ ? &full_head : nullptr);
+                                                BatchDrafter::Precision::MXFP8, full_head.w.data ? &full_head : nullptr,
+                                                shard_batch_drafter ? tp_.get() : nullptr);
     }
     taps_chunk_ = DeviceBuffer(std::size_t(prefill_chunk_) * TAP_ROW * 2);
     gathered_ = DeviceBuffer(std::size_t(o.slots) * 8 * TAP_ROW * 2);
@@ -211,8 +218,10 @@ void BatchEngine::draft(int n) {
         drafter_->draft(n, slot_.data(), anchor_.data(), next_pos_.data(), 0.f, seed_of(++draws_), spec_);
     if (tp_) {
       auto* base = static_cast<std::byte*>(draft_bcast_.p);
-      CUDA_CHECK(cudaMemcpyAsync(base, d.tokens, cnt * 4, cudaMemcpyDeviceToDevice, stream_.s));
-      CUDA_CHECK(cudaMemcpyAsync(base + cnt * 4, d.conf, cnt * 4, cudaMemcpyDeviceToDevice, stream_.s));
+      if (tp_->layout.tp_rank == 0) {
+        CUDA_CHECK(cudaMemcpyAsync(base, d.tokens, cnt * 4, cudaMemcpyDeviceToDevice, stream_.s));
+        CUDA_CHECK(cudaMemcpyAsync(base + cnt * 4, d.conf, cnt * 4, cudaMemcpyDeviceToDevice, stream_.s));
+      }
       tp_->broadcast_proposal(draft_bcast_.p, cnt * 8, stream_.s);
       CUDA_CHECK(cudaMemcpyAsync(draft_host_.data(), base, cnt * 4, cudaMemcpyDeviceToHost, stream_.s));
       CUDA_CHECK(cudaMemcpyAsync(conf_host_.data(), base + cnt * 4, cnt * 4, cudaMemcpyDeviceToHost, stream_.s));

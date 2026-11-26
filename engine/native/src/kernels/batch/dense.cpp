@@ -250,7 +250,7 @@ void TunedGemm::run(const __nv_bfloat16* A, int lda, const __nv_bfloat16* B, int
   if (!g.used) g.used = true, used_.push_back(&g);
   // a candidate still to time (fewest runs first; once the group ran in kWarmSteps steps), else the fastest measured
   int cand = -1;
-  if (g.steps >= kWarmSteps)
+  if (!capturing_ && g.steps >= kWarmSteps)
     for (int i = 0; i < n; ++i)
       if (ok(i) && !g.dropped[i] && g.issued[i] < kSamples && (cand < 0 || g.issued[i] < g.issued[cand])) cand = i;
   const bool timed = cand >= 0;

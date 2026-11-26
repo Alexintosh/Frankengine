@@ -248,6 +248,16 @@ void TpRuntime::head(const Weights& w, const __nv_bfloat16* x, float* logits, in
 #endif
 }
 
+void TpRuntime::allreduce_bf16(__nv_bfloat16* bf16, std::size_t count, TpSchedule schedule,
+                               unsigned op, cudaStream_t stream) {
+#ifdef INGINE_HAS_TP_COMM
+  const comm::CollectiveSite site{static_cast<unsigned>(schedule), op};
+  impl_->backend->allreduce_bf16({bf16, count}, {bf16, count}, site, stream);
+#else
+  (void)bf16; (void)count; (void)schedule; (void)op; (void)stream;
+#endif
+}
+
 void TpRuntime::broadcast_proposal(void* device, std::size_t bytes, cudaStream_t stream) {
 #ifdef INGINE_HAS_TP_COMM
   impl_->backend->broadcast_tokens({static_cast<std::byte*>(device), bytes}, 0,

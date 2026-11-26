@@ -2,6 +2,7 @@
 // consumes the fused forget|gain GEMM.
 #pragma once
 
+#include "kernels/head/nvfp4_head.h"
 #include "kernels/prefill/prefill.h"
 
 #include <cuda_bf16.h>
@@ -35,7 +36,15 @@ struct Strided {
 std::size_t head_partials(int M, int N);
 void head_sample(const __nv_bfloat16* A, int lda, const __nv_bfloat16* B, int ldb, int M, int N, int K,
                  const float* temps, std::uint64_t seed, float* logits, int ldc, int2* partials, std::int32_t* out,
-                 cudaStream_t stream, int v_begin = 0, void* cand_out = nullptr);
+                 cudaStream_t stream, int v_begin = 0, void* cand_out = nullptr,
+                 const std::uint64_t* d_seed = nullptr);
+
+// NVFP4 unembedding head with kernels::batch::sample fused: reads NVFP4 weights (3.56x smaller than BF16) with
+// exact nvfp4::decode arithmetic, supporting any M >= 1, greedy or Gumbel-max sampling, and CUDA-graph capture via d_seed.
+std::size_t head_partials_nvfp4(int M, int N);
+void head_sample_nvfp4(const __nv_bfloat16* A, int lda, kernels::head::Nvfp4Matrix w, int M, const float* temps,
+                       std::uint64_t seed, float* logits, int ldc, int2* partials, std::int32_t* out,
+                       cudaStream_t stream, void* cand_out = nullptr, const std::uint64_t* d_seed = nullptr);
 
 // BF16 GEMM, the arithmetic of prefill::Gemm: C[M, N] (row-major, ldc) = A[M, K] (bf16, lda) . B[N, K]^T (bf16,
 // ldb), FP32 accumulation, split-K partials reduced in FP32 only; C is bf16 (rounded once) or fp32.
@@ -61,6 +70,9 @@ class TunedGemm {
            int N, int K, cudaStream_t stream, const Strided& batch = {});
   // Folds in the timings of the calls since the last collect() (waits for their events); ends a step.
   void collect();
+  // When true, run() skips event-based candidate timing so calls are CUDA-graph capturable.
+  void set_capturing(bool c) noexcept { capturing_ = c; }
+  bool capturing() const noexcept { return capturing_; }
 
   // the M an algorithm group is measured at (M rounded up: 8, 16, 32, 48, 64, 96, ..., 256, 320, ..., multiples of
   // 64 from 256)
@@ -90,6 +102,7 @@ class TunedGemm {
   std::vector<Group*> used_;  // since the last collect()
   std::vector<Timing> pending_;
   std::vector<cudaEvent_t> events_;  // idle
+  bool capturing_ = false;
 };
 
 // prefill::gate_apply of G gates at once: fg fp32 [G, T, 2H] (gate g's row t: the forget products, then the gain

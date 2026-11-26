@@ -82,6 +82,9 @@ Prefiller::Prefiller(const Weights& w, const Ablation& abl, int max_chunk, cudaS
   tiles_ = static_cast<int4*>(alloc(std::size_t(pk::moe_tiles_capacity(max_chunk)) * sizeof(int4)));
   act_ = bf16(C * TOP_K * layout_.I_local);
   moe_sum_ = bf16(C * H);
+  moe_a_codes_ = static_cast<std::uint8_t*>(alloc(std::max(C * H, C * TOP_K * layout_.I_local)));
+  moe_a_scales_ = static_cast<std::uint8_t*>(alloc(std::max(C * (H / 16), C * TOP_K * ((layout_.I_local / 16 + 3) / 4 * 4))));
+  moe_a_factors_ = f32(C * TOP_K);
   if (tp_) {
     down_partial_ = f32(C * TOP_K * H);
     if (tp_->wire != TpWire::Bf16) partial_ = f32(C * H);
@@ -332,7 +335,7 @@ void Prefiller::run(State& st, const std::int32_t* tokens, int T, int pos0, floa
     gemm_->run(xm_, H, bf16p(layer.router_bf16), H, router_logits_, EXPERTS, true, T, EXPERTS, H, s);
     CUDA_CHECK(cudaMemsetAsync(counts_, 0, EXPERTS * sizeof(int), s));
     pk::moe_topk(router_logits_, f32p(layer.router_bias), T, idx_, wts_, counts_, s);
-    const pk::MoeWork work{counts_, tiles_n_, tiles_, pair_token_, pair_dst_};
+    const pk::MoeWork work{counts_, tiles_n_, tiles_, pair_token_, pair_dst_, moe_a_codes_, moe_a_scales_, moe_a_factors_};
     pk::moe_route(idx_, T, work, s);
     const Experts& ex = layer.experts;
     const pk::MoeExperts me{ex.fmt == ExpertFormat::NVFP4 ? 0 : 1, ex.w13.data, ex.w13_scale.data,

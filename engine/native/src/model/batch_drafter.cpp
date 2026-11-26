@@ -1,4 +1,5 @@
 #include "model/batch_drafter.h"
+#include "model/tp_runtime.h"
 
 #include "core/device.h"
 #include "core/safetensors.h"
@@ -80,8 +81,8 @@ BatchDrafter::Weight BatchDrafter::weight(const __nv_bfloat16* x, int rows, int 
 }
 
 BatchDrafter::BatchDrafter(const std::filesystem::path& model_dir, const Weights& w, int slots, int ctx, int max_seqs,
-                           cudaStream_t stream, Precision precision, const Dense* unembed_override)
-    : w_(w), stream_(stream), slots_(slots), ctx_(ctx), max_seqs_(max_seqs), precision_(precision),
+                           cudaStream_t stream, Precision precision, const Dense* unembed_override, TpRuntime* tp)
+    : w_(w), tp_(tp), stream_(stream), slots_(slots), ctx_(ctx), max_seqs_(max_seqs), precision_(precision),
       gemm_(std::make_unique<kernels::prefill::Gemm>()) {
   if (slots < 1 || max_seqs < 1 || ctx < 2 * BLOCK) throw std::invalid_argument("BatchDrafter: bad slots/ctx/max_seqs");
   if (precision_ == Precision::MXFP8) mx_gemm_ = std::make_unique<kbd::MxGemm>();
@@ -160,10 +161,12 @@ BatchDrafter::BatchDrafter(const std::filesystem::path& model_dir, const Weights
 
   // scratch
   const int M = max_seqs_ * BLOCK, MH = max_seqs_ * GAMMA;
-  d_params_ = i32s(std::max<std::size_t>(3 * std::size_t(max_seqs_), 4 * std::size_t(slots_)));
+  const std::size_t params_n = std::max<std::size_t>(3 * std::size_t(max_seqs_), 4 * std::size_t(slots_));
+  d_params_ = i32s(params_n);
+  pin_params_ = MappedHostBuffer(params_n * 4);
   xn_ = act(M, H);
   attn_o_ = act(M, kd::Q_DIM);
-  act_ = act(M, inter_);
+  act_ = act(M, inter_local_);
   h_ = bf16s(std::size_t(MH) * H);
   head_in_ = precision_ == Precision::MXFP8 ? act(MH, H) : Act{};
   head_in_.x = h_;
@@ -171,7 +174,7 @@ BatchDrafter::BatchDrafter(const std::filesystem::path& model_dir, const Weights
   qkv_ = bf16s(std::size_t(M) * kd::QKV_ROWS);
   q_ = bf16s(std::size_t(M) * kd::Q_DIM);
   delta_ = bf16s(std::size_t(M) * H);
-  gu_ = bf16s(std::size_t(M) * 2 * inter_);
+  gu_ = bf16s(std::size_t(M) * 2 * inter_local_);
   kb_ = bf16s(std::size_t(M) * kd::KV_DIM);
   vb_ = bf16s(std::size_t(M) * kd::KV_DIM);
   attn_ws_ = f32s(kbd::attention_workspace_floats(max_seqs_));
@@ -234,7 +237,13 @@ DeviceBuffer BatchDrafter::load(const std::filesystem::path& model_dir) {
   };
   const std::int64_t h = H;
   inter_ = int(f.at("layers.0.mlp.gate_proj.weight").shape.at(0));
+  const int tp_size = tp_ ? tp_->layout.tp_size : 1;
+  const int tp_rank = tp_ ? tp_->layout.tp_rank : 0;
+  if (inter_ % tp_size != 0 || (inter_ / tp_size) % 128 != 0)
+    throw std::runtime_error("BatchDrafter: inter must be divisible by 128 * tp_size");
+  inter_local_ = inter_ / tp_size;
   const std::int64_t I = inter_;
+  const std::int64_t IL = inter_local_;
 
   {
     const SafetensorsTensor& t = f.at("fuse_weight");
@@ -267,8 +276,33 @@ DeviceBuffer BatchDrafter::load(const std::filesystem::path& model_dir) {
     L.qkv = proj({{a + "q_proj.weight", {kd::Q_DIM, h}}, {a + "k_proj.weight", {kd::KV_DIM, h}},
                   {a + "v_proj.weight", {kd::KV_DIM, h}}});
     L.wo = proj({{a + "o_proj.weight", {h, kd::Q_DIM}}});
-    L.gate_up = proj({{p + "mlp.gate_proj.weight", {I, h}}, {p + "mlp.up_proj.weight", {I, h}}});
-    L.down = proj({{p + "mlp.down_proj.weight", {h, I}}});
+    if (tp_size == 1) {
+      L.gate_up = proj({{p + "mlp.gate_proj.weight", {I, h}}, {p + "mlp.up_proj.weight", {I, h}}});
+      L.down = proj({{p + "mlp.down_proj.weight", {h, I}}});
+    } else {
+      const SafetensorsTensor& tg = f.at(p + "mlp.gate_proj.weight");
+      const SafetensorsTensor& tu = f.at(p + "mlp.up_proj.weight");
+      const SafetensorsTensor& td = f.at(p + "mlp.down_proj.weight");
+      if (tg.dtype != "BF16" || tg.shape != std::vector<std::int64_t>{I, h} ||
+          tu.dtype != "BF16" || tu.shape != std::vector<std::int64_t>{I, h} ||
+          td.dtype != "BF16" || td.shape != std::vector<std::int64_t>{h, I})
+        throw std::runtime_error("mtp.safetensors: unexpected MLP shape");
+      const std::size_t half_gu = std::size_t(IL) * h * 2;
+      DeviceBuffer gu_cat(2 * half_gu);
+      CUDA_CHECK(cudaMemcpyAsync(gu_cat.p,
+                                 static_cast<const std::byte*>(raw.p) + (tg.offset - base) + std::size_t(tp_rank) * half_gu,
+                                 half_gu, cudaMemcpyDeviceToDevice, stream_));
+      CUDA_CHECK(cudaMemcpyAsync(static_cast<std::byte*>(gu_cat.p) + half_gu,
+                                 static_cast<const std::byte*>(raw.p) + (tu.offset - base) + std::size_t(tp_rank) * half_gu,
+                                 half_gu, cudaMemcpyDeviceToDevice, stream_));
+      L.gate_up = weight(static_cast<const __nv_bfloat16*>(gu_cat.p), int(2 * IL), int(h));
+      DeviceBuffer down_slice(std::size_t(h) * IL * 2);
+      CUDA_CHECK(cudaMemcpy2DAsync(down_slice.p, std::size_t(IL) * 2,
+                                   static_cast<const std::byte*>(raw.p) + (td.offset - base) + std::size_t(tp_rank) * IL * 2,
+                                   std::size_t(I) * 2, std::size_t(IL) * 2, std::size_t(h),
+                                   cudaMemcpyDeviceToDevice, stream_));
+      L.down = weight(static_cast<const __nv_bfloat16*>(down_slice.p), int(h), int(IL));
+    }
     L.wkv_ctx = persist({{a + "k_proj_ctx.weight", {kd::KV_DIM, h}}, {a + "v_proj_ctx.weight", {kd::KV_DIM, h}}});
   }
   final_norm_ = persist({{"norm.weight", {h}}});
@@ -355,8 +389,8 @@ void BatchDrafter::commit(int n, const std::int32_t* slots, const std::int64_t* 
     ++m;
   }
   if (total == 0) return;
-  // pageable source: staged before cudaMemcpyAsync returns
-  CUDA_CHECK(cudaMemcpyAsync(d_params_, host_params_.data(), host_params_.size() * 4, cudaMemcpyHostToDevice, stream_));
+  std::memcpy(pin_params_.data(), host_params_.data(), host_params_.size() * 4);
+  CUDA_CHECK(cudaMemcpyAsync(d_params_, pin_params_.data(), host_params_.size() * 4, cudaMemcpyHostToDevice, stream_));
   const kbd::CommitSeqs S{d_params_, d_params_ + slots_, d_params_ + 2 * slots_, d_params_ + 3 * slots_, m};
   const __nv_bfloat16* ctx_norm[3] = {layers_[0].ctx_norm, layers_[1].ctx_norm, layers_[2].ctx_norm};
   const __nv_bfloat16* k_norm[3] = {layers_[0].k_norm_ctx, layers_[1].k_norm_ctx, layers_[2].k_norm_ctx};
@@ -393,9 +427,10 @@ BatchDrafter::Drafts BatchDrafter::draft(int n, const std::int32_t* slots, const
     for (int l = 0; l < 3; ++l)
       max_keys[l] = std::max(max_keys[l], int(std::min<std::int64_t>(P[i], layers_[l].ring.rows)) + R);
   }
-  CUDA_CHECK(cudaMemcpyAsync(d_params_, host_params_.data(), host_params_.size() * 4, cudaMemcpyHostToDevice, stream_));
+  std::memcpy(pin_params_.data(), host_params_.data(), host_params_.size() * 4);
+  CUDA_CHECK(cudaMemcpyAsync(d_params_, pin_params_.data(), host_params_.size() * 4, cudaMemcpyHostToDevice, stream_));
   const kbd::DraftSeqs S{d_params_, d_params_ + max_seqs_, d_params_ + 2 * max_seqs_};
-  const int M = n * R, MH = n * gamma, I = inter_;
+  const int M = n * R, MH = n * gamma, I = inter_local_;
 
   kbd::embed_block(n, R, S, static_cast<const __nv_bfloat16*>(w_.embed.data),
                    static_cast<const float*>(w_.embed_norm.data), mask_embed_, layers_[0].in_norm, f_rnn_, res_, xn_.x,
@@ -410,6 +445,7 @@ BatchDrafter::Drafts BatchDrafter::draft(int n, const std::int32_t* slots, const
     linear(xn_, L.gate_up, gu_, 2 * I, M, 2 * I, H);
     kbd::silu_mul(gu_, M, I, act_.x, act_.mx, stream_);
     linear(act_, L.down, delta_, H, M, H, I);
+    if (tp_) tp_->allreduce_bf16(delta_, std::size_t(M) * H, TpSchedule::Proposal, unsigned(l), stream_);
     if (l < 2) kbd::add_rmsnorm(res_, delta_, layers_[l + 1].in_norm, xn_.x, xn_.mx, M, R, nullptr, {}, stream_);
     else kbd::add_rmsnorm(res_, delta_, final_norm_, nullptr, {}, M, R, h_, head_in_.mx, stream_);
   }

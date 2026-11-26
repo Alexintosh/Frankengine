@@ -114,7 +114,8 @@ int main(int argc, char** argv) {
     auto* idx = dalloc<int>(size_t(maxT) * 8);
     auto* wts = dalloc<float>(size_t(maxT) * 8);
     pk::MoeWork w{dalloc<int>(128), dalloc<int>(1), dalloc<int4>(pk::moe_tiles_capacity(maxT)), dalloc<int>(size_t(maxT) * 8),
-                  dalloc<int>(size_t(maxT) * 8)};
+                  dalloc<int>(size_t(maxT) * 8), dalloc<uint8_t>(size_t(maxT) * 8 * INTER),
+                  dalloc<uint8_t>(size_t(maxT) * 8 * (INTER / 16)), dalloc<float>(size_t(maxT) * 8)};
     auto* act = dalloc<uint16_t>(size_t(maxT) * 8 * 1152);
     auto* down = dalloc<uint16_t>(size_t(maxT) * 8 * H);
     auto route = [&](const Layer& L, int T) {

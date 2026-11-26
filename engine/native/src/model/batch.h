@@ -3,6 +3,8 @@
 #pragma once
 
 #include "core/arena.h"
+#include "core/decode_graph.h"
+#include "core/host_memory.h"
 #include "kernels/batch/batch.h"
 #include "model/model_data.h"
 #include "model/tp_runtime.h"
@@ -113,10 +115,11 @@ class BatchDecoder {
   // logits_raw() (model.logits = 30 tanh(bf16(l) / 30)), else model.logits
   static constexpr int kLogitsLd = (UNPADDED_VOCAB + 7) / 8 * 8;
   const float* logits() const { return keep_logits_ || !logits_raw() ? logits_ : nullptr; }
-  bool logits_raw() const { return !(unembed_override_ ? unembed_override_->fp8() : w_.unembed.fp8()); }
+  bool logits_raw() const { return use_nvfp4_head_ || !(unembed_override_ ? unembed_override_->fp8() : w_.unembed.fp8()); }
 
  private:
   const float* const* block_table(const std::vector<const float*>& blocks);
+  void run_body(int n, int T, int M, bool verify, std::uint64_t seed);
   kernels::batch::ConvStates conv_states() const;  // slot 0's conv states and the slot strides
 
   const Weights& w_;
@@ -133,6 +136,12 @@ class BatchDecoder {
   std::vector<DeviceBuffer> storage_;
   std::map<std::vector<const float*>, DeviceBuffer> tables_;
   DeviceBuffer attn_ws_;
+  bool use_nvfp4_head_ = false;
+  bool graph_enabled_ = true;
+  using GraphKey = std::tuple<int, int, int, bool>;
+  std::map<GraphKey, int> graph_seen_;
+  std::map<GraphKey, DecodeGraphExecutable> graphs_;
+  MappedHostBuffer pin_tokens_, pin_slots_, pin_pos_, pin_rows_, pin_temps_, pin_seed_, pin_sampled_;
   std::vector<std::int32_t> sampled_host_;
   std::vector<float> temps_host_;            // per row
   std::vector<std::int32_t> rows_host_, last_m_;  // the last step's row offsets [n + 1] and rows per sequence
@@ -142,6 +151,7 @@ class BatchDecoder {
   std::int32_t* rows_;  // row offsets, device [max_seqs + 1]
   float* temps_;        // per row
   std::int64_t *pos_, *ids_;
+  std::uint64_t* d_seed_ = nullptr;
   float *B0_, *B1_, *B2_[PASSES], *E_[PASSES], *hid_, *part_, *y_, *y2_;
   __nv_bfloat16 *xin_, *xm_, *xf_;
   float *mixf_, *msgs_, *mixm_;

@@ -134,6 +134,12 @@ struct MoeWork {
   int4* tiles = nullptr;      // [moe_max_tiles(T)] {expert, first pair, pairs, 0}
   int* pair_token = nullptr;  // [T * 8] token of each expert-sorted pair
   int* pair_dst = nullptr;    // [T * 8] t * 8 + slot of each expert-sorted pair
+  // Optional scratch for pre-quantized block-scaled activations (NVFP4 / MXFP8 native MMA).
+  // Capacity: codes >= max(T*H, T*8*I_local) bytes, scales >= max(T*(H/16), T*8*(I_local/16)) bytes,
+  // factors >= T*8 floats.
+  uint8_t* a_codes = nullptr;
+  uint8_t* a_scales = nullptr;
+  float* a_factors = nullptr;
 };
 // (token, expert) pairs per grouped-GEMM tile: 32 for small chunks (few pairs per expert: deeper weight
 // prefetch), 128 otherwise. INGINE_MOE_TILE_ROWS (32 or 128) overrides it (benchmarks).

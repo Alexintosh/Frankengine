@@ -29,6 +29,8 @@ class TpRuntime {
 
   void reduce(float* fp32, __nv_bfloat16* bf16, std::size_t count, TpSchedule schedule,
               unsigned op, cudaStream_t stream);
+  void allreduce_bf16(__nv_bfloat16* bf16, std::size_t count, TpSchedule schedule,
+                      unsigned op, cudaStream_t stream);
   void head(const Weights& weights, const __nv_bfloat16* x, float* logits, int32_t* token, int m,
             TpSchedule schedule, cudaStream_t stream);
   void broadcast_proposal(void* device, std::size_t bytes, cudaStream_t stream);

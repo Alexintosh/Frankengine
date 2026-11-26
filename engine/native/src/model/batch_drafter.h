@@ -22,6 +22,7 @@
 #include "model/model_data.h"
 
 #include "core/arena.h"
+#include "core/host_memory.h"
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -41,6 +42,8 @@ class MxGemm;
 
 namespace ingine::model {
 
+class TpRuntime;
+
 class BatchDrafter {
  public:
   static constexpr int BLOCK = kernels::draft::BLOCK;  // 8 rows per drafted block
@@ -53,7 +56,8 @@ class BatchDrafter {
   // mtp.safetensors from model_dir; `w` supplies the embedding, its norm and the unembedding (and must outlive
   // the drafter). slots x ctx positions; draft() and commit() take up to max_seqs sequences.
   BatchDrafter(const std::filesystem::path& model_dir, const Weights& w, int slots, int ctx, int max_seqs,
-               cudaStream_t stream, Precision precision = Precision::MXFP8, const Dense* unembed_override = nullptr);
+               cudaStream_t stream, Precision precision = Precision::MXFP8, const Dense* unembed_override = nullptr,
+               TpRuntime* tp = nullptr);
   ~BatchDrafter();
   BatchDrafter(const BatchDrafter&) = delete;
   BatchDrafter& operator=(const BatchDrafter&) = delete;
@@ -115,10 +119,11 @@ class BatchDrafter {
   void linear(const Act& in, const Weight& w, __nv_bfloat16* out, int ldc, int M, int N, int K);
 
   const Weights& w_;
+  TpRuntime* tp_ = nullptr;
   cudaStream_t stream_;
   int slots_, ctx_, max_seqs_;
   Precision precision_;
-  int inter_ = 0, short_rows_ = 0, short_ld_ = 0;
+  int inter_ = 0, inter_local_ = 0, short_rows_ = 0, short_ld_ = 0;
   std::size_t bytes_ = 0;
   std::vector<DeviceBuffer> storage_;
   std::unique_ptr<kernels::prefill::Gemm> gemm_;
@@ -144,6 +149,7 @@ class BatchDrafter {
   float* conf_ = nullptr;
   __nv_bfloat16 *commit_xin_ = nullptr, *commit_kv_ = nullptr;
   std::vector<std::int32_t> host_params_;
+  MappedHostBuffer pin_params_;
 };
 
 }  // namespace ingine::model

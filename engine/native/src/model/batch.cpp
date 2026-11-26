@@ -14,6 +14,8 @@
 #include "kernels/prefill/prefill.h"
 
 #include <algorithm>
+#include <cstdlib>
+#include <cstring>
 #include <stdexcept>
 #include <string>
 
@@ -132,6 +134,7 @@ BatchDecoder::BatchDecoder(const Weights& w, const Ablation& abl, BatchState& st
   tokens_ = i32(N), slots_ = i32(S), sampled_ = i32(N), rows_ = i32(S + 1);
   temps_ = f32(N);
   pos_ = i64(S), ids_ = i64(N);
+  d_seed_ = static_cast<std::uint64_t*>(alloc(sizeof(std::uint64_t)));
   B0_ = f32(N * H), B1_ = f32(N * H);
   for (int p = 0; p < PASSES; ++p) B2_[p] = f32(N * H), E_[p] = f32(N * H);
   hid_ = f32(N * H), part_ = f32(N * H), y_ = f32(N * H), y2_ = f32(N * H);
@@ -152,10 +155,24 @@ BatchDecoder::BatchDecoder(const Weights& w, const Ablation& abl, BatchState& st
     local_cand_ = static_cast<kernels::head::Candidate*>(alloc(N * sizeof(kernels::head::Candidate)));
     gathered_cand_ = static_cast<kernels::head::Candidate*>(alloc(2 * N * sizeof(kernels::head::Candidate)));
   }
-  // BF16 head rows: the tokens from the head GEMM, the logits only when kept; FP8 rows: the logits, then sample
+  // NVFP4 or BF16 head rows: fused head + sample; FP8 rows: logits, then sample
+  use_nvfp4_head_ = !unembed_override_ && w.unembed_nvfp4.codes != nullptr;
   const Dense& head_w = unembed_override_ ? *unembed_override_ : w.unembed;
-  if (head_w.fp8()) logits_ = f32(N * LD_V);
-  else head_partials_ = static_cast<int2*>(alloc(kb::head_partials(int(N), layout_.v_end - layout_.v_begin) * sizeof(int2)));
+  if (use_nvfp4_head_) {
+    head_partials_ = static_cast<int2*>(alloc(kb::head_partials_nvfp4(int(N), w.unembed_nvfp4.rows) * sizeof(int2)));
+  } else if (head_w.fp8()) {
+    logits_ = f32(N * LD_V);
+  } else {
+    head_partials_ = static_cast<int2*>(alloc(kb::head_partials(int(N), layout_.v_end - layout_.v_begin) * sizeof(int2)));
+  }
+  if (const char* ge = std::getenv("INGINE_BATCH_GRAPH"); ge && *ge && std::atoi(ge) == 0) graph_enabled_ = false;
+  pin_tokens_ = MappedHostBuffer(N * sizeof(std::int32_t));
+  pin_slots_ = MappedHostBuffer(S * sizeof(std::int32_t));
+  pin_pos_ = MappedHostBuffer(S * sizeof(std::int64_t));
+  pin_rows_ = MappedHostBuffer((S + 1) * sizeof(std::int32_t));
+  pin_temps_ = MappedHostBuffer(N * sizeof(float));
+  pin_seed_ = MappedHostBuffer(sizeof(std::uint64_t));
+  pin_sampled_ = MappedHostBuffer(N * sizeof(std::int32_t));
   // FP8 dense rows (dense_fp8): dequantized per visit as the Prefiller does
   wscratch_ = w.dense_fp8 ? bf16(std::max(std::size_t(PROJ_ROWS_FULL) * H, std::size_t(H) * HEADS * HEAD_DIM)) : nullptr;
   if (max_m > 1) {
@@ -248,26 +265,73 @@ std::span<const std::int32_t> BatchDecoder::step(int n, const std::int32_t* m, c
     rows_host_[std::size_t(b) + 1] = rows_host_[std::size_t(b)] + m[b];
     M = std::max(M, m[b]);
   }
-  const Weights& w = w_;
   const cudaStream_t s = stream_;
   const int T = rows_host_[std::size_t(n)];  // rows: m[b] per sequence
   const bool verify = M > 1;  // keep taps, conv inputs and the overwritten conv rows (max_m > 1)
+  std::memcpy(pin_tokens_.data(), tokens, std::size_t(T) * 4);
+  std::memcpy(pin_slots_.data(), slots, std::size_t(n) * 4);
+  std::memcpy(pin_pos_.data(), pos, std::size_t(n) * 8);
+  std::memcpy(pin_rows_.data(), rows_host_.data(), (std::size_t(n) + 1) * 4);
+  auto* pt = static_cast<float*>(pin_temps_.data());
+  for (int b = 0; b < n; ++b)
+    std::fill(pt + rows_host_[std::size_t(b)], pt + rows_host_[std::size_t(b) + 1], temperature[b]);
+  std::memcpy(pin_seed_.data(), &seed, sizeof(seed));
+
+  CUDA_CHECK(cudaMemcpyAsync(tokens_, pin_tokens_.data(), std::size_t(T) * 4, cudaMemcpyHostToDevice, s));
+  CUDA_CHECK(cudaMemcpyAsync(slots_, pin_slots_.data(), std::size_t(n) * 4, cudaMemcpyHostToDevice, s));
+  CUDA_CHECK(cudaMemcpyAsync(pos_, pin_pos_.data(), std::size_t(n) * 8, cudaMemcpyHostToDevice, s));
+  CUDA_CHECK(cudaMemcpyAsync(rows_, pin_rows_.data(), (std::size_t(n) + 1) * 4, cudaMemcpyHostToDevice, s));
+  CUDA_CHECK(cudaMemcpyAsync(temps_, pin_temps_.data(), std::size_t(T) * 4, cudaMemcpyHostToDevice, s));
+  CUDA_CHECK(cudaMemcpyAsync(d_seed_, pin_seed_.data(), sizeof(seed), cudaMemcpyHostToDevice, s));
+  last_n_ = n, last_verify_ = verify;
+
+  const Dense& head_w_chk = unembed_override_ ? *unembed_override_ : w_.unembed;
+  const bool can_graph = graph_enabled_ && (use_nvfp4_head_ || !head_w_chk.fp8()) && n <= 8 && T <= 64;
+  const GraphKey gkey{n, T, M, keep_logits_};
+  bool used_graph = false;
+  if (can_graph) {
+    if (auto it = graphs_.find(gkey); it != graphs_.end()) {
+      it->second.launch(s);
+      used_graph = true;
+    } else if (graphs_.size() < 64 && graph_seen_[gkey] >= 2) {
+      gemm_->set_capturing(true);
+      DecodeGraphDefinition def;
+      try {
+        def.capture(s, [&] { run_body(n, T, M, verify, seed); });
+      } catch (...) {
+        gemm_->set_capturing(false);
+        throw;
+      }
+      gemm_->set_capturing(false);
+      DecodeGraphExecutable exec;
+      exec.instantiate(def);
+      exec.upload(s);
+      exec.launch(s);
+      graphs_.emplace(gkey, std::move(exec));
+      used_graph = true;
+    } else {
+      ++graph_seen_[gkey];
+    }
+  }
+  if (!used_graph) run_body(n, T, M, verify, seed);
+
+  CUDA_CHECK(cudaMemcpyAsync(pin_sampled_.data(), sampled_, std::size_t(T) * 4, cudaMemcpyDeviceToHost, s));
+  if (tp_) tp_->wait(s);
+  else CUDA_CHECK(cudaStreamSynchronize(s));
+  std::memcpy(sampled_host_.data(), pin_sampled_.data(), std::size_t(T) * 4);
+  if (!used_graph) gemm_->collect();
+  return {sampled_host_.data(), std::size_t(T)};
+}
+
+void BatchDecoder::run_body(int n, int T, int M, bool verify, std::uint64_t seed) {
+  const Weights& w = w_;
+  const cudaStream_t s = stream_;
   const std::size_t slab = std::size_t(T) * H;
   const float* attn_dirs = f32p(abl_.attn_dirs);
   const float* attn_w = f32p(abl_.attn_w);
   const float* mlp_dirs = f32p(abl_.mlp_dirs);
   const float* mlp_w = f32p(abl_.mlp_w);
-  const State s0 = st_.view(0);  // per-visit base pointers; sequence b's slot adds slots[b] * stride
-
-  CUDA_CHECK(cudaMemcpyAsync(tokens_, tokens, std::size_t(T) * 4, cudaMemcpyHostToDevice, s));
-  CUDA_CHECK(cudaMemcpyAsync(slots_, slots, std::size_t(n) * 4, cudaMemcpyHostToDevice, s));
-  CUDA_CHECK(cudaMemcpyAsync(pos_, pos, std::size_t(n) * 8, cudaMemcpyHostToDevice, s));
-  CUDA_CHECK(cudaMemcpyAsync(rows_, rows_host_.data(), (std::size_t(n) + 1) * 4, cudaMemcpyHostToDevice, s));
-  for (int b = 0; b < n; ++b)
-    std::fill(temps_host_.begin() + rows_host_[std::size_t(b)], temps_host_.begin() + rows_host_[std::size_t(b) + 1],
-              temperature[b]);
-  CUDA_CHECK(cudaMemcpyAsync(temps_, temps_host_.data(), std::size_t(T) * 4, cudaMemcpyHostToDevice, s));
-  last_n_ = n, last_verify_ = verify;
+  const State s0 = st_.view(0);
 
   auto mix = [&](const std::vector<const float*>& blocks, const float* base, const float* write, const float* abl_r,
                  const float* abl_w, float* partial_out, const float* queries, int Q, const float* norm_w,
@@ -493,7 +557,17 @@ std::span<const std::int32_t> BatchDecoder::step(int n, const std::int32_t* m, c
     CUDA_CHECK(cudaMemcpy2DAsync(taps_ + std::size_t(NUM_TAPS - 1) * H, std::size_t(NUM_TAPS) * H * 2, xf_,
                                  std::size_t(H) * 2, std::size_t(H) * 2, T, cudaMemcpyDeviceToDevice, s));
   const Dense& head_w = unembed_override_ ? *unembed_override_ : w.unembed;
-  if (head_w.fp8()) {  // model.logits row by row (FP8 rows dequantized in the kernel)
+  if (use_nvfp4_head_) {
+    if (tp_) {
+      kb::head_sample_nvfp4(xf_, H, w.unembed_nvfp4, T, temps_, seed, nullptr, 0,
+                            head_partials_, nullptr, s, local_cand_, d_seed_);
+      tp_->exchange_draft_head(local_cand_, std::size_t(T) * sizeof(kernels::head::Candidate), gathered_cand_, s);
+      tp_merge_candidates(gathered_cand_, sampled_, T, s);
+    } else {
+      kb::head_sample_nvfp4(xf_, H, w.unembed_nvfp4, T, temps_, seed, keep_logits_ ? logits_ : nullptr,
+                            LD_V, head_partials_, sampled_, s, nullptr, d_seed_);
+    }
+  } else if (head_w.fp8()) {
     for (int b = 0; b < T; ++b)
       pk::head_logits(xf_ + std::size_t(b) * H, head_w.w.data, f32p(head_w.scale), UNPADDED_VOCAB,
                       logits_ + std::size_t(b) * LD_V, s);
@@ -501,18 +575,13 @@ std::span<const std::int32_t> BatchDecoder::step(int n, const std::int32_t* m, c
   } else if (tp_) {
     const int n_local = layout_.v_end - layout_.v_begin;
     kb::head_sample(xf_, H, bf16p(head_w.w), H, T, n_local, H, temps_, seed, nullptr, 0,
-                    head_partials_, nullptr, s, layout_.v_begin, local_cand_);
+                    head_partials_, nullptr, s, layout_.v_begin, local_cand_, d_seed_);
     tp_->exchange_draft_head(local_cand_, std::size_t(T) * sizeof(kernels::head::Candidate), gathered_cand_, s);
     tp_merge_candidates(gathered_cand_, sampled_, T, s);
-  } else {  // the head with kb::sample's choice fused
+  } else {
     kb::head_sample(xf_, H, bf16p(head_w.w), H, T, UNPADDED_VOCAB, H, temps_, seed, keep_logits_ ? logits_ : nullptr,
-                    LD_V, head_partials_, sampled_, s);
+                    LD_V, head_partials_, sampled_, s, 0, nullptr, d_seed_);
   }
-  CUDA_CHECK(cudaMemcpyAsync(sampled_host_.data(), sampled_, std::size_t(T) * 4, cudaMemcpyDeviceToHost, s));
-  if (tp_) tp_->wait(s);
-  else CUDA_CHECK(cudaStreamSynchronize(s));
-  gemm_->collect();
-  return {sampled_host_.data(), std::size_t(T)};
 }
 
 }  // namespace ingine::model
