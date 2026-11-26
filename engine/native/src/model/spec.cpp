@@ -280,6 +280,8 @@ void SpecLoop::generate_host_verified(std::int32_t token, int max_new_tokens, co
   int position = int(tokens_in_state.size());
   if (drafter_ && drafter_->length() != position)
     throw std::logic_error("SpecLoop: drafter context does not match the state");
+  if (dflash2_ && dflash2_->length() != position)
+    throw std::logic_error("SpecLoop: DFlash2 context does not match the state");
 
   const bool profile_decision = rt_.options().tp.serve && tp && tp->profile;
   // Reuse events for forced replay and optional serving decision profiling.
@@ -357,17 +359,21 @@ void SpecLoop::generate_host_verified(std::int32_t token, int max_new_tokens, co
       }
     }
     if (drafter_) drafter_->note_tokens(emitted);
+    // Both ranks finish the draft collectives before rank 0 can publish cancellation.
+    const bool propose_flash = !stop && dflash2_ && (keep_running || dflash2_head_ || dflash2_->is_sharded());
+    if (propose_flash) event(0);
+    if (dflash2_ && last_width) {
+      // Commit only the rows still in the target state after stop trimming.
+      // This also runs before a width-zero cancellation, even if no draft is needed.
+      const int start = position - last_accepted - 1;
+      const int kept = int(tokens_in_state.size()) - start;
+      dflash2_->commit(ptr<const __nv_bfloat16>(rt_.buffers(last_width).taps), kept, start, true);
+    }
     if (stop) break;
 
     const int offset = stats.generated_tokens;
     const int32_t anchor = out.back();
-    // Both ranks finish the draft collectives before rank 0 can publish cancellation.
-    if (dflash2_ && (keep_running || dflash2_head_ || dflash2_->is_sharded())) {
-      event(0);
-      if (last_width) {
-        const int n = last_accepted + 1;
-        dflash2_->commit(ptr<const __nv_bfloat16>(rt_.buffers(last_width).taps), n, position - n, true);
-      }
+    if (propose_flash) {
       draft_.tokens = dflash2_->propose(anchor);
       event(1);
     } else if (dflash2_head_) {
@@ -474,7 +480,7 @@ void SpecLoop::generate_host_verified(std::int32_t token, int max_new_tokens, co
     out.assign(r.drafts, r.drafts + r.accepted);
     out.push_back(r.next);
   }
-  if (drafter_) {
+  if (drafter_ || dflash2_) {
     CUDA_CHECK(cudaEventRecord(done_, stream));
     CUDA_CHECK(cudaEventSynchronize(done_));
   }

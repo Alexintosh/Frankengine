@@ -14,6 +14,7 @@
 #include <mma.h>
 #include <algorithm>
 #include <array>
+#include <charconv>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
@@ -444,6 +445,7 @@ struct DraftProfile {
   cudaStream_t stream;
   bool enabled;
   bool capturing = false;
+  bool pending_commit = false;
   std::array<Span, 64> spans;
   int used = 0, rounds = 0, commits = 0;
   int position = 0;
@@ -465,6 +467,8 @@ struct DraftProfile {
 
   void finish(int current_position) {
     if (!enabled || used == 0) return;
+    if (pending_commit) ++commits;
+    pending_commit = false;
     // Profiling is opt-in. This wait is excluded from the GPU stage totals.
     CUDA_CHECK(cudaStreamSynchronize(stream));
     for (int i = 0; i < used; ++i) {
@@ -499,6 +503,7 @@ struct DraftProfile {
   void reset() {
     print();
     used = rounds = commits = 0;
+    pending_commit = false;
     totals.fill(0);
   }
 };
@@ -533,6 +538,8 @@ struct DFlash2::Impl {
     for (auto graph : graphs)
       if (graph) cudaGraphExecDestroy(graph);
   }
+
+  std::size_t ring_bytes() const { return std::size_t(W) * kv_dim * sizeof(Bf); }
 
   int attention_splits() const {
     if (length + Block <= AttentionTile) return 0;
@@ -846,13 +853,12 @@ struct DFlash2::Impl {
   void commit(const Bf* taps, int n, int start, bool decode) {
     if (start != length || n < 0)
       throw std::invalid_argument("DFlash2 commit must append to the committed context");
-    if (!dump_dir.empty() && !dump_written && n) dump("taps.bf16", taps, std::size_t(n) * 4 * H, start != 0);
+    if (n == 0) return;
+    if (!dump_dir.empty() && !dump_written) dump("taps.bf16", taps, std::size_t(n) * 4 * H, start != 0);
     profile.used = 0;
-    if (decode && profile.enabled) {
-      profile.begin(DraftProfile::Commit);
-      ++profile.commits;
-    }
-    const bool decode_fp8 = padded_taps && decode && n > 0 && n <= Block;
+    profile.pending_commit = decode && profile.enabled;
+    if (profile.pending_commit) profile.begin(DraftProfile::Commit);
+    const bool decode_fp8 = padded_taps && decode && n <= Block;
     if (decode_fp8 && n < Block) {
       CUDA_CHECK(cudaMemcpyAsync(padded_taps, taps, n * 4 * H * sizeof(Bf), cudaMemcpyDeviceToDevice, s));
       CUDA_CHECK(cudaMemsetAsync(padded_taps + n * 4 * H, 0, (Block - n) * 4 * H * sizeof(Bf), s));
@@ -1263,6 +1269,30 @@ void DFlash2::propose_sharded_head(const Bf* hidden, bool replicated) {
 
 const float* DFlash2::confidence() const { return impl_->confidence; }
 
+int batch_dflash2_max_ctx(int fallback, TpRuntime* tp, cudaStream_t stream) {
+  int limit = fallback;
+  const bool root = !tp || tp->layout.tp_rank == 0;
+  if (root) {
+    if (const char* env = std::getenv("INGINE_BATCH_DFLASH2_MAX_CTX"); env && *env) {
+      const std::string_view value(env);
+      const auto end = value.data() + value.size();
+      const auto parsed = std::from_chars(value.data(), end, limit);
+      if (parsed.ec != std::errc{} || parsed.ptr != end || limit < 0) limit = -1;
+    }
+  }
+  if (tp) {
+    // Batch subsets determine the collective schedule. Use rank 0's limit on both ranks.
+    DeviceBuffer device(sizeof(limit));
+    if (root)
+      CUDA_CHECK(cudaMemcpyAsync(device.p, &limit, sizeof(limit), cudaMemcpyHostToDevice, stream));
+    tp->broadcast_proposal(device.p, sizeof(limit), stream);
+    CUDA_CHECK(cudaMemcpyAsync(&limit, device.p, sizeof(limit), cudaMemcpyDeviceToHost, stream));
+    tp->wait(stream);
+  }
+  if (limit < 0) throw std::invalid_argument("INGINE_BATCH_DFLASH2_MAX_CTX must be a nonnegative integer");
+  return limit;
+}
+
 bool dflash2_full_head() {
   const char* value = std::getenv("INKLING_DFLASH2_FULL_HEAD");
   return value && std::string_view(value) == "1";
@@ -1286,6 +1316,46 @@ void DFlash2::reset() {
   impl_->length = 0;
   impl_->proposal_round = 0;
   impl_->profile.reset();
+}
+
+int DFlash2::length() const { return impl_->length; }
+
+std::size_t DFlash2::checkpoint_bytes() const {
+  return 2 * impl_->layers.size() * impl_->ring_bytes();
+}
+
+void DFlash2::save_checkpoint(void* dst) {
+  auto& d = *impl_;
+  auto* buffer = static_cast<std::byte*>(dst);
+  const std::size_t bytes = d.ring_bytes();
+  for (const auto& layer : d.layers) {
+    CUDA_CHECK(cudaMemcpyAsync(buffer, layer.keys, bytes, cudaMemcpyDeviceToDevice, d.s));
+    CUDA_CHECK(cudaMemcpyAsync(buffer + bytes, layer.values, bytes, cudaMemcpyDeviceToDevice, d.s));
+    buffer += 2 * bytes;
+  }
+  checkpoint_length_ = d.length;
+}
+
+void DFlash2::adopt_checkpoint(int len) {
+  if (len < 0) throw std::invalid_argument("DFlash2 checkpoint length must be nonnegative");
+  checkpoint_length_ = len;
+}
+
+void DFlash2::restore_checkpoint(const void* src, int len) {
+  if (len < 0 || len != checkpoint_length_)
+    throw std::invalid_argument("DFlash2 checkpoint length does not match the last save");
+  auto& d = *impl_;
+  auto* buffer = static_cast<const std::byte*>(src);
+  const std::size_t bytes = d.ring_bytes();
+  for (const auto& layer : d.layers) {
+    CUDA_CHECK(cudaMemcpyAsync(layer.keys, buffer, bytes, cudaMemcpyDeviceToDevice, d.s));
+    CUDA_CHECK(cudaMemcpyAsync(layer.values, buffer + bytes, bytes, cudaMemcpyDeviceToDevice, d.s));
+    buffer += 2 * bytes;
+  }
+  d.length = len;
+  d.proposal_round = 0;
+  d.profile.used = 0;
+  d.profile.pending_commit = false;
 }
 
 void DFlash2::commit(const Bf* taps, int n, int start, bool decode) {

@@ -86,9 +86,10 @@ BatchEngine::BatchEngine(const BatchEngineOptions& o)
     throw std::invalid_argument("BatchEngine: spec_threshold must be in [0, 1)");
   if (spec_ > 0) {
     batch_draft_type_ = resolve_batch_draft_type(o);
-    dflash2_max_ctx_ = std::max(1, o.dflash2_max_ctx);
-    const bool use_dspark = batch_draft_type_ == "dspark" || batch_draft_type_ == "hybrid";
-    const bool use_dflash2 = batch_draft_type_ == "dflash2" || batch_draft_type_ == "hybrid";
+    const bool hybrid = batch_draft_type_ == "hybrid";
+    if (hybrid) dflash2_max_ctx_ = batch_dflash2_max_ctx(std::max(1, o.dflash2_max_ctx), tp_.get(), stream_.s);
+    const bool use_dspark = batch_draft_type_ == "dspark" || hybrid;
+    const bool use_dflash2 = batch_draft_type_ == "dflash2" || (hybrid && dflash2_max_ctx_ > 0);
     if (use_dspark) {
       const bool shard_batch_drafter = [] {
         const char* e = std::getenv("INGINE_SHARD_BATCH_DRAFTER");
@@ -277,7 +278,7 @@ void BatchEngine::draft(int n) {
     for (int i = 0; i < n; ++i) df_idx[std::size_t(i)] = i;
   } else if (batch_draft_type_ == "hybrid") {
     for (int i = 0; i < n; ++i) {
-      if (next_pos_[std::size_t(i)] <= dflash2_max_ctx_) df_idx.push_back(i);
+      if (dflash2_max_ctx_ > 0 && next_pos_[std::size_t(i)] <= dflash2_max_ctx_) df_idx.push_back(i);
       else ds_idx.push_back(i);
     }
   } else {

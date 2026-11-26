@@ -5,6 +5,7 @@
 
 #include "kernels/head/nvfp4_head.h"
 
+#include <cstddef>
 #include <filesystem>
 #include <memory>
 
@@ -18,6 +19,8 @@ bool dflash2_shard_fp32();
 
 class DFlash2Head;
 class TpRuntime;
+
+int batch_dflash2_max_ctx(int fallback, TpRuntime* tp, cudaStream_t stream);
 
 class DFlash2 {
  public:
@@ -38,6 +41,12 @@ class DFlash2 {
   const int* propose(int anchor);
   const float* confidence() const;
   void reset();
+  int length() const;
+  // The caller supplies a device buffer of checkpoint_bytes() on this rank.
+  std::size_t checkpoint_bytes() const;
+  void save_checkpoint(void* dst);
+  void adopt_checkpoint(int len);
+  void restore_checkpoint(const void* src, int len);
   void commit(const __nv_bfloat16* taps, int n, int start, bool decode = false);
   const __nv_bfloat16* forward(const __nv_bfloat16* embeddings);
   const int* select(const int* candidates, const float* unary, const int* anchor);
@@ -55,6 +64,7 @@ class DFlash2 {
   void propose_sharded_head(const __nv_bfloat16* hidden, bool replicated);
   struct Impl;
   std::unique_ptr<Impl> impl_;
+  int checkpoint_length_ = -1;
 };
 
 class DFlash2Head {

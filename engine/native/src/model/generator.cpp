@@ -150,8 +150,10 @@ class EngineGenerator final : public Generator {
       }
       if (batch_draft_type_ != "dspark" && batch_draft_type_ != "dflash2" && batch_draft_type_ != "hybrid")
         throw std::invalid_argument("batch_draft_type must be dspark, dflash2, or hybrid");
-      const bool use_batch_dspark = batch_draft_type_ == "dspark" || batch_draft_type_ == "hybrid";
-      const bool use_batch_dflash2 = batch_draft_type_ == "dflash2" || batch_draft_type_ == "hybrid";
+      const bool hybrid = batch_draft_type_ == "hybrid";
+      if (hybrid) batch_dflash2_max_ctx_ = batch_dflash2_max_ctx(options.dflash2_max_ctx, rt_.tp(), stream);
+      const bool use_batch_dspark = batch_draft_type_ == "dspark" || hybrid;
+      const bool use_batch_dflash2 = batch_draft_type_ == "dflash2" || (hybrid && batch_dflash2_max_ctx_ > 0);
       if (use_batch_dspark) {
         const bool shard_batch_drafter = [] {
           const char* e = std::getenv("INGINE_SHARD_BATCH_DRAFTER");
@@ -211,6 +213,7 @@ class EngineGenerator final : public Generator {
     checkpoint_drafter_ = carved(rt_.checkpoint_bytes());
     checkpoint_logits_ = checkpoint_drafter_ + (drafter_ ? carved(drafter_->checkpoint_bytes()) : 0);
     checkpoint_ = DeviceBuffer(checkpoint_logits_ + logits_.bytes);
+    if (dflash2_) dflash2_checkpoint_ = DeviceBuffer(dflash2_->checkpoint_bytes());
     // the vision tower's weights are resident: loaded before the park budget below is measured
     if (options.vision) vision_ = std::make_unique<VisionEncoder>(options.model_dir, rt_.stream());
     CUDA_CHECK(cudaStreamSynchronize(rt_.stream()));
@@ -266,26 +269,19 @@ class EngineGenerator final : public Generator {
     if (rt_.tp() && options_.tp.serve) rt_.tp()->full_logits = sampling.temperature > 0;
 
     bool flash = options_.draft_type == "dflash2";
-    if (!flash && options_.draft_type == "hybrid" && n <= options_.dflash2_max_ctx &&
-        (sampling.temperature <= 0.f || allow_dflash2_sampled)) {
-      // Preserve warm multi-turn Solo KV reuse (>= 512 tokens) instead of forcing a cold DFlash2 prefill.
-      constexpr std::size_t kMinHybridReuse = 512;
-      bool has_warm_reuse = false;
-      if (!options_.cold_prefill && !previous_flash_) {
-        const bool drafter_ok = !drafter_ || drafter_->length() == int(tokens_in_state_.size());
-        const bool sampled_head = rt_.tp() && rt_.tp()->full_logits;
-        const bool ext = drafter_ok && tokens_in_state_.size() >= kMinHybridReuse &&
-                         tokens_in_state_.size() < prompt.size() &&
-                         std::equal(tokens_in_state_.begin(), tokens_in_state_.end(), prompt.begin());
-        const bool ckpt = !ext && checkpoint_ids_.size() >= kMinHybridReuse &&
-                          checkpoint_ids_.size() <= prompt.size() &&
-                          (checkpoint_ids_.size() < prompt.size() || checkpoint_sampled_head_ == sampled_head) &&
-                          std::equal(checkpoint_ids_.begin(), checkpoint_ids_.end(), prompt.begin());
-        const bool parked = find_parked(prompt, kMinHybridReuse - 1) != nullptr;
-        has_warm_reuse = ext || ckpt || parked;
+    if (options_.draft_type == "hybrid") {
+      if (n <= options_.dflash2_max_ctx && (sampling.temperature <= 0.f || allow_dflash2_sampled)) {
+        const bool warm_flash = !options_.cold_prefill &&
+            (live_prefix(prompt, true) || checkpoint_prefix(prompt, true) || find_parked(prompt, 0, true));
+        // Favor a substantial warm DSpark prefix when DFlash2 would need a full prefill.
+        constexpr std::size_t kMinHybridReuse = 512;
+        const bool warm_dspark = !options_.cold_prefill &&
+            (live_prefix(prompt, false) >= kMinHybridReuse ||
+             checkpoint_prefix(prompt, false) >= kMinHybridReuse ||
+             find_parked(prompt, kMinHybridReuse - 1, false));
+        flash = warm_flash || !warm_dspark;
       }
-      flash = !has_warm_reuse;
-      if (rt_.tp() && options_.tp.serve && !rt_.tp()->agree(uint64_t(flash), rt_.stream())) flash = false;
+      if (rt_.tp() && !rt_.tp()->agree(uint64_t(flash), rt_.stream())) flash = false;
     }
     auto* spec = flash ? dflash2_spec_.get() : spec_.get();
     // a verify call writes up to max(verify widths) positions
@@ -314,13 +310,14 @@ class EngineGenerator final : public Generator {
         mix(stop_ids);
         request = (request ^ std::uint64_t(flash)) * 1099511628211ull;
       }
-      if (flash && !previous_flash_ && !options_.cold_prefill) park_live();
-      if (flash || previous_flash_) {
+      if (flash != previous_flash_) {
+        if (!options_.cold_prefill) park_live();
         tokens_in_state_.clear();
-        checkpoint_ids_.clear();
+        clear_checkpoint();
+        if (!flash && dflash2_) dflash2_->reset();
       }
+      prefill(prompt, full_prompt.images, stop_ids, stats, request, flash, counter ? &on_tokens : nullptr);
       previous_flash_ = flash;
-      prefill(prompt, full_prompt.images, stats, request, flash, counter ? &on_tokens : nullptr);
       if (stats.interrupted_prefill_offset) return stats;
       stats.prompt_tokens = n;
       stats.image_tokens = image_tokens;
@@ -526,7 +523,8 @@ class EngineGenerator final : public Generator {
       if (tp && !tp->agree(reused, stream)) reused = 0;
       if (slot == 0) {
         park_live();
-        checkpoint_ids_.clear();
+        clear_checkpoint();
+        if (previous_flash_ && dflash2_) dflash2_->reset();
         previous_flash_ = false;
         if (drafter_) drafter_->reset();
       }
@@ -710,13 +708,21 @@ class EngineGenerator final : public Generator {
     return int(tokens);
   }
 
+  void clear_checkpoint() {
+    checkpoint_ids_.clear();
+    checkpoint_is_flash_ = false;
+    checkpoint_has_logits_ = false;
+  }
+
   // After a failure anywhere in a request the device state may be ahead of or behind tokens_in_state_ (a step
   // in flight, a partial prefill, a round between launch and bookkeeping): wait for the stream and forget
   // everything reusable, so the next request starts from an empty state.
   void forget_state() noexcept {
     cudaStreamSynchronize(rt_.stream());
     tokens_in_state_.clear();
-    checkpoint_ids_.clear();
+    clear_checkpoint();
+    previous_flash_ = false;
+    if (dflash2_) dflash2_->reset();
     if (drafter_) drafter_->reset();  // stream-ordered; CUDA failures abort (CUDA_CHECK)
   }
 
@@ -828,6 +834,43 @@ class EngineGenerator final : public Generator {
     }
   }
 
+  std::size_t live_prefix(std::span<const std::int32_t> ids, bool flash) const {
+    const auto& prev = tokens_in_state_;
+    if (options_.cold_prefill || previous_flash_ != flash || prev.empty() || prev.size() >= ids.size())
+      return 0;
+    // Only ranks that own the active drafter have a local draft length to check.
+    const int len = int(prev.size());
+    if (flash ? (dflash2_ && dflash2_->length() != len) : (drafter_ && drafter_->length() != len))
+      return 0;
+    return std::equal(prev.begin(), prev.end(), ids.begin()) ? prev.size() : 0;
+  }
+
+  std::size_t checkpoint_prefix(std::span<const std::int32_t> ids, bool flash) const {
+    const auto& saved = checkpoint_ids_;
+    if (options_.cold_prefill || checkpoint_is_flash_ != flash || saved.empty() || saved.size() > ids.size())
+      return 0;
+    // Reusing the entire prompt also reuses its saved logits.
+    const bool sampled_head = rt_.tp() && rt_.tp()->full_logits;
+    if (saved.size() == ids.size() && (!checkpoint_has_logits_ || checkpoint_sampled_head_ != sampled_head))
+      return 0;
+    return std::equal(saved.begin(), saved.end(), ids.begin()) ? saved.size() : 0;
+  }
+
+  std::size_t find_anchor_boundary(std::span<const std::int32_t> ids, std::span<const PromptImage> images,
+                                   std::span<const std::int32_t> stop_ids) const {
+    if (options_.cold_prefill || park_budget_ == 0 || stop_ids.empty() || ids.size() < kMinParked + 16)
+      return 0;
+    for (std::size_t i = kMinParked; i + 16 <= ids.size(); ++i) {
+      if (std::find(stop_ids.begin(), stop_ids.end(), ids[i]) == stop_ids.end()) continue;
+      for (const PromptImage& image : images) {
+        const auto pos = std::size_t(image.pos);
+        if (pos < i && pos + std::size_t(image.tokens()) > i) return 0;
+      }
+      return i;
+    }
+    return 0;
+  }
+
   // engine._prefill with prompt checkpoints: brings the state to `ids` (last logits in logits_) and sets
   // stats.reused_tokens and stats.reuse.
   // * Extend: `ids` extends tokens_in_state_ (the previous prompt and the generated tokens processed since):
@@ -844,39 +887,31 @@ class EngineGenerator final : public Generator {
   // apart. The vision tower encodes an image when the first chunk that holds some of its tokens is reached
   // (images inside the reused prefix are not encoded again), and the Prefiller writes its rows over the
   // embeddings of its tokens; an image may span chunks.
-  void prefill(std::span<const std::int32_t> ids, std::span<const PromptImage> images, GenerateStats& stats,
-               std::uint64_t request, bool flash,
+  void prefill(std::span<const std::int32_t> ids, std::span<const PromptImage> images,
+               std::span<const std::int32_t> stop_ids, GenerateStats& stats, std::uint64_t request, bool flash,
                const std::function<bool(std::span<const int32_t>)>* proceed = nullptr) {
-    const bool cold = options_.cold_prefill || flash;
-    const std::vector<std::int32_t>& prev = tokens_in_state_;
+    const bool cold = options_.cold_prefill;
     const std::size_t n = ids.size();
-    const bool drafter_in_step = !drafter_ || drafter_->length() == int(prev.size());  // else a row is missing
     State& st = rt_.state();
     const cudaStream_t stream = rt_.stream();
-    const bool extend =
-        !cold && drafter_in_step && !prev.empty() && prev.size() < n && std::equal(prev.begin(), prev.end(), ids.begin());
-    // A different head mode can reuse the cached state if prefill computes fresh final logits.
-    const bool sampled_head = rt_.tp() && rt_.tp()->full_logits;
-    const bool checkpoint = !cold && !extend && !checkpoint_ids_.empty() && checkpoint_ids_.size() <= n &&
-                            (checkpoint_ids_.size() < n || checkpoint_sampled_head_ == sampled_head) &&
-                            std::equal(checkpoint_ids_.begin(), checkpoint_ids_.end(), ids.begin());
-    Parked* parked = cold ? nullptr :
-        find_parked(ids, extend ? prev.size() : checkpoint ? checkpoint_ids_.size() : 0);
+    const std::size_t extend = live_prefix(ids, flash);
+    const std::size_t checkpoint = extend ? 0 : checkpoint_prefix(ids, flash);
+    Parked* parked = cold ? nullptr : find_parked(ids, std::max(extend, checkpoint), flash);
     std::size_t start = 0;
     if (parked) {
       // parking the live conversation may move the parked list (never evicting the one to restore)
-      const std::vector<std::int32_t> keep = parked->ids;
-      park_live(&keep);
-      unpark(*std::find_if(parked_.begin(), parked_.end(), [&](const Parked& p) { return p.ids == keep; }));
+      const void* keep = parked->data.p;
+      park_live(keep);
+      unpark(*std::find_if(parked_.begin(), parked_.end(), [keep](const Parked& p) { return p.data.p == keep; }));
       restore_checkpoint();
       start = checkpoint_ids_.size();
       stats.reuse = Reuse::Parked;
     } else if (extend) {
-      start = prev.size();
+      start = extend;
       stats.reuse = Reuse::Extend;
     } else if (checkpoint) {
       restore_checkpoint();
-      start = checkpoint_ids_.size();
+      start = checkpoint;
       stats.reuse = Reuse::Checkpoint;
     } else {
       if (!cold) park_live();
@@ -884,20 +919,39 @@ class EngineGenerator final : public Generator {
       if (flash && dflash2_) dflash2_->reset();
       if (!flash && drafter_) drafter_->reset();
       tokens_in_state_.clear();
-      checkpoint_ids_.clear();
+      clear_checkpoint();
       stats.reuse = Reuse::None;
     }
     if (rt_.tp()) {
-      if (options_.tp.serve && !rt_.tp()->agree(start, stream)) {
+      // Equal offsets can still come from different target and draft snapshots.
+      const auto reuse = (std::uint64_t(start) << 32) | std::uint32_t(stats.reuse);
+      if (!rt_.tp()->agree(reuse, stream)) {
         forget_state();
         reset_state(st, stream);
-        if (flash && dflash2_) dflash2_->reset();
-        if (!flash && drafter_) drafter_->reset();
         start = 0;
         stats.reuse = Reuse::None;
       }
       rt_.tp()->verify_request((request ^ start) * 1099511628211ull, stream);
     }
+    std::size_t boundary = find_anchor_boundary(ids, images, stop_ids);
+    if (boundary <= start || park_layout(int(boundary), flash).bytes > park_budget_) boundary = 0;
+    std::size_t anchor_at = boundary;
+    if (anchor_at) {
+      for (Parked& p : parked_) {
+        if (p.is_flash == flash && p.ids.size() == anchor_at && std::equal(p.ids.begin(), p.ids.end(), ids.begin())) {
+          p.is_anchor = true;
+          p.used = ++clock_;
+          anchor_at = 0;
+          break;
+        }
+      }
+    }
+    const bool capture_anchor = anchor_at != 0;
+    // A rank that still has the anchor can split with the other rank while it rebuilds its copy.
+    if (rt_.tp() && options_.park_mb > 0 && !cold && !stop_ids.empty() && n >= kMinParked + 16 &&
+        !rt_.tp()->agree(anchor_at, stream))
+      anchor_at = rt_.tp()->agree(boundary, stream) ? boundary : 0;
+
     st.length = int(start);  // decode steps advance the state without its host-side length
     const std::size_t chunk = std::size_t(proceed ? std::min(2048, options_.prefill_chunk) : options_.prefill_chunk);
     struct Encoded {
@@ -911,9 +965,12 @@ class EngineGenerator final : public Generator {
       ++next_image;  // inside the reused prefix
     }
     std::vector<EmbedRows> rows;
-    for (std::size_t s = start; s < n; s += chunk) {
-      const int T = int(std::min(chunk, n - s));
-      for (; next_image < images.size() && std::size_t(images[next_image].pos) < s + std::size_t(T); ++next_image) {
+    for (std::size_t s = start; s < n;) {
+      int T = int(std::min(chunk, n - s));
+      if (anchor_at > s && s + std::size_t(T) > anchor_at) T = int(anchor_at - s);
+      const std::size_t end = s + std::size_t(T);
+      const bool at_anchor = anchor_at == end;
+      for (; next_image < images.size() && std::size_t(images[next_image].pos) < end; ++next_image) {
         const PromptImage& image = images[next_image];
         const auto t = std::chrono::steady_clock::now();
         DeviceBuffer out = vision_->encode(image.rgb->data(), image.height, image.width);
@@ -940,54 +997,62 @@ class EngineGenerator final : public Generator {
       if (flash ? bool(dflash2_) : bool(drafter_)) taps = rm(taps_.p, DType::BF16, {T, NUM_TAPS, HIDDEN});
       prefiller_.run(st, static_cast<const int32_t*>(chunk_tokens_.p), T, int(s),
                      rt_.tp() && (!rt_.tp()->full_logits || options_.tp.rank != 0) ? nullptr : static_cast<float*>(logits_.p), (flash ? bool(dflash2_) : bool(drafter_)) ? &taps : nullptr, rows,
-                     rt_.tp() && !rt_.tp()->full_logits ? static_cast<int32_t*>(logits_.p) : nullptr, (!proceed && !rt_.tp()) || s + T == n);
+                     rt_.tp() && !rt_.tp()->full_logits ? static_cast<int32_t*>(logits_.p) : nullptr,
+                     (!at_anchor && !proceed && !rt_.tp()) || end == n);
       if (!flash && drafter_) {
         drafter_->note_tokens(ids.subspan(s, std::size_t(T)));  // the prompt's tokens join the drafter's shortlist
         drafter_->commit(taps, int(s));
       }
       if (flash && dflash2_) dflash2_->commit(ptr<const __nv_bfloat16>(taps), T, int(s));
-      if (proceed && s + T < n && images.empty()) {
+      if (at_anchor && capture_anchor) park_anchor(ids.first(anchor_at), flash);
+      if (proceed && end < n && images.empty()) {
         const bool go_on = (*proceed)({});
         const bool agreed = !rt_.tp() || rt_.tp()->agree(go_on, stream);
         if (!agreed || !go_on) {
           CUDA_CHECK(cudaStreamSynchronize(stream));
-          tokens_in_state_.assign(ids.begin(), ids.begin() + s + T);
+          tokens_in_state_.assign(ids.begin(), ids.begin() + end);
           if (!cold) park_live();
-          checkpoint_ids_.clear();
-          previous_flash_ = false;
+          clear_checkpoint();
           stats.reused_tokens = int(start);
-          stats.interrupted_prefill_offset = int(s + T);
+          stats.interrupted_prefill_offset = int(end);
           return;
         }
       }
+      s = end;
     }
     if (!encoded.empty()) CUDA_CHECK(cudaStreamSynchronize(stream));  // queued chunks read the rows freed here
     tokens_in_state_.assign(ids.begin(), ids.end());
-    if (start < n && !cold) save_checkpoint();
+    if (start < n && !cold) save_checkpoint(flash);
     stats.reused_tokens = int(start);
   }
 
-  // Conversation parking. A parked conversation is a packed copy of a prompt checkpoint (target state |
-  // drafter checkpoint regions | last logits) plus the target's full-attention rows [0, n) of its n prompt
-  // tokens, in device memory within park_budget_ (least recently used evicted), and the drafter's context
-  // tokens of the checkpoint (its shortlist rows).
+  // Parked prompts hold target state, draft state, and the full-attention rows [0, n). An anchor saved
+  // mid-prefill has no logits and can only be reused when there's a suffix to prefill.
   struct Parked {
     std::vector<std::int32_t> ids, context;
     DeviceBuffer data;
+    bool is_flash = false;
+    bool is_anchor = false;
+    bool has_logits = true;
     bool sampled_head = false;
     std::uint64_t used = 0;
   };
   static constexpr std::size_t kMinParked = 256;  // shorter prompts are cheaper to prefill than to keep
+  static constexpr std::size_t kShieldTokens = 4096;
 
-  // the layout of a parked copy of n tokens: {offset, bytes} of each drafter region, logits, full rows
+  // The packed draft state is either DSpark's live regions or DFlash2's fixed-size ring.
   struct ParkLayout {
     std::array<Drafter::Region, 3> drafter{};
-    std::size_t drafter_off[3] = {}, logits = 0, rows = 0, bytes = 0;
+    std::size_t drafter_off[3] = {}, dflash2_off = 0, dflash2_bytes = 0, logits = 0, rows = 0, bytes = 0;
   };
-  ParkLayout park_layout(int n) const {
+  ParkLayout park_layout(int n, bool flash) const {
     ParkLayout l;
     std::size_t off = checkpoint_drafter_;
-    if (drafter_) {
+    if (flash) {
+      l.dflash2_off = off;
+      l.dflash2_bytes = dflash2_ ? dflash2_->checkpoint_bytes() : 0;
+      off += carved(l.dflash2_bytes);
+    } else if (drafter_) {
       l.drafter = drafter_->checkpoint_regions(n);
       for (int i = 0; i < 3; ++i) l.drafter_off[i] = off, off += carved(l.drafter[i].bytes);
     }
@@ -998,12 +1063,12 @@ class EngineGenerator final : public Generator {
   }
 
   // the parked conversation whose prompt is the longest prefix of `ids`, if longer than `live` (and kMinParked)
-  Parked* find_parked(std::span<const std::int32_t> ids, std::size_t live) {
+  Parked* find_parked(std::span<const std::int32_t> ids, std::size_t live, bool flash) {
     Parked* best = nullptr;
     const bool sampled_head = rt_.tp() && rt_.tp()->full_logits;
     for (Parked& p : parked_)
-      if (p.ids.size() >= kMinParked && p.ids.size() > live && p.ids.size() <= ids.size() &&
-          (p.ids.size() < ids.size() || p.sampled_head == sampled_head) &&
+      if (p.is_flash == flash && p.ids.size() >= kMinParked && p.ids.size() > live && p.ids.size() <= ids.size() &&
+          (p.ids.size() < ids.size() || (p.has_logits && p.sampled_head == sampled_head)) &&
           (!best || p.ids.size() > best->ids.size()) && std::equal(p.ids.begin(), p.ids.end(), ids.begin()))
         best = &p;
     return best;
@@ -1019,58 +1084,114 @@ class EngineGenerator final : public Generator {
     return true;
   }
 
-  // Parks the live conversation's checkpoint (the state after its last prompt; the full rows [0, n) are still
-  // in the caches) unless it is short, already parked or larger than the budget; the parked conversation with
-  // prompt `keep` (if given) stays. Never fails the request: a failed allocation disables parking.
-  void park_live(const std::vector<std::int32_t>* keep = nullptr) {
-    const std::size_t n = checkpoint_ids_.size();
-    if (park_budget_ == 0 || n < kMinParked) return;
-    for (Parked& p : parked_)
-      if (p.ids == checkpoint_ids_ && p.sampled_head == checkpoint_sampled_head_) {
-        p.used = ++clock_;
-        return;
-      }
-    auto kept = [&](const Parked& p) { return keep && p.ids == *keep; };
-    // a parked prefix of this conversation is superseded by it
-    std::erase_if(parked_, [&](const Parked& p) {
-      return !kept(p) && p.ids.size() <= n && std::equal(p.ids.begin(), p.ids.end(), checkpoint_ids_.begin());
-    });
-    const ParkLayout l = park_layout(int(n));
-    std::size_t used = 0, kept_bytes = 0;
-    for (const Parked& p : parked_) used += p.data.bytes, kept_bytes += kept(p) ? p.data.bytes : 0;
-    if (kept_bytes + l.bytes > park_budget_) return;
-    while (used + l.bytes > park_budget_) {  // least recently used first
+  DeviceBuffer allocate_parked(std::size_t bytes, std::size_t n, bool is_anchor, const void* keep = nullptr) {
+    const bool shield = !is_anchor && n < kShieldTokens;
+    auto evictable = [&](const Parked& p) { return p.data.p != keep && (!shield || !p.is_anchor); };
+    std::size_t used = 0, evictable_bytes = 0;
+    for (const Parked& p : parked_) {
+      used += p.data.bytes;
+      if (evictable(p)) evictable_bytes += p.data.bytes;
+    }
+    if (used - evictable_bytes + bytes > park_budget_) return {};
+    while (used + bytes > park_budget_) {
       auto lru = parked_.end();
-      for (auto it = parked_.begin(); it != parked_.end(); ++it)
-        if (!kept(*it) && (lru == parked_.end() || it->used < lru->used)) lru = it;
+      for (auto it = parked_.begin(); it != parked_.end(); ++it) {
+        if (!evictable(*it)) continue;
+        if (lru == parked_.end() || (lru->is_anchor && !it->is_anchor) ||
+            (lru->is_anchor == it->is_anchor && it->used < lru->used))
+          lru = it;
+      }
       used -= lru->data.bytes;
       parked_.erase(lru);
     }
-    Parked p;
     try {
       parking_ = true;  // a failure here must not release the parked conversations through the hook
-      p.data = DeviceBuffer(l.bytes);
+      DeviceBuffer data(bytes);
       parking_ = false;
+      return data;
     } catch (const std::exception& e) {
       parking_ = false;
       std::fprintf(stderr, "conversation parking disabled: %s\n", e.what());
       cudaGetLastError();  // the failed allocation is not a sticky error
       park_budget_ = 0;
-      std::erase_if(parked_, [&](const Parked& q) { return !kept(q); });
-      return;
+      std::erase_if(parked_, evictable);
+      return {};
     }
+  }
+
+  void pack_dspark(Parked& p, const ParkLayout& l) {
+    char* d = static_cast<char*>(p.data.p);
+    const char* c = static_cast<const char*>(checkpoint_.p) + checkpoint_drafter_;
+    for (int i = 0; i < 3; ++i)
+      CUDA_CHECK(cudaMemcpyAsync(d + l.drafter_off[i], c + l.drafter[i].offset, l.drafter[i].bytes,
+                                 cudaMemcpyDeviceToDevice, rt_.stream()));
+    p.context = drafter_->checkpoint_context();
+  }
+
+  // Parks the last prompt checkpoint while its full rows are still in the target cache.
+  // `keep` identifies a parked buffer selected for the upcoming restore.
+  void park_live(const void* keep = nullptr) {
+    const std::size_t n = checkpoint_ids_.size();
+    if (!checkpoint_has_logits_ || park_budget_ == 0 || n < kMinParked) return;
+    const bool flash = checkpoint_is_flash_;
+    for (Parked& p : parked_)
+      if (p.is_flash == flash && p.has_logits && p.ids == checkpoint_ids_ &&
+          p.sampled_head == checkpoint_sampled_head_) {
+        p.used = ++clock_;
+        return;
+      }
+    const ParkLayout l = park_layout(int(n), flash);
+    if (l.bytes > park_budget_) return;
+    // A longer checkpoint supersedes ordinary prefixes of the same draft type.
+    std::erase_if(parked_, [&](const Parked& p) {
+      return p.data.p != keep && !p.is_anchor && p.is_flash == flash && p.ids.size() <= n &&
+             std::equal(p.ids.begin(), p.ids.end(), checkpoint_ids_.begin());
+    });
+    Parked p;
+    p.data = allocate_parked(l.bytes, n, false, keep);
+    if (!p.data.p) return;
     char* d = static_cast<char*>(p.data.p);
     const char* c = static_cast<const char*>(checkpoint_.p);
     const cudaStream_t s = rt_.stream();
     CUDA_CHECK(cudaMemcpyAsync(d, c, checkpoint_drafter_, cudaMemcpyDeviceToDevice, s));
-    for (int i = 0; i < 3 && drafter_; ++i)
-      CUDA_CHECK(cudaMemcpyAsync(d + l.drafter_off[i], c + checkpoint_drafter_ + l.drafter[i].offset,
-                                 l.drafter[i].bytes, cudaMemcpyDeviceToDevice, s));
+    if (flash) {
+      if (dflash2_)
+        CUDA_CHECK(cudaMemcpyAsync(d + l.dflash2_off, dflash2_checkpoint_.p, l.dflash2_bytes,
+                                   cudaMemcpyDeviceToDevice, s));
+    } else if (drafter_) {
+      pack_dspark(p, l);
+    }
     CUDA_CHECK(cudaMemcpyAsync(d + l.logits, c + checkpoint_logits_, logits_.bytes, cudaMemcpyDeviceToDevice, s));
     rt_.save_full_rows(d + l.rows, int(n));
     p.ids = checkpoint_ids_;
+    p.is_flash = flash;
     p.sampled_head = checkpoint_sampled_head_;
-    if (drafter_) p.context = drafter_->checkpoint_context();
+    p.used = ++clock_;
+    parked_.push_back(std::move(p));
+  }
+
+  void park_anchor(std::span<const std::int32_t> ids, bool flash) {
+    const int n = int(ids.size());
+    const ParkLayout l = park_layout(n, flash);
+    // Saving either drafter replaces its checkpoint metadata. Preserve the previous prompt first.
+    if (!checkpoint_ids_.empty()) park_live();
+    Parked p;
+    p.data = allocate_parked(l.bytes, ids.size(), true);
+    if (!p.data.p) return;
+    clear_checkpoint();
+    char* d = static_cast<char*>(p.data.p);
+    rt_.save_checkpoint(d);
+    if (flash) {
+      if (dflash2_) dflash2_->save_checkpoint(d + l.dflash2_off);
+    } else if (drafter_) {
+      drafter_->save_checkpoint(static_cast<char*>(checkpoint_.p) + checkpoint_drafter_);
+      pack_dspark(p, l);
+    }
+    rt_.save_full_rows(d + l.rows, n);
+    p.ids.assign(ids.begin(), ids.end());
+    p.is_flash = flash;
+    p.is_anchor = true;
+    p.has_logits = false;
     p.used = ++clock_;
     parked_.push_back(std::move(p));
   }
@@ -1079,40 +1200,61 @@ class EngineGenerator final : public Generator {
   // full rows into the caches. It stays parked.
   void unpark(Parked& p) {
     const int n = int(p.ids.size());
-    const ParkLayout l = park_layout(n);
+    const ParkLayout l = park_layout(n, p.is_flash);
     const char* d = static_cast<const char*>(p.data.p);
     char* c = static_cast<char*>(checkpoint_.p);
     const cudaStream_t s = rt_.stream();
     CUDA_CHECK(cudaMemcpyAsync(c, d, checkpoint_drafter_, cudaMemcpyDeviceToDevice, s));
-    for (int i = 0; i < 3 && drafter_; ++i)
-      CUDA_CHECK(cudaMemcpyAsync(c + checkpoint_drafter_ + l.drafter[i].offset, d + l.drafter_off[i],
-                                 l.drafter[i].bytes, cudaMemcpyDeviceToDevice, s));
-    CUDA_CHECK(cudaMemcpyAsync(c + checkpoint_logits_, d + l.logits, logits_.bytes, cudaMemcpyDeviceToDevice, s));
+    if (p.is_flash) {
+      if (dflash2_) {
+        CUDA_CHECK(cudaMemcpyAsync(dflash2_checkpoint_.p, d + l.dflash2_off, l.dflash2_bytes,
+                                   cudaMemcpyDeviceToDevice, s));
+        dflash2_->adopt_checkpoint(n);
+      }
+    } else if (drafter_) {
+      for (int i = 0; i < 3; ++i)
+        CUDA_CHECK(cudaMemcpyAsync(c + checkpoint_drafter_ + l.drafter[i].offset, d + l.drafter_off[i],
+                                   l.drafter[i].bytes, cudaMemcpyDeviceToDevice, s));
+      drafter_->adopt_checkpoint(c + checkpoint_drafter_, n, p.context);
+    }
+    if (p.has_logits)
+      CUDA_CHECK(cudaMemcpyAsync(c + checkpoint_logits_, d + l.logits, logits_.bytes, cudaMemcpyDeviceToDevice, s));
     rt_.restore_full_rows(d + l.rows, n);
-    if (drafter_) drafter_->adopt_checkpoint(c + checkpoint_drafter_, n, p.context);
     checkpoint_ids_ = p.ids;
+    checkpoint_is_flash_ = p.is_flash;
+    checkpoint_has_logits_ = p.has_logits;
     checkpoint_sampled_head_ = p.sampled_head;
     p.used = ++clock_;
   }
 
-  // The checkpoint (on the device): target state (Runtime::save_checkpoint) | drafter context
-  // (Drafter::save_checkpoint) | logits of the last prompt token.
-  void save_checkpoint() {
+  // The target state and last prompt logits share checkpoint_. DFlash2 owns a separate ring snapshot.
+  void save_checkpoint(bool flash) {
     char* p = static_cast<char*>(checkpoint_.p);
     rt_.save_checkpoint(p);
-    if (drafter_) drafter_->save_checkpoint(p + checkpoint_drafter_);
+    if (flash) {
+      if (dflash2_) dflash2_->save_checkpoint(dflash2_checkpoint_.p);
+    } else if (drafter_) {
+      drafter_->save_checkpoint(p + checkpoint_drafter_);
+    }
     CUDA_CHECK(cudaMemcpyAsync(p + checkpoint_logits_, logits_.p, logits_.bytes, cudaMemcpyDeviceToDevice,
                                rt_.stream()));
     checkpoint_ids_ = tokens_in_state_;
+    checkpoint_is_flash_ = flash;
+    checkpoint_has_logits_ = true;
     checkpoint_sampled_head_ = rt_.tp() && rt_.tp()->full_logits;
   }
 
   void restore_checkpoint() {
     const char* p = static_cast<const char*>(checkpoint_.p);
     rt_.restore_checkpoint(p);
-    if (drafter_) drafter_->restore_checkpoint(p + checkpoint_drafter_);
-    CUDA_CHECK(cudaMemcpyAsync(logits_.p, p + checkpoint_logits_, logits_.bytes, cudaMemcpyDeviceToDevice,
-                               rt_.stream()));
+    if (checkpoint_is_flash_) {
+      if (dflash2_) dflash2_->restore_checkpoint(dflash2_checkpoint_.p, int(checkpoint_ids_.size()));
+    } else if (drafter_) {
+      drafter_->restore_checkpoint(p + checkpoint_drafter_);
+    }
+    if (checkpoint_has_logits_)
+      CUDA_CHECK(cudaMemcpyAsync(logits_.p, p + checkpoint_logits_, logits_.bytes, cudaMemcpyDeviceToDevice,
+                                 rt_.stream()));
     tokens_in_state_ = checkpoint_ids_;
   }
 
@@ -1162,7 +1304,7 @@ class EngineGenerator final : public Generator {
       for (int i = 0; i < n; ++i) df_idx[std::size_t(i)] = i;
     } else if (batch_draft_type_ == "hybrid") {
       for (int i = 0; i < n; ++i) {
-        if (next_pos[i] <= options_.dflash2_max_ctx) df_idx.push_back(i);
+        if (batch_dflash2_max_ctx_ > 0 && next_pos[i] <= batch_dflash2_max_ctx_) df_idx.push_back(i);
         else ds_idx.push_back(i);
       }
     } else {
@@ -1241,6 +1383,7 @@ class EngineGenerator final : public Generator {
   Dense batch_unembed_;
   BatchState batch_state_;
   std::string batch_draft_type_;
+  int batch_dflash2_max_ctx_ = 0;
   std::unique_ptr<BatchDecoder> batch_dec_;
   std::unique_ptr<BatchDrafter> batch_drafter_;
   std::vector<DeviceBuffer> batch_dflash2_head_storage_;
@@ -1266,15 +1409,17 @@ class EngineGenerator final : public Generator {
   DeviceBuffer chunk_tokens_, logits_, token_, taps_;
   PinnedHostBuffer host_token_;
   // prompt checkpoint (save_checkpoint) and the prompt it holds (empty: none)
-  DeviceBuffer checkpoint_;
+  DeviceBuffer checkpoint_, dflash2_checkpoint_;
   std::size_t checkpoint_drafter_ = 0, checkpoint_logits_ = 0;  // byte offsets in checkpoint_
   std::vector<std::int32_t> checkpoint_ids_;
   std::vector<std::int32_t> tokens_in_state_;
+  bool checkpoint_is_flash_ = false;
+  bool checkpoint_has_logits_ = false;
   bool checkpoint_sampled_head_ = false;
   std::vector<Parked> parked_;
   std::size_t park_budget_ = 0;  // bytes
   std::uint64_t clock_ = 0;      // last use of a parked conversation
-  bool parking_ = false;         // park_live is allocating
+  bool parking_ = false;         // a parked buffer is being allocated
   int release_hook_ = -1;
   std::mutex mutex_;
 };
