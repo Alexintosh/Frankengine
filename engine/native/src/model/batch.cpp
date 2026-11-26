@@ -166,6 +166,11 @@ BatchDecoder::BatchDecoder(const Weights& w, const Ablation& abl, BatchState& st
     head_partials_ = static_cast<int2*>(alloc(kb::head_partials(int(N), layout_.v_end - layout_.v_begin) * sizeof(int2)));
   }
   if (const char* ge = std::getenv("INGINE_BATCH_GRAPH"); ge && *ge && std::atoi(ge) == 0) graph_enabled_ = false;
+  if (const char* gms = std::getenv("INGINE_BATCH_GRAPH_MAX_SEQS"); gms && *gms) {
+    const int parsed = std::atoi(gms);
+    if (parsed >= 0) graph_max_seqs_ = parsed;
+  }
+  graph_max_tokens_ = graph_max_seqs_ * max_m_;
   pin_tokens_ = MappedHostBuffer(N * sizeof(std::int32_t));
   pin_slots_ = MappedHostBuffer(S * sizeof(std::int32_t));
   pin_pos_ = MappedHostBuffer(S * sizeof(std::int64_t));
@@ -286,14 +291,15 @@ std::span<const std::int32_t> BatchDecoder::step(int n, const std::int32_t* m, c
   last_n_ = n, last_verify_ = verify;
 
   const Dense& head_w_chk = unembed_override_ ? *unembed_override_ : w_.unembed;
-  const bool can_graph = graph_enabled_ && (use_nvfp4_head_ || !head_w_chk.fp8()) && n <= 8 && T <= 64;
+  const bool can_graph =
+      graph_enabled_ && (use_nvfp4_head_ || !head_w_chk.fp8()) && n <= graph_max_seqs_ && T <= graph_max_tokens_;
   const GraphKey gkey{n, T, M, keep_logits_};
   bool used_graph = false;
   if (can_graph) {
     if (auto it = graphs_.find(gkey); it != graphs_.end()) {
       it->second.launch(s);
       used_graph = true;
-    } else if (graphs_.size() < 64 && graph_seen_[gkey] >= 2) {
+    } else if (graphs_.size() < 128 && graph_seen_[gkey] >= 2) {
       gemm_->set_capturing(true);
       DecodeGraphDefinition def;
       try {
@@ -419,7 +425,7 @@ void BatchDecoder::run_body(int n, int T, int M, bool verify, std::uint64_t seed
           f32p(layer.attn_norm_mix), xin_, nullptr);
     }
     if (tap < 3 && v == TAP_VISITS[tap]) {
-      if (verify) pk::store_tap(hid, T, taps_ + std::size_t(tap) * H, std::int64_t(NUM_TAPS) * H, s);
+      if (max_m_ > 1) pk::store_tap(hid, T, taps_ + std::size_t(tap) * H, std::int64_t(NUM_TAPS) * H, s);
       ++tap;
     }
 
@@ -553,7 +559,7 @@ void BatchDecoder::run_body(int n, int T, int M, bool verify, std::uint64_t seed
   // ---- final read, taps, the head of every row, one token per row
   mix({B0_, B1_, B2_[2], E_[2]}, part_, y2_, mlp_dirs + std::size_t(prev_v) * H, mlp_w + 4 * std::size_t(prev_v), nullptr,
       f32p(w.final_query), 1, f32p(w.final_norm), xf_, nullptr);
-  if (verify)
+  if (max_m_ > 1)
     CUDA_CHECK(cudaMemcpy2DAsync(taps_ + std::size_t(NUM_TAPS - 1) * H, std::size_t(NUM_TAPS) * H * 2, xf_,
                                  std::size_t(H) * 2, std::size_t(H) * 2, T, cudaMemcpyDeviceToDevice, s));
   const Dense& head_w = unembed_override_ ? *unembed_override_ : w.unembed;

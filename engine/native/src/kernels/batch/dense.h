@@ -46,6 +46,13 @@ void head_sample_nvfp4(const __nv_bfloat16* A, int lda, kernels::head::Nvfp4Matr
                        std::uint64_t seed, float* logits, int ldc, int2* partials, std::int32_t* out,
                        cudaStream_t stream, void* cand_out = nullptr, const std::uint64_t* d_seed = nullptr);
 
+// Fused NVFP4 head + exact top-16 candidate selection per row (raw logits before softcap, tie-break by lowest global id).
+// Supports arbitrary M >= 1 (K = 2304). ws must hold head_topk16_nvfp4_workspace_bytes(M, w.rows) bytes.
+// Writes descending top-16 values to out_vals [M, 16] and global token ids to out_ids [M, 16].
+std::size_t head_topk16_nvfp4_workspace_bytes(int M, int rows);
+void head_topk16_nvfp4(const __nv_bfloat16* A, int lda, kernels::head::Nvfp4Matrix w, int M, void* ws,
+                       float* out_vals, std::int32_t* out_ids, cudaStream_t stream);
+
 // BF16 GEMM, the arithmetic of prefill::Gemm: C[M, N] (row-major, ldc) = A[M, K] (bf16, lda) . B[N, K]^T (bf16,
 // ldb), FP32 accumulation, split-K partials reduced in FP32 only; C is bf16 (rounded once) or fp32.
 // The algorithm is chosen by measurement in place. Shapes are grouped by bucket(M); a group's candidates are the

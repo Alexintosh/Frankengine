@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <vector>
 
 using namespace ingine::test;
@@ -333,6 +334,59 @@ bool test_image_rows(Rng& rng) {
   return ok;
 }
 
+// Native Blackwell FP8 dense GEMM (quantize_fp8_rows + fp8_dense_gemm) against exact FP64 oracle of
+// (A_q * a_scale) . (B_q * b_scale)^T across both 64x64 and 128x128 tiles, BF16 and FP32 outputs.
+double decode_e4m3(uint8_t b) {
+  const int sign = (b >> 7) & 1, exp = (b >> 3) & 15, man = b & 7;
+  double v = (exp == 0) ? std::ldexp(double(man), -9) : std::ldexp(1.0 + double(man) / 8.0, exp - 7);
+  return sign ? -v : v;
+}
+
+bool test_fp8_dense(Rng& rng) {
+  bool ok = true;
+  struct Case { int M, N, K; bool f32; };
+  const Case cases[] = {{17, 37, 64, true}, {17, 37, 64, false}, {135, 196, 128, true}, {135, 196, 128, false}};
+  for (const Case& c : cases) {
+    const auto x = rand_bf16(rng, size_t(c.M) * c.K, 1.0);
+    std::vector<uint8_t> b(size_t(c.N) * c.K);
+    for (auto& v : b) v = e4m3_bits(float(rng.normal() * 2.0));
+    const auto sb = rand_f32(rng, c.N, 0.02, 0.05);
+    DeviceArray<uint16_t> dx(x);
+    DeviceArray<uint8_t> daq(size_t(c.M) * c.K), db(b);
+    DeviceArray<float> dsa(c.M), dsb(sb);
+    DeviceArray<uint8_t> dc(size_t(c.M) * c.N * (c.f32 ? 4 : 2));
+    pk::quantize_fp8_rows(reinterpret_cast<const __nv_bfloat16*>(dx.get()), c.K, c.M, c.K, daq.get(), dsa.get(),
+                          nullptr);
+    pk::fp8_dense_gemm(daq.get(), dsa.get(), c.K, db.get(), dsb.get(), c.K, dc.get(), c.N, c.f32, c.M, c.N, c.K,
+                       nullptr);
+    INGINE_TEST_CUDA(cudaDeviceSynchronize());
+    const auto haq = daq.download();
+    const auto hsa = dsa.download();
+    const auto hdc = dc.download();
+    std::vector<float> got(size_t(c.M) * c.N);
+    if (c.f32) {
+      std::memcpy(got.data(), hdc.data(), got.size() * 4);
+    } else {
+      const auto* p16 = reinterpret_cast<const uint16_t*>(hdc.data());
+      for (size_t i = 0; i < got.size(); ++i) got[i] = bf16_val(p16[i]);
+    }
+    std::vector<double> ref(size_t(c.M) * c.N);
+    for (int m = 0; m < c.M; ++m) {
+      for (int n = 0; n < c.N; ++n) {
+        double acc = 0.0;
+        for (int k = 0; k < c.K; ++k)
+          acc += double(decode_e4m3(haq[size_t(m) * c.K + k])) * double(decode_e4m3(b[size_t(n) * c.K + k]));
+        const double val = acc * double(hsa[m]) * double(sb[n]);
+        ref[size_t(m) * c.N + n] = c.f32 ? val : rbf(val);
+      }
+    }
+    const std::string tag = "fp8_dense " + std::to_string(c.M) + "x" + std::to_string(c.N) + "x" +
+                            std::to_string(c.K) + (c.f32 ? " f32" : " bf16");
+    ok &= check_close(tag.c_str(), got, ref, c.f32 ? 1e-5 : 1e-4, c.f32 ? 1e-5 : 1e-4);
+  }
+  return ok;
+}
+
 }  // namespace
 
 int main() {
@@ -351,6 +405,7 @@ int main() {
   ok &= test_head(rng, false);
   ok &= test_head(rng, true);
   ok &= test_gemm(rng);
+  ok &= test_fp8_dense(rng);
   ok &= test_taps(rng);
   ok &= test_image_rows(rng);
   std::printf("%s\n", ok ? "ALL PASS" : "SOME FAILED");

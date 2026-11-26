@@ -150,7 +150,14 @@ ChatServer::ChatServer(model::Generator& generator, const text::ChatFormat& fmt,
         return images;
       }()),
       created_(std::time(nullptr)),
-      scheduler_(generator, fmt.stop_ids(), options.max_queue) {
+      scheduler_(generator, fmt.stop_ids(), options.max_queue, [&] {
+        std::vector<int32_t> ids;
+        for (std::string_view tok : {text::END_MESSAGE, std::string_view("<|im_end|>"),
+                                     std::string_view("<|eot_id|>"), std::string_view("<|end_of_turn|>")}) {
+          if (auto id = fmt.tokenizer().token_id(tok)) ids.push_back(*id);
+        }
+        return ids;
+      }()) {
   // A pool thread per connection, as ThreadingHTTPServer: the running request, the waiting ones, the ones
   // rejected with 503 and /health probes must all be served concurrently.
   const auto threads = std::max<std::size_t>(16, std::size_t(std::max(0, options.max_queue)) + options.max_batch + 8);
@@ -193,6 +200,46 @@ void ChatServer::handle_get(const httplib::Request& req, httplib::Response& res)
                    {"max_queue", st.max_queue},
                    {"batch_ctx", st.batch_ctx},
                    {"batch_spec", st.batch_spec}});
+  } else if (path == "/v1/telemetry") {
+    const engine::SchedulerStats st = scheduler_.stats();
+    send_json(res, 200,
+              Json{{"model", model_id_},
+                   {"waiting", st.waiting},
+                   {"active", st.active},
+                   {"decoding", st.decoding},
+                   {"max_batch", st.max_batch},
+                   {"batch_ctx", st.batch_ctx},
+                   {"batch_spec", st.batch_spec},
+                   {"live_decode_tok_s", st.live_decode_tok_s},
+                   {"total_decode_tokens", st.total_decode_tokens},
+                   {"total_prefill_tokens", st.total_prefill_tokens},
+                   {"total_batch_steps", st.total_batch_steps},
+                   {"avg_accept_len", st.avg_accept_len},
+                   {"clone_slot_lanes", st.clone_slot_lanes},
+                   {"clone_slot_saved_tokens", st.clone_slot_saved_tokens}});
+  } else if (path == "/metrics") {
+    const engine::SchedulerStats st = scheduler_.stats();
+    std::string body;
+    body += "# TYPE frankengine_active_slots gauge\n";
+    body += "frankengine_active_slots " + std::to_string(st.active) + "\n";
+    body += "# TYPE frankengine_decoding_slots gauge\n";
+    body += "frankengine_decoding_slots " + std::to_string(st.decoding) + "\n";
+    body += "# TYPE frankengine_waiting_requests gauge\n";
+    body += "frankengine_waiting_requests " + std::to_string(st.waiting) + "\n";
+    body += "# TYPE frankengine_live_decode_tok_s gauge\n";
+    body += "frankengine_live_decode_tok_s " + std::to_string(st.live_decode_tok_s) + "\n";
+    body += "# TYPE frankengine_avg_accept_len gauge\n";
+    body += "frankengine_avg_accept_len " + std::to_string(st.avg_accept_len) + "\n";
+    body += "# TYPE frankengine_decode_tokens_total counter\n";
+    body += "frankengine_decode_tokens_total " + std::to_string(st.total_decode_tokens) + "\n";
+    body += "# TYPE frankengine_prefill_tokens_total counter\n";
+    body += "frankengine_prefill_tokens_total " + std::to_string(st.total_prefill_tokens) + "\n";
+    body += "# TYPE frankengine_clone_slot_lanes_total counter\n";
+    body += "frankengine_clone_slot_lanes_total " + std::to_string(st.clone_slot_lanes) + "\n";
+    body += "# TYPE frankengine_clone_slot_saved_tokens_total counter\n";
+    body += "frankengine_clone_slot_saved_tokens_total " + std::to_string(st.clone_slot_saved_tokens) + "\n";
+    res.status = 200;
+    res.set_content(body, "text/plain; version=0.0.4; charset=utf-8");
   } else if (path == "/v1/models") {
     send_json(res, 200, Json{{"object", "list"}, {"data", Json::array({model_card()})}});
   } else if (path == "/v1/models/" + model_id_) {

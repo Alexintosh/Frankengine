@@ -83,7 +83,7 @@ int main(int argc, char** argv) {
   double hybrid_dflash2_threshold = 0.50;
   int dflash2_max_ctx = 1536;
   bool dflash2_adaptive = false;
-  std::string draft_type = "dspark", dflash2_dir;
+  std::string draft_type = "dspark", batch_draft_type, dflash2_dir;
   double spec_threshold = 0.8, fake_delay = 0.02;
   // sampling defaults; negative: from generation_config.json
   double temperature = -1, top_p = -1;
@@ -131,6 +131,9 @@ int main(int argc, char** argv) {
   ap.option("--batch-spec-threshold", "", "cumulative draft confidence threshold for --batch-spec (default 0.50)",
             &batch_spec_threshold);
   ap.option("--batch-spec-min", "", "minimum drafts verified per sequence in --batch-spec (default 2)", &batch_spec_min);
+  ap.option("--batch-draft-type", "{dspark,dflash2,hybrid}",
+            "batched drafter implementation (default INGINE_BATCH_DRAFT_TYPE or dspark)",
+            &batch_draft_type, {"dspark", "dflash2", "hybrid"});
   ap.option("--max-queue", "", "requests allowed to wait behind the running one", &max_queue);
   ap.option("--max-model-len", "",
             "context limit (default: generator.max_model_len or tokenizer model_max_length)", &max_model_len);
@@ -193,6 +196,7 @@ int main(int argc, char** argv) {
       options.batch_spec = batch_spec;
       options.batch_spec_threshold = float(batch_spec_threshold);
       options.batch_spec_min = batch_spec_min;
+      options.batch_draft_type = batch_draft_type;
       options.dense_fp8 = dense_fp8;
       options.kv_fp8 = kv_fp8;
       options.spec = spec;

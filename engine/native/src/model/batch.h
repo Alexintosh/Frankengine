@@ -138,6 +138,8 @@ class BatchDecoder {
   DeviceBuffer attn_ws_;
   bool use_nvfp4_head_ = false;
   bool graph_enabled_ = true;
+  int graph_max_seqs_ = 32;
+  int graph_max_tokens_ = 256;
   using GraphKey = std::tuple<int, int, int, bool>;
   std::map<GraphKey, int> graph_seen_;
   std::map<GraphKey, DecodeGraphExecutable> graphs_;

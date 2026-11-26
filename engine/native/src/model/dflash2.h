@@ -12,6 +12,9 @@ namespace ingine::model {
 
 // In-order committed context. Proposal KV is held separately from the ring.
 bool dflash2_full_head();
+bool dflash2_shard_backbone();
+bool dflash2_gqa();
+bool dflash2_shard_fp32();
 
 class DFlash2Head;
 class TpRuntime;
@@ -20,12 +23,17 @@ class DFlash2 {
  public:
   static constexpr int block = 8;
   static constexpr int mask_token = 200056;
-  DFlash2(const std::filesystem::path& checkpoint, cudaStream_t stream, bool nvfp4);
+  DFlash2(const std::filesystem::path& checkpoint, cudaStream_t stream, bool nvfp4,
+          TpRuntime* tp = nullptr, int tp_size = 1, int tp_rank = 0);
   ~DFlash2();
 
   void bind_head(kernels::head::Nvfp4Matrix head, const __nv_bfloat16* embed,
                  const float* embed_norm);
   void bind_sharded_head(DFlash2Head& head, const __nv_bfloat16* embed, const float* embed_norm);
+  void bind_backbone_only(const __nv_bfloat16* embed, const float* embed_norm);
+  bool is_sharded() const;
+  int tp_size() const;
+  int tp_rank() const;
   void warmup();
   const int* propose(int anchor);
   const float* confidence() const;
@@ -34,9 +42,17 @@ class DFlash2 {
   const __nv_bfloat16* forward(const __nv_bfloat16* embeddings);
   const int* select(const int* candidates, const float* unary, const int* anchor);
 
+  // Single-GPU two-rank simulation helpers for parity verification (rank0 and rank1 constructed with
+  // tp == nullptr, tp_size == 2, tp_rank == 0 / 1 on the same stream).
+  static const __nv_bfloat16* forward_pair(DFlash2& rank0, DFlash2& rank1,
+                                           const __nv_bfloat16* embeddings,
+                                           bool fp32_reduce = false);
+  static const int* propose_pair(DFlash2& rank0, DFlash2& rank1, int anchor,
+                                 bool fp32_reduce = false);
+
  private:
   const int* propose(int anchor, bool warming_up);
-  void propose_sharded_head();
+  void propose_sharded_head(const __nv_bfloat16* hidden, bool replicated);
   struct Impl;
   std::unique_ptr<Impl> impl_;
 };
@@ -45,7 +61,7 @@ class DFlash2Head {
  public:
   DFlash2Head(TpRuntime& tp, kernels::head::Nvfp4Matrix matrix, cudaStream_t stream);
   ~DFlash2Head();
-  void run(const __nv_bfloat16* hidden = nullptr);
+  void run(const __nv_bfloat16* hidden = nullptr, bool replicated = false, bool run_merge = true);
   const int* ids() const;
   const float* values() const;
 

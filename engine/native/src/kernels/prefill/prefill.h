@@ -36,6 +36,15 @@ class Gemm {
   Impl* impl_;
 };
 
+// Per-row dynamic FP8 E4M3 quantization (scale[m] = amax / 448) for native Blackwell FP8 dense projections.
+void quantize_fp8_rows(const __nv_bfloat16* x, int ldx, int M, int K, uint8_t* q, float* scale, cudaStream_t stream);
+
+// Native Blackwell FP8 GEMM with fused OUTER_VEC_32F per-row scaling:
+// C[M, N] (row-major, ldc, bf16 or fp32) = (A_q[M, K] * a_scale[M]) . (B_q[N, K] * b_scale[N])^T.
+void fp8_dense_gemm(const uint8_t* A_q, const float* a_scale, int lda,
+                    const void* B_q, const float* b_scale, int ldb,
+                    void* C, int ldc, bool c_fp32, int M, int N, int K, cudaStream_t stream);
+
 // ------------------------------------------------------------------------------------------- attention
 
 // Keys/values of one sliding visit for the chunk: rows [0, 1024) are the ring before the chunk, rotated so
@@ -125,6 +134,7 @@ void gate_inputs(const GateRows& rows, int G, int T, __nv_bfloat16* gin, cudaStr
 // products of the BF16 down projection).
 void gate_apply(const float* h, const float* msg, const float* f, const float* g, const float* norm_w, int T,
                 __nv_bfloat16* out, cudaStream_t stream);
+
 
 // ------------------------------------------------------------------------------------------------- MoE
 

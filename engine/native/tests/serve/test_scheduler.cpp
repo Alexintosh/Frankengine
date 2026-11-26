@@ -160,11 +160,122 @@ void test_shared_prefix_fork() {
   CHECK(cached_hits >= 4);
 }
 
+
+void test_persistent_prefix_anchor_across_waves() {
+  BatchGenerator gen(100);
+  gen.spec_ = 4;
+  Scheduler scheduler(gen, {}, 16);
+  std::vector<int32_t> shared(512, 77);
+
+  // Wave 1: 4 concurrent requests share 512-token prefix -> forks + saves persistent anchor.
+  {
+    std::vector<std::shared_ptr<Job>> wave1;
+    for (int i = 0; i < 4; ++i) {
+      auto p = shared;
+      p.push_back(1000 + i);
+      p.push_back(2000 + i);
+      wave1.push_back(std::make_shared<Job>(std::move(p), 4, Sampling{}));
+      CHECK(scheduler.submit(wave1.back()));
+    }
+    for (auto& job : wave1) CHECK(drain(*job) == std::vector<int32_t>(4, 100));
+  }
+  const int prefilled_after_w1 = gen.prefilled_tokens.load();
+
+  // Wave 2: 4 brand-new requests with DIFFERENT suffixes -> ALL 4 must hit persistent anchor (0 shared tokens prefilled!).
+  {
+    std::vector<std::shared_ptr<Job>> wave2;
+    for (int i = 0; i < 4; ++i) {
+      auto p = shared;
+      p.push_back(3000 + i);
+      p.push_back(4000 + i);
+      wave2.push_back(std::make_shared<Job>(std::move(p), 4, Sampling{}));
+      CHECK(scheduler.submit(wave2.back()));
+    }
+    for (auto& job : wave2) CHECK(drain(*job) == std::vector<int32_t>(4, 100));
+    for (auto& job : wave2) CHECK(job->cached_tokens() == 512);
+  }
+  const int prefilled_w2 = gen.prefilled_tokens.load() - prefilled_after_w1;
+  CHECK(prefilled_w2 == 8);  // only 2 suffix tokens x 4 lanes!
+
+  // Wave 3: anchor must STILL be intact and reusable across waves.
+  {
+    std::vector<std::shared_ptr<Job>> wave3;
+    for (int i = 0; i < 4; ++i) {
+      auto p = shared;
+      p.push_back(5000 + i);
+      p.push_back(6000 + i);
+      wave3.push_back(std::make_shared<Job>(std::move(p), 4, Sampling{}));
+      CHECK(scheduler.submit(wave3.back()));
+    }
+    for (auto& job : wave3) CHECK(drain(*job) == std::vector<int32_t>(4, 100));
+    for (auto& job : wave3) CHECK(job->cached_tokens() == 512);
+  }
+  const int prefilled_w3 = gen.prefilled_tokens.load() - (prefilled_after_w1 + prefilled_w2);
+  CHECK(prefilled_w3 == 8);
+}
+
+void test_prefix_anchor_eviction_at_full_capacity() {
+  BatchGenerator gen(100);
+  gen.spec_ = 4;
+  Scheduler scheduler(gen, {}, 16);
+  std::vector<int32_t> shared(512, 88);
+  {
+    std::vector<std::shared_ptr<Job>> wave1;
+    for (int i = 0; i < 3; ++i) {
+      auto p = shared;
+      p.push_back(100 + i);
+      wave1.push_back(std::make_shared<Job>(std::move(p), 2, Sampling{}));
+      CHECK(scheduler.submit(wave1.back()));
+    }
+    for (auto& job : wave1) CHECK(drain(*job) == std::vector<int32_t>(2, 100));
+  }
+  // Now saturate all 8 slots simultaneously -> anchor slot must be evicted cleanly so peak == 8.
+  gen.peak.store(0);
+  std::vector<std::shared_ptr<Job>> full;
+  for (int i = 0; i < 8; ++i) {
+    full.push_back(std::make_shared<Job>(std::vector<int32_t>{9000 + i, 9100 + i}, 12, Sampling{}));
+    CHECK(scheduler.submit(full.back()));
+  }
+  for (auto& job : full) CHECK(drain(*job) == std::vector<int32_t>(12, 100));
+  CHECK(gen.peak.load() == 8);
+}
+
+void test_system_prompt_anchor_boundary() {
+  BatchGenerator gen(100);
+  gen.spec_ = 4;
+  constexpr int32_t kImEnd = 9999;
+  Scheduler scheduler(gen, {kImEnd}, 16);
+  std::vector<int32_t> sys(320, 55);
+  sys.push_back(kImEnd);  // boundary at 321 tokens
+  auto make_prompt = [&](int tag) {
+    auto p = sys;
+    for (int k = 0; k < 24; ++k) p.push_back(tag * 100 + k);
+    return p;
+  };
+  // Two concurrent requests in Wave 1 with different user suffixes sharing the system prompt + single follow-up Wave 2.
+  auto j1 = std::make_shared<Job>(make_prompt(1), 4, Sampling{});
+  auto j2 = std::make_shared<Job>(make_prompt(2), 4, Sampling{});
+  CHECK(scheduler.submit(j1));
+  CHECK(scheduler.submit(j2));
+  CHECK(drain(*j1) == std::vector<int32_t>(4, 100));
+  CHECK(drain(*j2) == std::vector<int32_t>(4, 100));
+  const int before = gen.prefilled_tokens.load();
+  // Single follow-up request with the same system prompt (even c=1!) must reuse the 321-token system anchor.
+  auto j3 = std::make_shared<Job>(make_prompt(3), 4, Sampling{});
+  CHECK(scheduler.submit(j3));
+  CHECK(drain(*j3) == std::vector<int32_t>(4, 100));
+  CHECK(j3->cached_tokens() == 321);
+  CHECK(gen.prefilled_tokens.load() - before == 24);
+}
+
 }  // namespace
 
 int main() {
   test_batch_capacity_and_cancel();
   test_shared_prefix_fork();
+  test_persistent_prefix_anchor_across_waves();
+  test_prefix_anchor_eviction_at_full_capacity();
+  test_system_prompt_anchor_boundary();
   test_cuts();
   test_cancel_fifo_bound();
   test_failure_and_close();

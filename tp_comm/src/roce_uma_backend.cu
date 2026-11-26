@@ -3,6 +3,7 @@
 #include <cuda/atomic>
 #include <cuda_runtime.h>
 
+#include <cstdlib>
 #include <new>
 
 namespace inkling::comm::detail {
@@ -93,7 +94,6 @@ __device__ std::uint64_t pack(SharedControl* control, std::uint64_t* device_epoc
             make_header(session, op, rank, rail, epoch, slot, part.bytes);
     }
     if (threadIdx.x == 0) control->tx.operation = op;
-    // Every writer orders its stores to the mapped TX area before publication.
     __threadfence_system();
     __syncthreads();
     if (threadIdx.x == 0) {
@@ -431,7 +431,7 @@ __global__ void publish_gather(SharedControl* control, std::uint64_t* device_epo
     }
 }
 
-// The large FP32 path preserves wire headers and per-element summation order.
+// The large FP32/BF16 path preserves wire headers and per-element summation order.
 __global__ void pack_large(SharedControl* control, const std::uint64_t* device_epoch,
                            __grid_constant__ const Buffers buffers,
                            const std::byte* src, std::uint32_t bytes, int rails) {
@@ -457,7 +457,7 @@ __global__ void publish_large(SharedControl* control, std::uint64_t* device_epoc
     if (epoch) await_peer(control, device_epoch, epoch, timeout_ns, trace);
 }
 
-template <bool bypass>
+template <bool bypass, bool bf16>
 __global__ void reduce_large(SharedControl* control, const std::uint64_t* device_epoch,
                              __grid_constant__ const Buffers buffers,
                              const std::byte* src, std::byte* dst, std::uint32_t bytes, int rank, int rails) {
@@ -476,8 +476,8 @@ __global__ void reduce_large(SharedControl* control, const std::uint64_t* device
     for (unsigned i = blockIdx.x * blockDim.x + threadIdx.x; i < part.bytes / sizeof(uint4);
          i += gridDim.x * blockDim.x) {
         const auto x = local[i], y = payload_load<bypass>(peer + i);
-        output[i] = make_uint4(sum_word<false>(x.x, y.x, rank), sum_word<false>(x.y, y.y, rank),
-                               sum_word<false>(x.z, y.z, rank), sum_word<false>(x.w, y.w, rank));
+        output[i] = make_uint4(sum_word<bf16>(x.x, y.x, rank), sum_word<bf16>(x.y, y.y, rank),
+                               sum_word<bf16>(x.z, y.z, rank), sum_word<bf16>(x.w, y.w, rank));
     }
 }
 
@@ -485,6 +485,122 @@ __global__ void consume_large(SharedControl* control, const std::uint64_t* devic
     const auto next = *device_epoch;
     if (next > 1 && !load(control->host_failed) && load(control->ready) == next - 1)
         store(control->consumed.epoch, next - 1);
+}
+
+// Pipelined multi-slice bulk AllReduce (>= 2 MiB): overlaps GPU pack(s+1),
+// dual-rail RDMA(s), and GPU reduce(s-1) within a single epoch and slot on one
+// stream (CUDA Graph safe, zero extra DMA memory).
+__global__ void pack_bulk_slice(SharedControl* control, const std::uint64_t* epoch_ptr,
+                                __grid_constant__ const Buffers buffers,
+                                const std::byte* src, std::uint32_t bytes, int rails,
+                                unsigned slice, unsigned slices) {
+    const auto epoch = *epoch_ptr;
+    if (!epoch || load(control->host_failed)) return;
+    const auto slot = slot_for(epoch);
+    const auto part = stripe(bytes, blockIdx.y, rails);
+    const auto sl = slice_of(part.bytes, slice, slices);
+    const auto* input = reinterpret_cast<const uint4*>(src + part.offset + sl.offset);
+    auto* output = reinterpret_cast<uint4*>(buffers.tx[slot][blockIdx.y] + kHeaderBytes + sl.offset);
+    const unsigned vecs = sl.bytes / sizeof(uint4);
+    for (unsigned i = blockIdx.x * blockDim.x + threadIdx.x; i < vecs; i += gridDim.x * blockDim.x) {
+        output[i] = input[i];
+    }
+    __threadfence_system();
+}
+
+__global__ void publish_bulk_start(SharedControl* control, std::uint64_t* device_epoch,
+                                   __grid_constant__ const Buffers buffers,
+                                   __grid_constant__ const Operation op,
+                                   int rank, int rails, std::uint64_t session, bool trace) {
+    __shared__ std::uint64_t epoch;
+    if (threadIdx.x == 0) {
+        epoch = load(control->host_failed) ? 0 : device_epoch[0];
+        device_epoch[1] = epoch;
+        if (epoch) device_epoch[0] = epoch + 1;
+    }
+    __syncthreads();
+    if (!epoch) return;
+
+    const unsigned slot = slot_for(epoch);
+    const auto wire = wire_bytes(op, rank);
+    if (threadIdx.x < rails_for(wire, rails)) {
+        const auto rail = threadIdx.x;
+        const auto part = stripe(wire, rail, rails);
+        *reinterpret_cast<WireHeader*>(buffers.tx[slot][rail]) =
+            make_header(session, op, rank, rail, epoch, slot, part.bytes);
+    }
+    if (threadIdx.x == 0) control->tx.operation = op;
+    __threadfence_system();
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        store(control->bulk_tx_slice, pack_slice_word(epoch, 1));
+        if (trace) control->tx.publish_ns = gpu_ns();
+        store(control->tx.epoch, epoch);
+    }
+}
+
+__global__ void signal_bulk_tx(SharedControl* control, const std::uint64_t* active_epoch, unsigned ready_slices) {
+    const auto epoch = *active_epoch;
+    if (epoch && !load(control->host_failed)) {
+        __threadfence_system();
+        store(control->bulk_tx_slice, pack_slice_word(epoch, ready_slices));
+    }
+}
+
+__global__ void await_bulk_rx(SharedControl* control, std::uint64_t* device_epoch,
+                              unsigned needed_slices, std::uint64_t timeout_ns) {
+    const auto epoch = device_epoch[1];
+    if (!epoch) return;
+    const auto target = pack_slice_word(epoch, needed_slices);
+    const auto start = gpu_ns();
+    unsigned spins = 0;
+    for (;;) {
+        if (load(control->bulk_rx_slice) >= target) return;
+        if ((++spins & 7u) == 0) {
+            if (load(control->host_failed)) {
+                device_epoch[1] = 0;
+                return;
+            }
+            if (gpu_ns() - start >= timeout_ns) {
+                device_epoch[0] = 0;
+                device_epoch[1] = 0;
+                store(control->gpu_failed, epoch);
+                return;
+            }
+        }
+    }
+}
+
+template <bool bypass, bool bf16>
+__global__ void reduce_bulk_slice(SharedControl* control, const std::uint64_t* active_epoch,
+                                  __grid_constant__ const Buffers buffers,
+                                  const std::byte* src, std::byte* dst, std::uint32_t bytes,
+                                  int rank, int rails, unsigned slice, unsigned slices) {
+    const auto epoch = *active_epoch;
+    if (!epoch || load(control->host_failed)) return;
+    const auto slot = slot_for(epoch);
+    const auto part = stripe(bytes, blockIdx.y, rails);
+    const auto sl = slice_of(part.bytes, slice, slices);
+    const auto* local = reinterpret_cast<const uint4*>(src + part.offset + sl.offset);
+    const auto* peer = reinterpret_cast<const uint4*>(buffers.rx[slot][blockIdx.y] + kHeaderBytes + sl.offset);
+    auto* output = reinterpret_cast<uint4*>(dst + part.offset + sl.offset);
+    const unsigned vecs = sl.bytes / sizeof(uint4);
+    for (unsigned i = blockIdx.x * blockDim.x + threadIdx.x; i < vecs; i += gridDim.x * blockDim.x) {
+        const auto x = local[i], y = payload_load<bypass>(peer + i);
+        output[i] = make_uint4(sum_word<bf16>(x.x, y.x, rank), sum_word<bf16>(x.y, y.y, rank),
+                               sum_word<bf16>(x.z, y.z, rank), sum_word<bf16>(x.w, y.w, rank));
+    }
+}
+
+__global__ void consume_bulk(SharedControl* control, std::uint64_t* device_epoch,
+                             std::uint64_t timeout_ns, bool trace) {
+    const auto epoch = device_epoch[1];
+    if (!epoch) return;
+    if (!await_peer(control, device_epoch, epoch, timeout_ns, trace)) {
+        if (threadIdx.x == 0) device_epoch[1] = 0;
+        return;
+    }
+    if (threadIdx.x == 0) store(control->consumed.epoch, epoch);
 }
 
 class MappedAllocation {
@@ -521,7 +637,10 @@ public:
           // Let the proxy report the CQ/rail failure first when it is responsive.
           timeout_ns_(std::chrono::duration_cast<std::chrono::nanoseconds>(
               options.timeout + std::chrono::milliseconds(20)).count()),
-          visibility_(options.visibility), trace_(options.trace) {
+          visibility_(options.visibility), trace_(options.trace),
+          bulk_pipe_(read_env_bool("INKLING_COMM_BULK_PIPE", true)),
+          bulk_slices_override_(read_env_u32("INKLING_COMM_BULK_SLICES", 0)),
+          large_min_bytes_(read_env_u32("INKLING_COMM_LARGE_MIN_BYTES", 0)) {
         int mapped = 0;
         INKLING_CUDA(cudaDeviceGetAttribute(&mapped, cudaDevAttrCanMapHostMemory, options.cuda_device));
         require(mapped, "CUDA device cannot access mapped host memory");
@@ -654,20 +773,80 @@ private:
         if (gather) {
             publish_gather<<<1, kThreads, 0, stream>>>(gpu_control_, epoch_.value, gpu_buffers_, op, rank_, rails_,
                                                        timeout_ns_, proxy_->session(), trace_);
-        } else if (op.kind == Kind::f32 && bytes >= (1u << 20) && !(bytes % sizeof(uint4)) &&
-            !((reinterpret_cast<std::uintptr_t>(src) | reinterpret_cast<std::uintptr_t>(dst)) & 15)) {
+        } else if ((op.kind == Kind::f32 || op.kind == Kind::bf16) &&
+                   bytes >= (large_min_bytes_ ? large_min_bytes_
+                                              : (op.kind == Kind::bf16 ? kLargeThresholdBytesBf16 : kLargeThresholdBytesF32)) &&
+                   !(bytes % sizeof(uint4)) &&
+                   !((reinterpret_cast<std::uintptr_t>(src) | reinterpret_cast<std::uintptr_t>(dst)) & 15)) {
             const unsigned active_rails = rails_for(bytes, rails_);
-            const dim3 grid(48 / active_rails, active_rails);
-            pack_large<<<grid, kThreads, 0, stream>>>(gpu_control_, epoch_.value, gpu_buffers_, src, bytes, rails_);
-            publish_large<<<1, kThreads, 0, stream>>>(gpu_control_, epoch_.value, gpu_buffers_, op, rank_, rails_,
-                                                      timeout_ns_, proxy_->session(), trace_);
-            if (visibility_ == VisibilityMode::cache_bypass)
-                reduce_large<true><<<grid, kThreads, 0, stream>>>(gpu_control_, epoch_.value, gpu_buffers_,
-                                                                 src, dst, bytes, rank_, rails_);
-            else
-                reduce_large<false><<<grid, kThreads, 0, stream>>>(gpu_control_, epoch_.value, gpu_buffers_,
-                                                                  src, dst, bytes, rank_, rails_);
-            consume_large<<<1, 1, 0, stream>>>(gpu_control_, epoch_.value);
+            const bool is_bf16 = (op.kind == Kind::bf16);
+            const bool bypass = (visibility_ == VisibilityMode::cache_bypass);
+            const unsigned slices = choose_bulk_slices(bytes);
+            if (slices > 1) {
+                op.slices = static_cast<std::uint8_t>(slices);
+                const auto max_rail = std::max(stripe(bytes, 0, rails_).bytes,
+                                               active_rails > 1 ? stripe(bytes, 1, rails_).bytes : 0u);
+                const auto slice_vecs = (slice_of(max_rail, 0, slices).bytes + sizeof(uint4) - 1) / sizeof(uint4);
+                const unsigned bpr = std::max(1u, std::min<unsigned>(48u / active_rails, static_cast<unsigned>((slice_vecs + kThreads - 1) / kThreads)));
+                const dim3 grid(bpr, active_rails);
+                auto launch_reduce = [&](unsigned sl) {
+                    if (bypass) {
+                        if (is_bf16)
+                            reduce_bulk_slice<true, true><<<grid, kThreads, 0, stream>>>(
+                                gpu_control_, epoch_.value + 1, gpu_buffers_, src, dst, bytes, rank_, rails_, sl, slices);
+                        else
+                            reduce_bulk_slice<true, false><<<grid, kThreads, 0, stream>>>(
+                                gpu_control_, epoch_.value + 1, gpu_buffers_, src, dst, bytes, rank_, rails_, sl, slices);
+                    } else {
+                        if (is_bf16)
+                            reduce_bulk_slice<false, true><<<grid, kThreads, 0, stream>>>(
+                                gpu_control_, epoch_.value + 1, gpu_buffers_, src, dst, bytes, rank_, rails_, sl, slices);
+                        else
+                            reduce_bulk_slice<false, false><<<grid, kThreads, 0, stream>>>(
+                                gpu_control_, epoch_.value + 1, gpu_buffers_, src, dst, bytes, rank_, rails_, sl, slices);
+                    }
+                };
+                // Pack slice 0 and immediately publish epoch so RDMA begins right away.
+                pack_bulk_slice<<<grid, kThreads, 0, stream>>>(
+                    gpu_control_, epoch_.value, gpu_buffers_, src, bytes, rails_, 0, slices);
+                publish_bulk_start<<<1, kThreads, 0, stream>>>(
+                    gpu_control_, epoch_.value, gpu_buffers_, op, rank_, rails_, proxy_->session(), trace_);
+                for (unsigned sl = 0; sl < slices; ++sl) {
+                    if (sl + 1 < slices) {
+                        pack_bulk_slice<<<grid, kThreads, 0, stream>>>(
+                            gpu_control_, epoch_.value + 1, gpu_buffers_, src, bytes, rails_, sl + 1, slices);
+                        signal_bulk_tx<<<1, 1, 0, stream>>>(gpu_control_, epoch_.value + 1, sl + 2);
+                    }
+                    await_bulk_rx<<<1, 1, 0, stream>>>(gpu_control_, epoch_.value, sl + 1, timeout_ns_);
+                    launch_reduce(sl);
+                }
+                consume_bulk<<<1, 1, 0, stream>>>(gpu_control_, epoch_.value, timeout_ns_, trace_);
+            } else {
+                const auto max_rail = std::max(stripe(bytes, 0, rails_).bytes,
+                                               active_rails > 1 ? stripe(bytes, 1, rails_).bytes : 0u);
+                const auto rail_vecs = max_rail / sizeof(uint4);
+                const unsigned bpr = std::max(1u, std::min<unsigned>(48u / active_rails, static_cast<unsigned>((rail_vecs + kThreads - 1) / kThreads)));
+                const dim3 grid(bpr, active_rails);
+                pack_large<<<grid, kThreads, 0, stream>>>(gpu_control_, epoch_.value, gpu_buffers_, src, bytes, rails_);
+                publish_large<<<1, kThreads, 0, stream>>>(gpu_control_, epoch_.value, gpu_buffers_, op, rank_, rails_,
+                                                          timeout_ns_, proxy_->session(), trace_);
+                if (bypass) {
+                    if (is_bf16)
+                        reduce_large<true, true><<<grid, kThreads, 0, stream>>>(gpu_control_, epoch_.value, gpu_buffers_,
+                                                                                src, dst, bytes, rank_, rails_);
+                    else
+                        reduce_large<true, false><<<grid, kThreads, 0, stream>>>(gpu_control_, epoch_.value, gpu_buffers_,
+                                                                                 src, dst, bytes, rank_, rails_);
+                } else {
+                    if (is_bf16)
+                        reduce_large<false, true><<<grid, kThreads, 0, stream>>>(gpu_control_, epoch_.value, gpu_buffers_,
+                                                                                 src, dst, bytes, rank_, rails_);
+                    else
+                        reduce_large<false, false><<<grid, kThreads, 0, stream>>>(gpu_control_, epoch_.value, gpu_buffers_,
+                                                                                  src, dst, bytes, rank_, rails_);
+                }
+                consume_large<<<1, 1, 0, stream>>>(gpu_control_, epoch_.value);
+            }
         } else if (visibility_ == VisibilityMode::cache_bypass) {
             collective<true><<<1, kThreads, 0, stream>>>(gpu_control_, epoch_.value, gpu_buffers_,
                                                        src, dst, op, rank_, rails_, timeout_ns_, proxy_->session(), trace_);
@@ -691,8 +870,31 @@ private:
     int rails_;
     std::size_t capacity_;
     std::uint64_t timeout_ns_;
+    static bool read_env_bool(const char* name, bool fallback) {
+        const char* v = std::getenv(name);
+        if (!v || !*v) return fallback;
+        return std::strtol(v, nullptr, 10) != 0;
+    }
+
+    static std::uint32_t read_env_u32(const char* name, std::uint32_t fallback) {
+        const char* v = std::getenv(name);
+        if (!v || !*v) return fallback;
+        const long parsed = std::strtol(v, nullptr, 10);
+        return parsed > 0 ? static_cast<std::uint32_t>(parsed) : fallback;
+    }
+
+    unsigned choose_bulk_slices(std::uint32_t bytes) const {
+        if (!bulk_pipe_ || bytes < kBulkPipeThresholdBytes) return 1;
+        if (bulk_slices_override_ >= 2)
+            return std::min<unsigned>(bulk_slices_override_, kMaxBulkSlices);
+        return 4u;
+    }
+
     VisibilityMode visibility_;
     bool trace_;
+    bool bulk_pipe_;
+    std::uint32_t bulk_slices_override_;
+    std::uint32_t large_min_bytes_;
     MappedAllocation control_;
     MappedAllocation dma_;
     MappedAllocation bounce_;

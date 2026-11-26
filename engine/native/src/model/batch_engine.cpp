@@ -2,11 +2,14 @@
 
 #include "core/device.h"
 #include "kernels/batch/batch.h"
+#include "model/batch_dflash2.h"
 #include "model/batch_drafter.h"
+#include "model/dflash2.h"
 #include "model/prefill.h"
 #include "model/runtime.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <stdexcept>
 #include <string>
@@ -19,6 +22,26 @@ constexpr int TAP_ROW = NUM_TAPS * HIDDEN;  // bf16 per row of taps
 
 // the Gumbel noise of sampling call `draw`
 std::uint64_t seed_of(std::uint64_t draw) { return draw * 0x9E3779B97F4A7C15ull + 0x2545F4914F6CDD1Dull; }
+
+std::string resolve_batch_draft_type(const BatchEngineOptions& o) {
+  std::string dt = o.batch_draft_type;
+  if (dt.empty()) {
+    if (const char* env = std::getenv("INGINE_BATCH_DRAFT_TYPE"); env && *env) dt = env;
+    else if (!o.dflash2_dir.empty()) dt = "dflash2";
+    else dt = "dspark";
+  }
+  if (dt != "dspark" && dt != "dflash2" && dt != "hybrid")
+    throw std::invalid_argument("BatchEngine: batch_draft_type must be dspark, dflash2, or hybrid");
+  return dt;
+}
+
+std::filesystem::path resolve_dflash2_dir(const BatchEngineOptions& o) {
+  if (!o.dflash2_dir.empty()) return o.dflash2_dir;
+  if (const char* env = std::getenv("INKLING_DFLASH2_DIR"); env && *env) return env;
+  const auto sibling = o.model_dir.parent_path() / "Inkling-2-Mini-DFlash2";
+  if (std::filesystem::exists(sibling / "model.safetensors")) return sibling;
+  throw std::invalid_argument("BatchEngine: DFlash2 requires --dflash2-dir or INKLING_DFLASH2_DIR");
+}
 
 }  // namespace
 
@@ -62,18 +85,41 @@ BatchEngine::BatchEngine(const BatchEngineOptions& o)
   if (!(spec_threshold_ >= 0.f && spec_threshold_ < 1.f))
     throw std::invalid_argument("BatchEngine: spec_threshold must be in [0, 1)");
   if (spec_ > 0) {
-    const bool shard_batch_drafter = [] {
-      const char* e = std::getenv("INGINE_SHARD_BATCH_DRAFTER");
-      return !e || !*e || std::atoi(e) != 0;
-    }();
-    if (!tp_ || shard_batch_drafter || tp_->layout.tp_rank == 0) {
-      std::vector<DeviceBuffer> tmp_head;
-      Dense full_head;
-      if (tp_ || !w_.unembed.w.data || w_.unembed.fp8())
-        full_head = load_head(o.model_dir, false, false, stream_.s, tmp_head).dense;
-      drafter_ = std::make_unique<BatchDrafter>(o.model_dir, w_, o.slots, o.ctx, o.slots, stream_.s,
-                                                BatchDrafter::Precision::MXFP8, full_head.w.data ? &full_head : nullptr,
-                                                shard_batch_drafter ? tp_.get() : nullptr);
+    batch_draft_type_ = resolve_batch_draft_type(o);
+    dflash2_max_ctx_ = std::max(1, o.dflash2_max_ctx);
+    const bool use_dspark = batch_draft_type_ == "dspark" || batch_draft_type_ == "hybrid";
+    const bool use_dflash2 = batch_draft_type_ == "dflash2" || batch_draft_type_ == "hybrid";
+    if (use_dspark) {
+      const bool shard_batch_drafter = [] {
+        const char* e = std::getenv("INGINE_SHARD_BATCH_DRAFTER");
+        return !e || !*e || std::atoi(e) != 0;
+      }();
+      if (!tp_ || shard_batch_drafter || tp_->layout.tp_rank == 0) {
+        std::vector<DeviceBuffer> tmp_head;
+        Dense full_head;
+        if (tp_ || !w_.unembed.w.data || w_.unembed.fp8())
+          full_head = load_head(o.model_dir, false, false, stream_.s, tmp_head).dense;
+        drafter_ = std::make_unique<BatchDrafter>(o.model_dir, w_, o.slots, o.ctx, o.slots, stream_.s,
+                                                  BatchDrafter::Precision::MXFP8, full_head.w.data ? &full_head : nullptr,
+                                                  shard_batch_drafter ? tp_.get() : nullptr);
+      }
+    }
+    if (use_dflash2) {
+      if (tp_ && o.head_nvfp4 && !dflash2_full_head()) {
+        dflash2_head_ = std::make_unique<BatchDFlash2Head>(*tp_, w_.unembed_nvfp4, o.slots, stream_.s);
+      }
+      if (!tp_ || tp_->layout.tp_rank == 0) {
+        const auto dir = resolve_dflash2_dir(o);
+        const kernels::head::Nvfp4Matrix* head_ovr = nullptr;
+        kernels::head::Nvfp4Matrix loaded_head{};
+        if (!dflash2_head_ && (tp_ || !w_.unembed_nvfp4.codes)) {
+          loaded_head = load_head(o.model_dir, false, true, stream_.s, dflash2_head_storage_).nvfp4;
+          head_ovr = &loaded_head;
+        }
+        dflash2_ = std::make_unique<BatchDFlash2>(dir, w_, o.slots, o.slots, stream_.s,
+                                                  BatchDFlash2::default_precision(), BatchDFlash2::default_kv_fp8(),
+                                                  head_ovr, dflash2_head_.get());
+      }
     }
     taps_chunk_ = DeviceBuffer(std::size_t(prefill_chunk_) * TAP_ROW * 2);
     gathered_ = DeviceBuffer(std::size_t(o.slots) * 8 * TAP_ROW * 2);
@@ -95,8 +141,11 @@ BatchEngine::~BatchEngine() {
 std::string BatchEngine::model_id() const { return ablated_ ? "inkling-2-mini-abliterated" : "inkling-2-mini"; }
 
 std::size_t BatchEngine::device_bytes() const {
+  std::size_t extra = 0;
+  for (const auto& b : dflash2_head_storage_) extra += b.bytes;
   return st_.device_bytes() + dec_->device_bytes() + pf_->device_bytes() + chunk_.bytes + logits_.bytes + first_.bytes +
-         (drafter_ ? drafter_->device_bytes() : 0) + taps_chunk_.bytes + gathered_.bytes + rows_.bytes;
+         (drafter_ ? drafter_->device_bytes() : 0) + (dflash2_ ? dflash2_->device_bytes() : 0) +
+         (dflash2_head_ ? dflash2_head_->device_bytes() : 0) + extra + taps_chunk_.bytes + gathered_.bytes + rows_.bytes;
 }
 
 std::vector<std::int32_t> BatchEngine::admit(std::span<const Admission> requests) {
@@ -111,6 +160,7 @@ std::vector<std::int32_t> BatchEngine::admit(std::span<const Admission> requests
                                   " tokens does not fit a slot of " + std::to_string(st_.ctx) + " positions");
     reset_slot(st_, a.slot, stream_.s);
     if (drafter_) drafter_->reset_slot(a.slot);
+    if (dflash2_) dflash2_->reset_slot(a.slot);
     if (P <= kStepPrefill && P + 8 <= st_.ctx) together.push_back(i);
     else prefill_one(a, first[i]);
   }
@@ -139,12 +189,15 @@ void BatchEngine::prefill_one(const Admission& a, std::int32_t& first) {
     if (tp_) tp_->full_logits = sampled;
     float* log_dst = (!tp_ || (sampled && tp_->layout.tp_rank == 0)) ? static_cast<float*>(logits_.p) : nullptr;
     std::int32_t* grd_dst = (tp_ && !sampled) ? static_cast<std::int32_t*>(first_.p) : nullptr;
+    const bool need_taps = drafter_ || dflash2_;
     pf_->run(v, static_cast<const std::int32_t*>(chunk_.p), T, p, log_dst,
-             drafter_ ? &taps : nullptr, {}, grd_dst, final_chunk);
-    if (drafter_) {
+             need_taps ? &taps : nullptr, {}, grd_dst, final_chunk);
+    if (need_taps) {
       const std::int32_t slot = a.slot, count = T;
       const std::int64_t start = p;
-      drafter_->commit(1, &slot, &start, &count, static_cast<const __nv_bfloat16*>(taps_chunk_.p));
+      const auto* tp_ptr = static_cast<const __nv_bfloat16*>(taps_chunk_.p);
+      if (drafter_) drafter_->commit(1, &slot, &start, &count, tp_ptr);
+      if (dflash2_) dflash2_->commit(1, &slot, &start, &count, tp_ptr);
     }
   }
   const std::uint64_t seed = seed_of(++draws_);
@@ -189,7 +242,7 @@ void BatchEngine::prefill_together(std::span<const Admission> requests, std::spa
     }
     keep_ = m_;
     dec_->accept(keep_.data());  // every prompt row is kept
-    if (drafter_) commit_kept(n);
+    if (drafter_ || dflash2_) commit_kept(n);
   }
 }
 
@@ -200,49 +253,105 @@ void BatchEngine::offsets(int n) {
 }
 
 void BatchEngine::commit_kept(int n) {
-  if (!drafter_) return;
+  if (!drafter_ && !dflash2_) return;
   rows_host_.clear();
   for (int i = 0; i < n; ++i)
     for (int r = 0; r < keep_[std::size_t(i)]; ++r) rows_host_.push_back(off_[std::size_t(i)] + r);
   CUDA_CHECK(cudaMemcpyAsync(rows_.p, rows_host_.data(), rows_host_.size() * 4, cudaMemcpyHostToDevice, stream_.s));
   kernels::batch::gather_rows(dec_->taps(), TAP_ROW, static_cast<const std::int32_t*>(rows_.p), int(rows_host_.size()),
                               static_cast<__nv_bfloat16*>(gathered_.p), stream_.s);
-  drafter_->commit(n, slot_.data(), pos_.data(), keep_.data(), static_cast<const __nv_bfloat16*>(gathered_.p));
+  const auto* gptr = static_cast<const __nv_bfloat16*>(gathered_.p);
+  if (drafter_) drafter_->commit(n, slot_.data(), pos_.data(), keep_.data(), gptr);
+  if (dflash2_) dflash2_->commit(n, slot_.data(), pos_.data(), keep_.data(), gptr);
 }
 
 void BatchEngine::draft(int n) {
+  const auto t0 = std::chrono::steady_clock::now();
   const std::size_t cnt = std::size_t(n) * G;
   draft_host_.resize(cnt), conf_host_.resize(cnt);
-  if (drafter_) {
-    const BatchDrafter::Drafts d =
-        drafter_->draft(n, slot_.data(), anchor_.data(), next_pos_.data(), 0.f, seed_of(++draws_), spec_);
+
+  // Partition indices into DFlash2 vs DSpark subsets (in dflash2 mode all -> df, in dspark mode all -> ds).
+  std::vector<int> df_idx, ds_idx;
+  if (batch_draft_type_ == "dflash2") {
+    df_idx.resize(std::size_t(n));
+    for (int i = 0; i < n; ++i) df_idx[std::size_t(i)] = i;
+  } else if (batch_draft_type_ == "hybrid") {
+    for (int i = 0; i < n; ++i) {
+      if (next_pos_[std::size_t(i)] <= dflash2_max_ctx_) df_idx.push_back(i);
+      else ds_idx.push_back(i);
+    }
+  } else {
+    ds_idx.resize(std::size_t(n));
+    for (int i = 0; i < n; ++i) ds_idx[std::size_t(i)] = i;
+  }
+
+  auto gather_sub = [&](const std::vector<int>& idx, std::vector<std::int32_t>& sl, std::vector<std::int32_t>& an,
+                        std::vector<std::int64_t>& np) {
+    sl.resize(idx.size()), an.resize(idx.size()), np.resize(idx.size());
+    for (std::size_t k = 0; k < idx.size(); ++k) {
+      const int i = idx[k];
+      sl[k] = slot_[std::size_t(i)];
+      an[k] = anchor_[std::size_t(i)];
+      np[k] = next_pos_[std::size_t(i)];
+    }
+  };
+
+  auto scatter_sync = [&](const std::vector<int>& idx, const std::int32_t* dev_tok, const float* dev_conf) {
+    const std::size_t sub_cnt = idx.size() * G;
+    std::vector<std::int32_t> dt(sub_cnt);
+    std::vector<float> dc(sub_cnt);
     if (tp_) {
       auto* base = static_cast<std::byte*>(draft_bcast_.p);
-      if (tp_->layout.tp_rank == 0) {
-        CUDA_CHECK(cudaMemcpyAsync(base, d.tokens, cnt * 4, cudaMemcpyDeviceToDevice, stream_.s));
-        CUDA_CHECK(cudaMemcpyAsync(base + cnt * 4, d.conf, cnt * 4, cudaMemcpyDeviceToDevice, stream_.s));
+      if (tp_->layout.tp_rank == 0 && dev_tok) {
+        CUDA_CHECK(cudaMemcpyAsync(base, dev_tok, sub_cnt * 4, cudaMemcpyDeviceToDevice, stream_.s));
+        CUDA_CHECK(cudaMemcpyAsync(base + sub_cnt * 4, dev_conf, sub_cnt * 4, cudaMemcpyDeviceToDevice, stream_.s));
       }
-      tp_->broadcast_proposal(draft_bcast_.p, cnt * 8, stream_.s);
-      CUDA_CHECK(cudaMemcpyAsync(draft_host_.data(), base, cnt * 4, cudaMemcpyDeviceToHost, stream_.s));
-      CUDA_CHECK(cudaMemcpyAsync(conf_host_.data(), base + cnt * 4, cnt * 4, cudaMemcpyDeviceToHost, stream_.s));
+      tp_->broadcast_proposal(draft_bcast_.p, sub_cnt * 8, stream_.s);
+      CUDA_CHECK(cudaMemcpyAsync(dt.data(), base, sub_cnt * 4, cudaMemcpyDeviceToHost, stream_.s));
+      CUDA_CHECK(cudaMemcpyAsync(dc.data(), base + sub_cnt * 4, sub_cnt * 4, cudaMemcpyDeviceToHost, stream_.s));
       tp_->wait(stream_.s);
     } else {
-      CUDA_CHECK(cudaMemcpyAsync(draft_host_.data(), d.tokens, cnt * 4, cudaMemcpyDeviceToHost, stream_.s));
-      CUDA_CHECK(cudaMemcpyAsync(conf_host_.data(), d.conf, cnt * 4, cudaMemcpyDeviceToHost, stream_.s));
+      CUDA_CHECK(cudaMemcpyAsync(dt.data(), dev_tok, sub_cnt * 4, cudaMemcpyDeviceToHost, stream_.s));
+      CUDA_CHECK(cudaMemcpyAsync(dc.data(), dev_conf, sub_cnt * 4, cudaMemcpyDeviceToHost, stream_.s));
       CUDA_CHECK(cudaStreamSynchronize(stream_.s));
     }
-  } else if (tp_) {
-    ++draws_;
-    auto* base = static_cast<std::byte*>(draft_bcast_.p);
-    tp_->broadcast_proposal(draft_bcast_.p, cnt * 8, stream_.s);
-    CUDA_CHECK(cudaMemcpyAsync(draft_host_.data(), base, cnt * 4, cudaMemcpyDeviceToHost, stream_.s));
-    CUDA_CHECK(cudaMemcpyAsync(conf_host_.data(), base + cnt * 4, cnt * 4, cudaMemcpyDeviceToHost, stream_.s));
-    tp_->wait(stream_.s);
+    for (std::size_t k = 0; k < idx.size(); ++k) {
+      const int sl = slot_[std::size_t(idx[k])];
+      std::copy_n(dt.begin() + std::ptrdiff_t(k) * G, G, drafts_.begin() + std::ptrdiff_t(sl) * G);
+      std::copy_n(dc.begin() + std::ptrdiff_t(k) * G, G, conf_.begin() + std::ptrdiff_t(sl) * G);
+    }
+  };
+
+  if (!df_idx.empty()) {
+    const int ndf = int(df_idx.size());
+    if (dflash2_) {
+      std::vector<std::int32_t> sl, an;
+      std::vector<std::int64_t> np;
+      gather_sub(df_idx, sl, an, np);
+      const BatchDFlash2::Drafts d = dflash2_->propose(ndf, sl.data(), an.data(), np.data());
+      scatter_sync(df_idx, d.tokens, d.conf);
+    } else if (tp_) {
+      if (dflash2_head_) dflash2_head_->run(ndf, nullptr);
+      scatter_sync(df_idx, nullptr, nullptr);
+    }
   }
-  for (int i = 0; i < n; ++i) {
-    std::copy_n(draft_host_.begin() + std::ptrdiff_t(i) * G, G, drafts_.begin() + std::ptrdiff_t(slot_[i]) * G);
-    std::copy_n(conf_host_.begin() + std::ptrdiff_t(i) * G, G, conf_.begin() + std::ptrdiff_t(slot_[i]) * G);
+
+  if (!ds_idx.empty()) {
+    const int nds = int(ds_idx.size());
+    if (drafter_) {
+      std::vector<std::int32_t> sl, an;
+      std::vector<std::int64_t> np;
+      gather_sub(ds_idx, sl, an, np);
+      const BatchDrafter::Drafts d =
+          drafter_->draft(nds, sl.data(), an.data(), np.data(), 0.f, seed_of(++draws_), spec_);
+      scatter_sync(ds_idx, d.tokens, d.conf);
+    } else if (tp_) {
+      ++draws_;
+      scatter_sync(ds_idx, nullptr, nullptr);
+    }
   }
+  draft_seconds_ += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+  ++draft_calls_;
 }
 
 void BatchEngine::step(std::span<Seq> seqs, std::vector<std::vector<std::int32_t>>& emitted) {
@@ -271,8 +380,10 @@ void BatchEngine::step(std::span<Seq> seqs, std::vector<std::vector<std::int32_t
     for (int k = 1; k < m_[std::size_t(i)]; ++k) tok_.push_back(drafts_[std::size_t(q.slot) * G + std::size_t(k - 1)]);
     slot_[i] = q.slot, pos_[i] = q.pos, temp_[i] = q.temperature;
   }
+  const auto tv0 = std::chrono::steady_clock::now();
   const auto got =
       dec_->step(n, m_.data(), tok_.data(), slot_.data(), pos_.data(), temp_.data(), seed_of(++draws_));
+  verify_seconds_ += std::chrono::duration<double>(std::chrono::steady_clock::now() - tv0).count();
   offsets(n);
   if (spec_ == 0) {
     for (int i = 0; i < n; ++i) {

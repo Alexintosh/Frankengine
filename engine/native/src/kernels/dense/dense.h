@@ -57,8 +57,9 @@ void head(const __nv_bfloat16* x, int M, Matrix w, float* out, bool pdl, cudaStr
 // bf16(w[r] . x[m]), R = w.rows; K = 3072 or 9216; same PDL contract as proj.
 void gemv(const __nv_bfloat16* x, int M, int K, Matrix w, float* out, bool pdl, cudaStream_t stream);
 
-// Eight-row DFlash2 projection with E4M3 weights and BF16 output.
+// Eight-row DFlash2 projection with E4M3 weights and BF16 or FP32 output.
 void dflash2_fp8(const __nv_bfloat16* x, Matrix w, __nv_bfloat16* out, cudaStream_t stream);
+void dflash2_fp8_f32(const __nv_bfloat16* x, Matrix w, float* out, cudaStream_t stream);
 
 // fp8_rows: bf16 [rows, K] -> float8_e4m3fn [rows, K] (q) + fp32 scale [rows] = amax / 448.
 void fp8_rows(const __nv_bfloat16* w, int rows, int K, void* q, float* scale, cudaStream_t stream);

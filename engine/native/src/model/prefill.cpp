@@ -16,6 +16,7 @@
 #include "kernels/prefill/prefill.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 
@@ -96,6 +97,12 @@ Prefiller::Prefiller(const Weights& w, const Ablation& abl, int max_chunk, cudaS
   gin_ = rel_;
   gpre_ = fpre_ + C * H;
   wscratch_ = w.dense_fp8 ? bf16(std::size_t(layout_.projection_rows(true)) * H) : nullptr;
+  const char* fp8_env = std::getenv("INGINE_PREFILL_FP8_DENSE");
+  fp8_dense_ = w.dense_fp8 && (!fp8_env || !*fp8_env || std::strtol(fp8_env, nullptr, 10) != 0);
+  if (fp8_dense_) {
+    xq_ = static_cast<std::uint8_t*>(alloc(std::max(3 * C * H, C * layout_.q_dim_local)));
+    x_scale_ = f32(3 * C);
+  }
   ids_ = static_cast<std::int64_t*>(alloc(C * 8));
   for (auto& b : storage_) b.fill(0);  // e.g. gathered sliding rows past ring + chunk: never keys, kept finite
 }
@@ -245,23 +252,48 @@ void Prefiller::run(State& st, const std::int32_t* tokens, int T, int pos0, floa
 
     // ---- projections (fast.proj_layout): one GEMM for a single input, else per input segment
     const int R = layout_.projection_rows(layer.full);
-    const __nv_bfloat16* wp = bf16_rows(layer.wproj);
     const bool single = !layer.full && !msgs;
-    if (single) {
-      gemm_->run(xin_, H, wp, H, proj_, R, false, T, R, H, s);
+    if (fp8_dense_ && T >= 64 && layer.wproj.fp8()) {
+      const auto* wp_q = static_cast<const std::uint8_t*>(layer.wproj.w.data);
+      const float* wp_sc = f32p(layer.wproj.scale);
+      if (single) {
+        pk::quantize_fp8_rows(xin_, H, T, H, xq_, x_scale_, s);
+        pk::fp8_dense_gemm(xq_, x_scale_, H, wp_q, wp_sc, H, proj_, R, false, T, R, H, s);
+      } else {
+        pk::quantize_fp8_rows(xin_, H, 3 * T, H, xq_, x_scale_, s);
+        struct Part {
+          int begin, end, input;
+        };
+        const Part parts[] = {{offsets[SEG_Q], offsets[SEG_K], 0},
+                              {offsets[SEG_K], offsets[SEG_V], 1},
+                              {offsets[SEG_V], offsets[SEG_K_DYN], 2},
+                              {offsets[SEG_K_DYN], offsets[SEG_V_DYN], 1},
+                              {offsets[SEG_V_DYN], offsets[NUM_SEGS], 2}};
+        for (const Part& part : parts) {
+          if (part.begin >= R) break;
+          pk::fp8_dense_gemm(xq_ + std::size_t(part.input) * slab, x_scale_ + std::size_t(part.input) * T, H,
+                             wp_q + std::size_t(part.begin) * H, wp_sc + part.begin, H, proj_ + part.begin, R, false,
+                             T, part.end - part.begin, H, s);
+        }
+      }
     } else {
-      struct Part {
-        int begin, end, input;
-      };
-      const Part parts[] = {{offsets[SEG_Q], offsets[SEG_K], 0},
-                            {offsets[SEG_K], offsets[SEG_V], 1},
-                            {offsets[SEG_V], offsets[SEG_K_DYN], 2},
-                            {offsets[SEG_K_DYN], offsets[SEG_V_DYN], 1},
-                            {offsets[SEG_V_DYN], offsets[NUM_SEGS], 2}};
-      for (const Part& part : parts) {
-        if (part.begin >= R) break;
-        gemm_->run(xin_ + std::size_t(part.input) * slab, H, wp + std::size_t(part.begin) * H, H, proj_ + part.begin,
-                   R, false, T, part.end - part.begin, H, s);
+      const __nv_bfloat16* wp = bf16_rows(layer.wproj);
+      if (single) {
+        gemm_->run(xin_, H, wp, H, proj_, R, false, T, R, H, s);
+      } else {
+        struct Part {
+          int begin, end, input;
+        };
+        const Part parts[] = {{offsets[SEG_Q], offsets[SEG_K], 0},
+                              {offsets[SEG_K], offsets[SEG_V], 1},
+                              {offsets[SEG_V], offsets[SEG_K_DYN], 2},
+                              {offsets[SEG_K_DYN], offsets[SEG_V_DYN], 1},
+                              {offsets[SEG_V_DYN], offsets[NUM_SEGS], 2}};
+        for (const Part& part : parts) {
+          if (part.begin >= R) break;
+          gemm_->run(xin_ + std::size_t(part.input) * slab, H, wp + std::size_t(part.begin) * H, H, proj_ + part.begin,
+                     R, false, T, part.end - part.begin, H, s);
+        }
       }
     }
 
@@ -307,10 +339,16 @@ void Prefiller::run(State& st, const std::int32_t* tokens, int T, int pos0, floa
     pk::attention(at, s);
 
     // ---- output projection + post-attention conv
-    const __nv_bfloat16* wo = bf16_rows(layer.wo);
     const bool wo_fp32 = tp_ && !tp_->bf16_wire(2 * v);
     void* wo_product = wo_fp32 ? static_cast<void*>(partial_) : wo_out_;
-    gemm_->run(attn_out_, q, wo, q, wo_product, H, wo_fp32, T, H, q, s);
+    static const bool fp8_wo = []{ const char* e = std::getenv("INGINE_PREFILL_FP8_WO"); return e && *e && std::strtol(e, nullptr, 10) != 0; }();
+    if (fp8_dense_ && fp8_wo && T >= 64 && layer.wo.fp8()) {
+      pk::quantize_fp8_rows(attn_out_, q, T, q, xq_, x_scale_, s);
+      pk::fp8_dense_gemm(xq_, x_scale_, q, layer.wo.w.data, f32p(layer.wo.scale), q, wo_product, H, wo_fp32, T, H, q, s);
+    } else {
+      const __nv_bfloat16* wo = bf16_rows(layer.wo);
+      gemm_->run(attn_out_, q, wo, q, wo_product, H, wo_fp32, T, H, q, s);
+    }
     if (tp_) reduce(2 * v, wo_out_);
     pk::static_conv(wo_out_, H, T, H, f32p(layer.attn_conv), st.conv_attn_at(v), y_, s);
     pk::conv_state_update(st.conv_attn_at(v), wo_out_, H, T, H, s);
