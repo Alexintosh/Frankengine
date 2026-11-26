@@ -26,15 +26,35 @@ class BatchGenerator final : public ingine::model::Generator {
     return {};
   }
 
-  ingine::model::PrefillChunkResult prefill_slot_chunk(
-      int, std::span<const int32_t> prompt, int offset, ingine::model::BatchSampling&, int stop_at = 0) override {
-    pause();
-    const int target = (stop_at > offset && stop_at < int(prompt.size())) ? stop_at : int(prompt.size());
-    offset = std::min(offset + 2048, target);
-    return {offset, 0, offset == int(prompt.size()) ? std::optional(token_) : std::nullopt};
+  int reusable_prefix(int slot, std::span<const int32_t> prompt) const override {
+    if (slot < 0 || slot >= 8) return 0;
+    const auto& h = histories_[std::size_t(slot)];
+    return !h.empty() && h.size() < prompt.size() && std::equal(h.begin(), h.end(), prompt.begin()) ? int(h.size()) : 0;
   }
 
-  bool clone_slot(int, int) override {
+  ingine::model::PrefillChunkResult prefill_slot_chunk(
+      int slot, std::span<const int32_t> prompt, int offset, ingine::model::BatchSampling&, int stop_at = 0) override {
+    pause();
+    auto& h = histories_[std::size_t(slot)];
+    int reused = 0;
+    if (offset == 0) {
+      reused = reusable_prefix(slot, prompt);
+      offset = reused;
+      if (!offset) h.clear();
+    }
+    if (stop_at > 0 && offset == stop_at && stop_at < int(prompt.size())) {
+      return {offset, reused, std::nullopt};
+    }
+    const int target = (stop_at > offset && stop_at < int(prompt.size())) ? stop_at : int(prompt.size());
+    const int next = std::min(offset + 2048, target);
+    h.insert(h.end(), prompt.begin() + offset, prompt.begin() + next);
+    prefilled_tokens += (next - offset);
+    return {next, reused, next == int(prompt.size()) ? std::optional(token_) : std::nullopt};
+  }
+
+  bool clone_slot(int src, int dst) override {
+    if (src < 0 || src >= 8 || dst < 0 || dst >= 8 || histories_[std::size_t(src)].empty()) return false;
+    histories_[std::size_t(dst)] = histories_[std::size_t(src)];
     ++cloned;
     return true;
   }
@@ -47,7 +67,8 @@ class BatchGenerator final : public ingine::model::Generator {
 
   void release_slot(int) override { ++released; }
 
-  std::atomic<int> peak{0}, released{0}, cloned{0};
+  std::atomic<int> peak{0}, released{0}, cloned{0}, prefilled_tokens{0};
+  std::vector<int32_t> histories_[8];
 
  private:
   static void pause() { std::this_thread::sleep_for(std::chrono::milliseconds(4)); }

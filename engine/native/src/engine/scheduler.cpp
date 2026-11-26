@@ -91,13 +91,17 @@ void Job::finish() {
   cv_.notify_all();
 }
 
-Scheduler::Scheduler(model::Generator& generator, std::vector<int32_t> stop_ids, int max_queue)
+Scheduler::Scheduler(model::Generator& generator, std::vector<int32_t> stop_ids, int max_queue,
+                     std::vector<int32_t> prefix_boundary_ids)
     : generator_(generator),
       stop_list_(std::move(stop_ids)),
       stop_ids_(stop_list_.begin(), stop_list_.end()),
+      boundary_ids_(prefix_boundary_ids.begin(), prefix_boundary_ids.end()),
       max_queue_(max_queue),
       max_batch_(generator.max_batch()),
-      thread_([this] { loop(); }) {}
+      thread_([this] { loop(); }) {
+  boundary_ids_.insert(stop_ids_.begin(), stop_ids_.end());
+}
 
 Scheduler::~Scheduler() { close(); }
 
@@ -196,28 +200,83 @@ void Scheduler::batch_loop() {
         return true;
       });
       if (closed_) return;
+      constexpr int kMinAnchorPrefix = 256;
+      const auto is_active_id = [&](int id) {
+        return std::any_of(slots_.begin(), slots_.end(), [&](const auto& s) { return s.slot == id; });
+      };
+      const auto is_anchor_id = [&](int id) {
+        return std::find(anchor_slots_.begin(), anchor_slots_.end(), id) != anchor_slots_.end();
+      };
+      const auto erase_anchor = [&](int id) {
+        auto it = std::find(anchor_slots_.begin(), anchor_slots_.end(), id);
+        if (it != anchor_slots_.end()) anchor_slots_.erase(it);
+      };
+      const auto touch_anchor = [&](int id) {
+        erase_anchor(id);
+        anchor_slots_.push_back(id);
+      };
       while (!waiting_.empty() && int(slots_.size()) < max_batch_) {
         auto job = waiting_.front();
         const bool solo_only = needs_solo(job);
         if (solo_only && !slots_.empty()) break;
         waiting_.pop_front();
         const bool idle = slots_.empty() && waiting_.empty();
-        int best = -1, prefix = -1;
+        int best_direct = -1, direct_prefix = -1;
+        int best_anchor = -1, anchor_prefix = -1;
+        int first_free_non_anchor = -1;
         for (int id = 0; id < max_batch_; ++id) {
-          if (std::any_of(slots_.begin(), slots_.end(), [&](const auto& s) { return s.slot == id; })) continue;
+          if (is_active_id(id)) continue;
           const int reuse = generator_.reusable_prefix(id, job->prompt_ids);
-          if (reuse > prefix) {
-            best = id;
-            prefix = reuse;
+          if (is_anchor_id(id)) {
+            if (reuse > anchor_prefix) {
+              best_anchor = id;
+              anchor_prefix = reuse;
+            }
+          } else {
+            if (first_free_non_anchor < 0) first_free_non_anchor = id;
+            if (reuse > direct_prefix) {
+              best_direct = id;
+              direct_prefix = reuse;
+            }
           }
         }
-        if (solo_only) best = 0;
-        auto& slot = slots_.emplace_back(ActiveSlot{job, best});
+        int chosen = -1;
+        int pending_src = -1;
+        int pending_len = 0;
+        if (solo_only) {
+          chosen = 0;
+          erase_anchor(0);
+        } else if (direct_prefix > 0 && direct_prefix >= anchor_prefix) {
+          chosen = best_direct;
+        } else if (generator_.batch_spec() > 0 && best_anchor >= 0 && anchor_prefix >= kMinAnchorPrefix) {
+          if (first_free_non_anchor >= 0) {
+            chosen = first_free_non_anchor;
+            pending_src = best_anchor;
+            pending_len = anchor_prefix;
+            touch_anchor(best_anchor);
+          } else {
+            // Full capacity: steal the matching anchor in-place rather than blocking.
+            chosen = best_anchor;
+            erase_anchor(best_anchor);
+          }
+        } else if (first_free_non_anchor >= 0) {
+          chosen = first_free_non_anchor;
+        } else if (!anchor_slots_.empty()) {
+          // Full capacity: evict the oldest LRU anchor slot.
+          chosen = anchor_slots_.front();
+          anchor_slots_.pop_front();
+        } else {
+          chosen = 0;
+        }
+        auto& slot = slots_.emplace_back(ActiveSlot{job, chosen});
         slot.sampling.params = job->sampling;
         slot.sampling.seed = job->sampling.seed ? *job->sampling.seed
             : (uint64_t(std::random_device{}()) << 32) ^ std::random_device{}();
         slot.force_solo = solo_only;
-        slot.solo = solo_only || (idle && best == 0);
+        slot.pending_anchor_src = pending_src;
+        slot.pending_anchor_len = pending_len;
+        // Keep solo mode when truly idle unless a warm persistent prefix anchor already holds >= 256 tokens.
+        slot.solo = solo_only || (idle && chosen == 0 && pending_src < 0 && anchor_prefix < kMinAnchorPrefix);
         job->started();
         if (solo_only) break;
       }
@@ -295,10 +354,95 @@ void Scheduler::batch_loop() {
       return cloned;
     };
 
+    const int max_anchors = (generator_.batch_spec() > 0 && max_batch_ >= 4) ? std::min(4, max_batch_ / 4) : 0;
+    const auto is_slot_active = [&](int id) {
+      return std::any_of(slots_.begin(), slots_.end(), [&](const auto& s) { return s.slot == id; });
+    };
+    const auto has_matching_anchor = [&](std::span<const int32_t> prompt, int len) -> int {
+      for (int aid : anchor_slots_) {
+        if (is_slot_active(aid)) continue;
+        if (generator_.reusable_prefix(aid, prompt) == len) return aid;
+      }
+      return -1;
+    };
+    const auto save_anchor = [&](const ActiveSlot& src) {
+      if (max_anchors <= 0 || src.offset < kMinForkPrefix || src.emitted || src.done || src.job->cancelled()) return;
+      if (const int existing = has_matching_anchor(src.job->prompt_ids, src.offset); existing >= 0) {
+        auto it = std::find(anchor_slots_.begin(), anchor_slots_.end(), existing);
+        if (it != anchor_slots_.end()) {
+          anchor_slots_.erase(it);
+          anchor_slots_.push_back(existing);
+        }
+        return;
+      }
+      int dst = -1;
+      if (int(anchor_slots_.size()) < max_anchors) {
+        // Prefer high-numbered idle non-anchor slots so slot 0 stays available for solo mode.
+        for (int id = max_batch_ - 1; id >= 1; --id) {
+          if (is_slot_active(id)) continue;
+          if (std::find(anchor_slots_.begin(), anchor_slots_.end(), id) != anchor_slots_.end()) continue;
+          dst = id;
+          break;
+        }
+      }
+      if (dst < 0 && !anchor_slots_.empty()) {
+        for (auto it = anchor_slots_.begin(); it != anchor_slots_.end(); ++it) {
+          if (!is_slot_active(*it)) {
+            dst = *it;
+            anchor_slots_.erase(it);
+            break;
+          }
+        }
+      }
+      if (dst < 0) return;
+      try {
+        if (generator_.clone_slot(src.slot, dst)) {
+          anchor_slots_.push_back(dst);
+          server_log().info("prefix-anchor saved: src_slot={} -> anchor_slot={} at {} tokens (pool={}/{})",
+                            src.slot, dst, src.offset, anchor_slots_.size(), max_anchors);
+        }
+      } catch (const std::exception& e) {
+        server_log().error("prefix-anchor save failed ({} -> {}): {}", src.slot, dst, e.what());
+      }
+    };
+    const auto find_system_boundary = [&](std::span<const int32_t> prompt) -> int {
+      if (max_anchors <= 0 || boundary_ids_.empty() || int(prompt.size()) < kMinForkPrefix + 16) return 0;
+      const int limit = int(prompt.size()) - 16;
+      for (int i = 0; i < limit; ++i) {
+        if (boundary_ids_.contains(prompt[std::size_t(i)])) {
+          const int boundary = i + 1;
+          if (boundary >= kMinForkPrefix) return boundary;
+        }
+      }
+      return 0;
+    };
+
+    // Materialize any persistent prefix-anchor clones queued during admission (outside mutex_, before any prefill).
     if (generator_.batch_spec() > 0) {
+      int anchor_hits = 0;
+      for (auto& slot : slots_) {
+        if (slot.pending_anchor_src < 0) continue;
+        const int src_id = slot.pending_anchor_src;
+        const int len = slot.pending_anchor_len;
+        slot.pending_anchor_src = -1;
+        slot.pending_anchor_len = 0;
+        if (slot.done || slot.job->cancelled() || slot.offset > 0) continue;
+        try {
+          if (generator_.clone_slot(src_id, slot.slot)) {
+            slot.offset = len;
+            slot.job->cached_tokens_.store(len);
+            ++anchor_hits;
+          }
+        } catch (const std::exception& e) {
+          server_log().error("prefix-anchor clone failed ({} -> {}): {}", src_id, slot.slot, e.what());
+        }
+      }
+      if (anchor_hits > 0) {
+        server_log().info("prefix-anchor reuse: cloned {} lane(s) from persistent anchor pool", anchor_hits);
+      }
       for (const auto& src : slots_) {
         if (src.offset >= kMinForkPrefix && !src.emitted && !src.done && !src.job->cancelled()) {
-          fork_from(src);
+          if (fork_from(src) > 0) save_anchor(src);
         }
       }
     }
@@ -333,6 +477,7 @@ void Scheduler::batch_loop() {
       if (!prefill) break;
       auto& slot = *prefill;
       int fork_at = 0;
+      bool anchor_boundary = false;
       if (generator_.batch_spec() > 0) {
         for (const auto& other : slots_) {
           if (other.slot == slot.slot || other.job->cancelled() || other.done || other.emitted) continue;
@@ -340,6 +485,14 @@ void Scheduler::batch_loop() {
                                    int(std::min(slot.job->prompt_ids.size(), other.job->prompt_ids.size())) - 1);
           if (lcp >= kMinForkPrefix && lcp > slot.offset && other.offset < lcp) {
             if (fork_at == 0 || lcp < fork_at) fork_at = lcp;
+          }
+        }
+        const int sys_end = find_system_boundary(slot.job->prompt_ids);
+        if (sys_end > slot.offset && has_matching_anchor(slot.job->prompt_ids, sys_end) < 0 &&
+            int(slots_.size()) < max_batch_) {
+          if (fork_at == 0 || sys_end <= fork_at) {
+            fork_at = sys_end;
+            anchor_boundary = true;
           }
         }
       }
@@ -355,7 +508,8 @@ void Scheduler::batch_loop() {
         slot.done = true;
       }
       if (fork_at > 0 && slot.offset == fork_at && !slot.done && !slot.job->cancelled()) {
-        fork_from(slot);
+        const int cloned = fork_from(slot);
+        if (cloned > 0 || anchor_boundary) save_anchor(slot);
         continue;
       }
       prefill_budget -= std::max(1, slot.offset - before);

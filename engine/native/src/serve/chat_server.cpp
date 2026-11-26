@@ -150,7 +150,14 @@ ChatServer::ChatServer(model::Generator& generator, const text::ChatFormat& fmt,
         return images;
       }()),
       created_(std::time(nullptr)),
-      scheduler_(generator, fmt.stop_ids(), options.max_queue) {
+      scheduler_(generator, fmt.stop_ids(), options.max_queue, [&] {
+        std::vector<int32_t> ids;
+        for (std::string_view tok : {text::END_MESSAGE, std::string_view("<|im_end|>"),
+                                     std::string_view("<|eot_id|>"), std::string_view("<|end_of_turn|>")}) {
+          if (auto id = fmt.tokenizer().token_id(tok)) ids.push_back(*id);
+        }
+        return ids;
+      }()) {
   // A pool thread per connection, as ThreadingHTTPServer: the running request, the waiting ones, the ones
   // rejected with 503 and /health probes must all be served concurrently.
   const auto threads = std::max<std::size_t>(16, std::size_t(std::max(0, options.max_queue)) + options.max_batch + 8);

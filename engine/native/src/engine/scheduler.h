@@ -81,7 +81,8 @@ struct SchedulerStats {
 
 class Scheduler {
  public:
-  Scheduler(model::Generator& generator, std::vector<int32_t> stop_ids, int max_queue);
+  Scheduler(model::Generator& generator, std::vector<int32_t> stop_ids, int max_queue,
+            std::vector<int32_t> prefix_boundary_ids = {});
   ~Scheduler();
   Scheduler(const Scheduler&) = delete;
   Scheduler& operator=(const Scheduler&) = delete;
@@ -106,11 +107,14 @@ class Scheduler {
     int32_t token = 0;
     model::BatchSampling sampling;
     bool solo = false, force_solo = false, done = false;
+    int pending_anchor_src = -1;
+    int pending_anchor_len = 0;
   };
 
   model::Generator& generator_;
   const std::vector<int32_t> stop_list_;
   const std::unordered_set<int32_t> stop_ids_;
+  std::unordered_set<int32_t> boundary_ids_;
   const int max_queue_;
   const int max_batch_;
   mutable std::mutex mutex_;
@@ -118,6 +122,7 @@ class Scheduler {
   std::deque<std::shared_ptr<Job>> waiting_;
   std::shared_ptr<Job> active_;
   std::vector<ActiveSlot> slots_;
+  std::deque<int> anchor_slots_;  // LRU (front = oldest, back = MRU) idle prefix-anchor slots
   bool closed_ = false;
   std::thread thread_;
 };
