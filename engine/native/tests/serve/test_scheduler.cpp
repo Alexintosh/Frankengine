@@ -252,29 +252,42 @@ void test_system_prompt_anchor_boundary() {
     for (int k = 0; k < 24; ++k) p.push_back(tag * 100 + k);
     return p;
   };
-  // Two concurrent requests in Wave 1 with different user suffixes sharing the system prompt + single follow-up Wave 2.
+  // Three concurrent requests in Wave 1 with different user suffixes sharing the system prompt + Wave 2 (c=3).
   auto j1 = std::make_shared<Job>(make_prompt(1), 4, Sampling{});
   auto j2 = std::make_shared<Job>(make_prompt(2), 4, Sampling{});
+  auto j2b = std::make_shared<Job>(make_prompt(3), 4, Sampling{});
   CHECK(scheduler.submit(j1));
   CHECK(scheduler.submit(j2));
+  CHECK(scheduler.submit(j2b));
   CHECK(drain(*j1) == std::vector<int32_t>(4, 100));
   CHECK(drain(*j2) == std::vector<int32_t>(4, 100));
-  // Wave 2 (c=2 concurrent requests with different user suffixes) must reuse the 321-token system anchor.
+  CHECK(drain(*j2b) == std::vector<int32_t>(4, 100));
+  // Wave 2 (c=3 concurrent requests with different user suffixes) must reuse the 321-token system anchor.
   const int before = gen.prefilled_tokens.load();
-  auto j3 = std::make_shared<Job>(make_prompt(3), 4, Sampling{});
-  auto j4 = std::make_shared<Job>(make_prompt(4), 4, Sampling{});
+  auto j3 = std::make_shared<Job>(make_prompt(4), 4, Sampling{});
+  auto j4 = std::make_shared<Job>(make_prompt(5), 4, Sampling{});
+  auto j4b = std::make_shared<Job>(make_prompt(6), 4, Sampling{});
   CHECK(scheduler.submit(j3));
   CHECK(scheduler.submit(j4));
+  CHECK(scheduler.submit(j4b));
   CHECK(drain(*j3) == std::vector<int32_t>(4, 100));
   CHECK(drain(*j4) == std::vector<int32_t>(4, 100));
+  CHECK(drain(*j4b) == std::vector<int32_t>(4, 100));
   CHECK(j3->cached_tokens() == 321);
   CHECK(j4->cached_tokens() == 321);
-  CHECK(gen.prefilled_tokens.load() - before == 48);
+  CHECK(j4b->cached_tokens() == 321);
+  CHECK(gen.prefilled_tokens.load() - before == 72);
 
-  // An idle c=1 request must route to fast Solo mode (never trapped in BatchDecoder by a batch anchor).
-  auto j5 = std::make_shared<Job>(make_prompt(5), 4, Sampling{});
-  CHECK(scheduler.submit(j5));
-  CHECK(drain(*j5) == std::vector<int32_t>(4, 100));
+  // Two overlapping requests (e.g. main agent turn + 13K background harness call) must stay in Solo,
+  // never kicking a single user into slower BatchDecoder (c=1..2).
+  gen.peak.store(0);
+  auto s1 = std::make_shared<Job>(make_prompt(7), 8, Sampling{});
+  auto s2 = std::make_shared<Job>(make_prompt(8), 8, Sampling{});
+  CHECK(scheduler.submit(s1));
+  CHECK(scheduler.submit(s2));
+  CHECK(drain(*s1) == std::vector<int32_t>(8, 100));
+  CHECK(drain(*s2) == std::vector<int32_t>(8, 100));
+  CHECK(gen.peak.load() == 0);
   CHECK(scheduler.stats().decoding == 0);
 }
 

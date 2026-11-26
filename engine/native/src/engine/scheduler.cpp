@@ -228,12 +228,19 @@ void Scheduler::batch_loop() {
     return !job->images.empty() ||
            (generator_.batch_spec() > 0 && int(job->prompt_ids.size()) + generator_.batch_spec() + 2 >= generator_.batch_max_ctx());
   };
-  // Tiny side-requests (e.g. UI title generation / short classifiers) finish in ~0.3s in solo mode.
-  // Never interrupt a solo job for a single tiny side-request (or interrupt a tiny solo job right before
-  // it finishes), which would otherwise kick a long single-session agent prompt into BatchDecoder (c=1).
-  const auto is_tiny_side_req = [](const std::shared_ptr<Job>& job) {
-    return job->images.empty() && job->prompt_ids.size() <= 512 && job->max_new_tokens <= 128;
-  };
+  // Minimum concurrent requests required before promoting a fast Solo session into BatchDecoder.
+  // At c=2 on long/sampled prompts (e.g. omp / DeepSeek harness sending a 13K background request alongside
+  // the user's main turn), BatchDecoder runs ~48 tok/s per lane (~96 tok/s sum), which is slower than
+  // sequential Solo (125-186 tok/s) in BOTH per-user speed and total throughput. Requiring c>=3 keeps
+  // single-user + background harness calls on fast Solo while immediately engaging BatchDecoder + BatchDFlash2
+  // for real parallel fan-out (c>=3..32).
+  const int min_batch_conc = [&] {
+    if (generator_.batch_spec() == 0) return 2;
+    if (const char* e = std::getenv("INGINE_BATCH_MIN_CONCURRENCY"); e && *e) {
+      return std::clamp(std::atoi(e), 2, max_batch_);
+    }
+    return std::min(3, max_batch_);
+  }();
   const auto emit = [&](ActiveSlot& slot, std::span<const int32_t> tokens) {
     std::vector<int32_t> out;
     const int ctx_cap = (slot.solo || slot.force_solo) ? generator_.max_model_len() : generator_.batch_max_ctx();
@@ -282,12 +289,10 @@ void Scheduler::batch_loop() {
         const bool solo_only = needs_solo(job);
         if (solo_only && !slots_.empty()) break;
         waiting_.pop_front();
-        const bool idle = slots_.empty() && waiting_.empty();
-        // If a single tiny side-request (e.g. UI title gen) arrives alongside a single real prompt,
-        // serialize them in fast Solo mode rather than promoting both into slower BatchDecoder (c=1..2).
-        const bool solo_with_tiny_peer =
-            slots_.empty() && waiting_.size() == 1 &&
-            (is_tiny_side_req(job) != is_tiny_side_req(waiting_.front()));
+        // When no batch is currently active and total concurrent work (this job + remaining waiting)
+        // is below min_batch_conc (default 3), ALWAYS run in fast Solo mode on slot 0 (Solo maintains
+        // its own 2 GB GPU checkpoint/park cache).
+        const bool route_solo = solo_only || (slots_.empty() && 1 + int(waiting_.size()) < min_batch_conc);
         int best_direct = -1, direct_prefix = -1;
         int best_anchor = -1, anchor_prefix = -1;
         int first_free_non_anchor = -1;
@@ -310,11 +315,6 @@ void Scheduler::batch_loop() {
         int chosen = -1;
         int pending_src = -1;
         int pending_len = 0;
-        // When the server is completely idle (c=1), or only paired with a single tiny side-request,
-        // ALWAYS run in fast Solo mode on slot 0 (Solo maintains its own 2 GB GPU checkpoint/park cache).
-        // Routing an idle c=1 request into BatchDecoder just to hit a batch prefix anchor trades 1-2s of
-        // one-time TTFT for a 2-3x decode slowdown!
-        const bool route_solo = solo_only || idle || solo_with_tiny_peer;
         if (route_solo) {
           chosen = 0;
           erase_anchor(0);
@@ -369,11 +369,8 @@ void Scheduler::batch_loop() {
               emit(first, tokens);
               if (first.done || first.job->cancelled()) return false;
               std::lock_guard lock(mutex_);
-              const bool tiny_guard =
-                  waiting_.size() == 1 &&
-                  (is_tiny_side_req(first.job) || is_tiny_side_req(waiting_.front()));
-              interrupted = !first.force_solo && !tiny_guard && !waiting_.empty() && first.job->images.empty() &&
-                            !needs_solo(waiting_.front()) &&
+              interrupted = !first.force_solo && 1 + int(waiting_.size()) >= min_batch_conc &&
+                            first.job->images.empty() && !needs_solo(waiting_.front()) &&
                             (generator_.batch_spec() == 0 ||
                              int(first.job->prompt_ids.size()) + first.emitted + generator_.batch_spec() + 2 < generator_.batch_max_ctx());
               return !interrupted;
