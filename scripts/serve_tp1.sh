@@ -26,12 +26,21 @@ ARGS=(
   --batch-spec-min "$BATCH_SPEC_MIN"
   --max-queue "$MAX_QUEUE"
   --park-mb "$PARK_MB"
-  --no-vision
   --spec-widths "$SPEC_WIDTHS"
   --spec-threshold "$SPEC_THRESHOLD"
 )
+if [[ "$VISION" == "1" ]]; then
+  ARGS+=(
+    --image-max-tokens "$IMAGE_MAX_TOKENS"
+    --max-images "$MAX_IMAGES"
+    --max-image-tokens "$MAX_IMAGE_TOKENS"
+  )
+else
+  ARGS+=(--no-vision)
+fi
 [[ "$DENSE_FP8" == "1" ]] && ARGS+=(--dense-fp8)
 [[ "$KV_FP8" == "1" ]] && ARGS+=(--kv-fp8)
+[[ "$KV_Q4" == "1" ]] && ARGS+=(--kv-q4)
 [[ "$HEAD_NVFP4" == "1" ]] && ARGS+=(--head-nvfp4)
 [[ "$DRAFT_NVFP4" == "1" ]] && ARGS+=(--draft-nvfp4)
 [[ "$SPEC" == "1" ]] && ARGS+=(--spec)
@@ -50,4 +59,11 @@ if [[ -n "$SERVE_EXTRA_ARGS" ]]; then
 fi
 ARGS+=("$@")
 
-exec "$EXE" "${ARGS[@]}"
+exec env \
+  "INGINE_BATCH_MIN_CONCURRENCY=$BATCH_MIN_CONCURRENCY" \
+  "INGINE_BATCH_PREFILL_CHUNK_WHILE_DECODING=$BATCH_PREFILL_CHUNK_WHILE_DECODING" \
+  "INGINE_BATCH_DECODE_STEPS_PER_PREFILL=$BATCH_DECODE_STEPS_PER_PREFILL" \
+  "INGINE_BATCH_SPEC_ADAPTIVE=$BATCH_SPEC_ADAPTIVE" \
+  "INGINE_BATCH_DFLASH2_MAX_CTX=$BATCH_DFLASH2_MAX_CTX" \
+  "INGINE_DFLASH2_SAMPLED=$DFLASH2_SAMPLED" \
+  "$EXE" "${ARGS[@]}"
