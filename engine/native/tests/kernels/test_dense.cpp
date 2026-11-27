@@ -23,6 +23,37 @@ cudaStream_t g_stream = nullptr;
 
 void sync() { INGINE_TEST_CUDA(cudaStreamSynchronize(g_stream)); }
 
+class ScopedEnv {
+ public:
+  ScopedEnv(const char* name, const char* value) : name_(name) {
+    if (const char* old = std::getenv(name)) old_ = old;
+    INGINE_CHECK(setenv(name_, value, 1) == 0);
+  }
+
+  ~ScopedEnv() {
+    if (old_) INGINE_CHECK(setenv(name_, old_->c_str(), 1) == 0);
+    else INGINE_CHECK(unsetenv(name_) == 0);
+  }
+
+  ScopedEnv(const ScopedEnv&) = delete;
+  ScopedEnv& operator=(const ScopedEnv&) = delete;
+
+ private:
+  const char* name_;
+  std::optional<std::string> old_;
+};
+
+float max_abs_diff(const std::vector<float>& a, const std::vector<float>& b) {
+  INGINE_CHECK(a.size() == b.size());
+  float worst = 0.f;
+  for (size_t i = 0; i < a.size(); ++i) {
+    const float diff = std::fabs(a[i] - b[i]);
+    if (!std::isfinite(diff)) return std::numeric_limits<float>::infinity();
+    worst = std::max(worst, diff);
+  }
+  return worst;
+}
+
 // A random weight matrix [rows, K] as the kernels take it: BF16 values, or FP8 codes + row scales.
 struct Weights {
   int rows = 0, K = 0;
@@ -183,11 +214,32 @@ bool test_router(Rng& rng, int M, bool wf32, bool ties = false) {
   DeviceArray<__nv_bfloat16> dx(to_bf16(x)), dwb(to_bf16(w));
   DeviceArray<float> dwf(w), db(bias), wts(size_t(M) * 8);
   DeviceArray<int> idx(size_t(M) * 8);
-  dense::router(dx.get(), M, wf32 ? static_cast<const void*>(dwf.get()) : static_cast<const void*>(dwb.get()), wf32,
-                db.get(), idx.get(), wts.get(), true, g_stream);
-  sync();
+  auto run = [&](int* dst_idx, float* dst_wts) {
+    dense::router(dx.get(), M, wf32 ? static_cast<const void*>(dwf.get()) : static_cast<const void*>(dwb.get()), wf32,
+                  db.get(), dst_idx, dst_wts, true, g_stream);
+    sync();
+  };
+  const bool compare_mma = !wf32 && M >= 2;
+  if (compare_mma) {
+    const ScopedEnv mma("INGINE_ROUTER_MMA", "1");
+    run(idx.get(), wts.get());
+  } else {
+    run(idx.get(), wts.get());
+  }
   const auto gi = idx.download();
   const auto gw = wts.download();
+  bool parity = true;
+  if (compare_mma) {
+    DeviceArray<int> scalar_idx(gi.size());
+    DeviceArray<float> scalar_wts(gw.size());
+    const ScopedEnv mma("INGINE_ROUTER_MMA", "0");
+    run(scalar_idx.get(), scalar_wts.get());
+    const bool same_idx = gi == scalar_idx.download();
+    const float max_wts = max_abs_diff(gw, scalar_wts.download());
+    parity = same_idx && max_wts < 1e-5f;
+    std::printf("%s router MMA M=%d%s: expert ids %s, max weight diff %.3e\n", parity ? "PASS" : "FAIL", M,
+                ties ? " ties" : "", same_idx ? "match" : "differ", max_wts);
+  }
   bool ok = true;
   std::vector<double> rw(gw.size());
   for (int m = 0; m < M; ++m) {
@@ -210,7 +262,7 @@ bool test_router(Rng& rng, int M, bool wf32, bool ties = false) {
   }
   std::printf("%s router M=%d %s%s: expert ids %s\n", ok ? "PASS" : "FAIL", M, wf32 ? "fp32" : "bf16",
               ties ? " ties" : "", ok ? "match" : "differ");
-  return Check{"router weights", 1e-5, 1e-6, 1.0}(gw, rw) && ok;
+  return Check{"router weights", 1e-5, 1e-6, 1.0}(gw, rw) && ok && parity;
 }
 
 struct MixCase {
@@ -421,6 +473,50 @@ bool test_gates(Rng& rng, int G, int M, bool fg32, bool h_shared = false) {
   return ok;
 }
 
+int bf16_ulp_index(__nv_bfloat16 value) {
+  uint16_t bits;
+  std::memcpy(&bits, &value, sizeof(bits));
+  const int magnitude = bits & 0x7fff;
+  return (bits & 0x8000) ? -magnitude : magnitude;
+}
+
+bool test_gates_mma(Rng& rng, int G, int M, bool h_shared) {
+  const size_t n = size_t(G) * M * H;
+  // Keep the gated outputs away from zero so the per-element ULP bound measures BF16 rounding, even
+  // when the two FP32 accumulations differ. test_gates exercises signed inputs and larger weights.
+  auto h = randn(rng, h_shared ? size_t(M) * H : n, 0.08);
+  for (auto& v : h) v += 0.75f;
+  auto nw = randn(rng, size_t(G) * H, 0.05);
+  for (auto& v : nw) v += 0.5f;
+  DeviceArray<float> dh(h), dm(randn(rng, n, 0.12)), dn(nw);
+  DeviceArray<__nv_bfloat16> wd(to_bf16(randn_bf16(rng, size_t(G) * 64 * 2 * H, 0.015)));
+  DeviceArray<__nv_bfloat16> wf(to_bf16(randn_bf16(rng, size_t(G) * H * 64, 0.03)));
+  DeviceArray<__nv_bfloat16> wg(to_bf16(randn_bf16(rng, size_t(G) * H * 64, 0.03)));
+  DeviceArray<__nv_bfloat16> scalar_bf16(n), mma_bf16(n);
+  DeviceArray<float> scalar_f32(n), mma_f32(n);
+  auto run = [&](const char* path, __nv_bfloat16* out_bf16, float* out_f32) {
+    const ScopedEnv flag("INGINE_GATES_MMA", path);
+    dense::message_gates(dh.get(), h_shared, dm.get(), G, M, wd.get(), wf.get(), wg.get(), false, dn.get(),
+                         out_bf16, out_f32, true, g_stream);
+    sync();
+  };
+  run("0", scalar_bf16.get(), scalar_f32.get());
+  run("1", mma_bf16.get(), mma_f32.get());
+  const auto want = scalar_bf16.download(), got = mma_bf16.download();
+  int max_ulp = 0;
+  float max_bf = 0.f;
+  for (size_t i = 0; i < n; ++i) {
+    max_ulp = std::max(max_ulp, std::abs(bf16_ulp_index(got[i]) - bf16_ulp_index(want[i])));
+    const float diff = std::fabs(bf16_to_float(got[i]) - bf16_to_float(want[i]));
+    max_bf = std::isfinite(diff) ? std::max(max_bf, diff) : std::numeric_limits<float>::infinity();
+  }
+  const float max_fp = max_abs_diff(mma_f32.download(), scalar_f32.download());
+  const bool ok = max_ulp <= 1 && max_bf < 5e-3f && max_fp < 5e-3f;
+  std::printf("%s message_gates MMA G=%d M=%d%s: max BF16 diff %.3e (%d ULP), max FP32 diff %.3e\n",
+              ok ? "PASS" : "FAIL", G, M, h_shared ? " shared-h" : "", max_bf, max_ulp, max_fp);
+  return ok;
+}
+
 bool test_embed(Rng& rng, int M) {
   const int V = 1000;
   const std::vector<float> table = randn_bf16(rng, size_t(V) * H, 0.05);
@@ -479,7 +575,7 @@ bool test_fp8_rows(Rng& rng) {
   return ok;
 }
 
-// ---- Bitwise lock. mix, message_gates and router are exact: on fixed inputs they must keep giving the bits
+// ---- Bitwise lock. mix and the scalar message_gates and router paths are exact: on fixed inputs they must keep giving the bits
 // recorded in kLock (taken from kernels checked byte for byte against the implementation they were ported
 // from). A changed hash means the arithmetic changed (order of a sum, an FMA contraction the compiler chose
 // differently, a rounding point). Either undo that, or, when the change is deliberate and qualified against
@@ -633,6 +729,8 @@ constexpr uint64_t kLock[8][3] = {
 };
 
 bool test_bit_lock() {
+  const ScopedEnv gates("INGINE_GATES_MMA", "0");
+  const ScopedEnv router("INGINE_ROUTER_MMA", "0");
   // Pre-M2 sm_121a build on GB10 with its existing gate-kernel fallback.
   const bool gb10 = is_gb10();
   bool ok = true;
@@ -708,6 +806,11 @@ int main() {
   ok &= test_gates(rng, 1, 5, true);  // FP32 forget/gain with several tokens: one staging buffer
   for (int M : {1, 3, 8}) ok &= test_embed(rng, M);
   ok &= test_fp8_rows(rng);
+  ok &= test_router(rng, 4, false, true);
+  for (int G : {1, 3})
+    for (int M : {2, 4, 8})
+      for (bool shared : {false, true}) ok &= test_gates_mma(rng, G, M, shared);
+  ok &= test_gates_mma(rng, 3, 3, true);  // partial final input staging group
   ok &= test_bit_lock();
   INGINE_TEST_CUDA(cudaStreamDestroy(g_stream));
   std::printf("%s\n", ok ? "ALL PASS" : "SOME FAILED");

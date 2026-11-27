@@ -6,17 +6,21 @@
 // down outputs are broadcast as float4 stores to every CTA's copy of g.
 // Each CTA applies forget and gain to its own channels, broadcasts its sums of squares, and writes the
 // normalized result. With eight CTAs, it stages forget/gain weights in channel tiles to fit shared memory.
+// BF16 M >= 2 uses MMA for both projections. CTAs share the work of a 16-row down tile across K
+// partitions. Each token owner reduces the partials and broadcasts the rounded down outputs.
 // PDL: prefetch the first forget/gain tile and all local down weights before waiting for h and msg.
 // Ported from engine/csrc/dense/gates.cu (torch launchers -> raw pointers).
 #include <cooperative_groups.h>
 
 #include "kernels/common/l2.cuh"
+#include "kernels/common/nvfp4.cuh"
 #include "kernels/dense/cluster.cuh"
 #include "kernels/dense/dense.cuh"
 #include "kernels/dense/dense.h"
 #include "kernels/dense/dsmem.cuh"
 #include "kernels/dense/reduce.cuh"
 
+#include <cstdlib>
 #include <type_traits>
 
 namespace cg = cooperative_groups;
@@ -62,6 +66,37 @@ struct GateCfg {
   static constexpr int XMAX = FG32 ? 1 : 4;       // tokens staged per barrier
 };
 
+template <class C, int NT>
+__device__ __forceinline__ void stage_fg(const GateArgs& a, size_t channel, uint8_t* fg, std::uint64_t wpol) {
+  const auto* fsrc = static_cast<const uint8_t*>(a.w_forget) + channel * C::ROW;
+  const auto* gsrc = static_cast<const uint8_t*>(a.w_gain) + channel * C::ROW;
+  constexpr int RCH = C::ROW / 16;
+  for (int k = threadIdx.x; k < C::TILE_C * RCH; k += NT) {
+    const int dst = (k / RCH) * C::RS + (k % RCH) * 16;
+    l2::cp_async16<WEIGHT_L2>(fg + dst, fsrc + k * 16, wpol);
+    l2::cp_async16<WEIGHT_L2>(fg + C::SLICE + dst, gsrc + k * 16, wpol);
+  }
+  asm volatile("cp.async.commit_group;" ::: "memory");
+}
+
+template <int CL, int M, int NW>
+__device__ __forceinline__ void exchange_squares(float (&sq)[M], float* red, float (&ssall)[CL][4 * ((M + 3) / 4)],
+                                                  int rank, uint32_t mb) {
+  constexpr int MQ = (M + 3) / 4;
+  block_sum_bcast<M, NW>(sq, red);
+  const int t = threadIdx.x;
+  if (t < CL) {  // send to CTA t
+    float r[4 * MQ] = {};
+#pragma unroll
+    for (int m = 0; m < M; ++m) r[m] = sq[m];
+#pragma unroll
+    for (int q = 0; q < MQ; ++q)
+      st_async4(remote(smem_u32(&ssall[rank][4 * q]), t),
+                make_float4(r[4 * q], r[4 * q + 1], r[4 * q + 2], r[4 * q + 3]), remote(mb, t));
+  }
+  mb_wait(mb);
+}
+
 template <int CL, bool FG32, int M>
 __global__ void __launch_bounds__(GateCfg<CL, FG32>::NT) gates_kernel(GateArgs a) {
   using C = GateCfg<CL, FG32>;
@@ -103,19 +138,8 @@ __global__ void __launch_bounds__(GateCfg<CL, FG32>::NT) gates_kernel(GateArgs a
 
   const std::uint64_t wpol = l2::policy<WEIGHT_L2>();
   const int c0 = rank * C::CPC;
-  auto stage_fg = [&](int pass) {
-    const size_t off = (size_t(g) * H + c0 + pass * C::TILE_C) * C::ROW;
-    const uint8_t* fsrc = reinterpret_cast<const uint8_t*>(a.w_forget) + off;
-    const uint8_t* gsrc = reinterpret_cast<const uint8_t*>(a.w_gain) + off;
-    constexpr int RCH = C::ROW / 16;
-    for (int k = t; k < C::TILE_C * RCH; k += C::NT) {
-      const int dst = (k / RCH) * C::RS + (k % RCH) * 16;
-      l2::cp_async16<WEIGHT_L2>(fg + dst, fsrc + size_t(k) * 16, wpol);
-      l2::cp_async16<WEIGHT_L2>(fg + C::SLICE + dst, gsrc + size_t(k) * 16, wpol);
-    }
-    asm volatile("cp.async.commit_group;" ::: "memory");
-  };
-  stage_fg(0);
+  const size_t gate_channel = size_t(g) * H + c0;
+  stage_fg<C, C::NT>(a, gate_channel, fg, wpol);
 
   // Down projection weights -> registers.
   uint4 wv[C::ROW_GROUPS][DCH];
@@ -207,7 +231,7 @@ __global__ void __launch_bounds__(GateCfg<CL, FG32>::NT) gates_kernel(GateArgs a
   for (int pass = 0; pass < C::PASSES; ++pass) {
     if (pass > 0) {
       __syncthreads();  // all threads have finished reading the previous tile
-      stage_fg(pass);
+      stage_fg<C, C::NT>(a, gate_channel + pass * C::TILE_C, fg, wpol);
     }
     const int c = c0 + pass * C::TILE_C + t;
     float hv[M], mv[M];
@@ -263,17 +287,7 @@ __global__ void __launch_bounds__(GateCfg<CL, FG32>::NT) gates_kernel(GateArgs a
   }
 
   // per-token sums of squares of this CTA's channels, sent to every CTA
-  block_sum_bcast<M, C::NW>(sq, red);
-  if (t < CL) {  // to CTA t: the M sums as 16-byte stores
-    float r[4 * MQ] = {};
-#pragma unroll
-    for (int m = 0; m < M; ++m) r[m] = sq[m];
-#pragma unroll
-    for (int q = 0; q < MQ; ++q)
-      st_async4(remote(smem_u32(&ssall[rank][4 * q]), t), make_float4(r[4 * q], r[4 * q + 1], r[4 * q + 2], r[4 * q + 3]),
-                remote(mb_s, t));
-  }
-  mb_wait(mb_s);
+  exchange_squares<CL, M, C::NW>(sq, red, ssall, rank, mb_s);
 
   if (own) {
 #pragma unroll
@@ -291,12 +305,245 @@ __global__ void __launch_bounds__(GateCfg<CL, FG32>::NT) gates_kernel(GateArgs a
   }
 }
 
-template <int CL, bool FG32>
+constexpr int GATE_MMA_WARPS = 9, GATE_MMA_THREADS = 32 * GATE_MMA_WARPS;
+
+template <int CL, int M>
+__global__ void __launch_bounds__(GATE_MMA_THREADS) gates_mma_kernel(GateArgs a) {
+  using C = GateCfg<CL, false>;
+  constexpr int NW = GATE_MMA_WARPS, NT = GATE_MMA_THREADS;
+  constexpr int KPARTS = CL / (RANK / 16), KCTA = 2 * H / KPARTS, KW = KCTA / NW;
+  constexpr int CHUNKS = KW / 32;  // two MMA steps per uint4 pair
+  constexpr int MQ = (M + 3) / 4;
+  static_assert(H % KCTA == 0 && KCTA % NW == 0 && KW % 32 == 0, "uneven down projection split");
+  static_assert(C::TILE_C == NW * 16, "one up projection tile per warp");
+  extern __shared__ __align__(16) uint8_t fg[];
+  auto* gated = reinterpret_cast<float (*)[C::CPC]>(fg + C::SMEM);
+  __shared__ __align__(16) __nv_bfloat16 xs[M][KCTA];
+  __shared__ __align__(16) float down[NW][M][16];
+  __shared__ __align__(16) float partial[KPARTS][RANK];  // received by the owner of token rank
+  __shared__ __align__(16) uint32_t grow[RANK / 2];       // owner's packed BF16 down row
+  __shared__ __align__(16) __nv_bfloat16 gall[M][RANK];   // broadcast down outputs
+  __shared__ __align__(16) float ssall[CL][4 * MQ];
+  __shared__ float red[NW * 32];
+  __shared__ __align__(8) uint64_t mbar[3];
+  constexpr size_t STATIC_SMEM =
+      sizeof(xs) + sizeof(down) + sizeof(partial) + sizeof(grow) + sizeof(gall) + sizeof(ssall) + sizeof(red) + sizeof(mbar);
+  static_assert(STATIC_SMEM <= 48 * 1024, "message_gates MMA must fit the static shared memory limit");
+  static_assert(STATIC_SMEM + C::SMEM + sizeof(float[M][C::CPC]) <= 101376,
+                "message_gates MMA must fit in shared memory");
+
+  const int rank = cg::this_cluster().block_rank(), g = blockIdx.x / CL;
+  const int tile = rank / KPARTS, part = rank % KPARTS;
+  const int t = threadIdx.x, warp = t >> 5, lane = t & 31;
+  const int row = lane >> 2, pair = lane & 3;
+  const float* hg = a.h + (a.h_shared ? size_t(0) : size_t(g) * M * H);
+  const float* mg = a.msg + size_t(g) * M * H;
+  const int c0 = rank * C::CPC;
+  const uint32_t mb_d = smem_u32(&mbar[0]), mb_g = smem_u32(&mbar[1]), mb_s = smem_u32(&mbar[2]);
+  if (t == 0) {
+    mb_init(mb_d);
+    mb_init(mb_g);
+    mb_init(mb_s);
+    fence_mbarrier_init();
+    if (rank < M) mb_expect(mb_d, sizeof(partial));
+    mb_expect(mb_g, sizeof(gall));
+    mb_expect(mb_s, sizeof(ssall));
+  }
+  cluster_arrive_relaxed();
+
+  const std::uint64_t wpol = l2::policy<WEIGHT_L2>();
+  const size_t gate_channel = size_t(g) * H + c0;
+  stage_fg<C, NT>(a, gate_channel, fg, wpol);
+
+  const __nv_bfloat16* wa = a.w_down + (size_t(g) * RANK + tile * 16 + row) * 2 * H + part * KCTA + warp * KW;
+  const __nv_bfloat16* wb = wa + 8 * 2 * H;
+  uint4 aw[CHUNKS], bw[CHUNKS];
+#pragma unroll
+  for (int i = 0; i < CHUNKS; ++i) {
+    const int k = i * 32 + pair * 8;
+    aw[i] = l2::ld_stream<WEIGHT_L2>(wa + k, wpol);
+    bw[i] = l2::ld_stream<WEIGHT_L2>(wb + k, wpol);
+  }
+
+  pdl_wait_fenced(a.zero);
+  pdl_trigger();
+
+  // The K partition is wholly in h or msg. Keep the scalar path's full-half norm and its 256-thread
+  // reduction order. The ninth warp contributes zero and is used by the projections.
+  const bool msg_half = part >= KPARTS / 2;
+  const float* input = msg_half ? mg : hg;
+  const int k0 = part * KCTA % H;
+  constexpr int XNT = C::NT, XPT = H / XNT, XG = 2;
+#pragma unroll 1
+  for (int m0 = 0; m0 < M; m0 += XG) {
+    float values[XG][XPT], ss[XG] = {};
+#pragma unroll
+    for (int j = 0; j < XG; ++j) {
+      if (t < XNT && m0 + j < M) {
+        const float* x = input + (m0 + j) * H + t;
+#pragma unroll
+        for (int k = 0; k < XPT; ++k) {
+          const float v = x[k * XNT];
+          values[j][k] = v;
+          ss[j] = fmaf(v, v, ss[j]);
+        }
+      }
+    }
+    block_sum_bcast<XG, NW>(ss, red);
+#pragma unroll
+    for (int j = 0; j < XG; ++j) {
+      if (t < XNT && m0 + j < M) {
+        const float rinv = rsqrtf(ss[j] / H + EPS);
+#pragma unroll
+        for (int k = 0; k < XPT; ++k) {
+          const int local = k * XNT + t - k0;
+          if (unsigned(local) < KCTA) xs[m0 + j][local] = __float2bfloat16_rn(values[j][k] * rinv);
+        }
+      }
+    }
+    __syncthreads();
+  }
+
+  const __nv_bfloat16* xb = xs[row < M ? row : 0] + warp * KW;
+  float dw[4] = {};
+#pragma unroll
+  for (int i = 0; i < CHUNKS; ++i) {
+    const uint4 v = *reinterpret_cast<const uint4*>(xb + i * 32 + pair * 8);
+    nvfp4::mma_bf16(dw, aw[i].x, bw[i].x, aw[i].y, bw[i].y, v.x, v.y);
+    nvfp4::mma_bf16(dw, aw[i].z, bw[i].z, aw[i].w, bw[i].w, v.z, v.w);
+  }
+  if (2 * pair < M) {
+    down[warp][2 * pair][row] = dw[0];
+    down[warp][2 * pair][row + 8] = dw[2];
+  }
+  if (2 * pair + 1 < M) {
+    down[warp][2 * pair + 1][row] = dw[1];
+    down[warp][2 * pair + 1][row + 8] = dw[3];
+  }
+  __syncthreads();
+
+  cluster_wait();
+  if (t < M * 4) {
+    const int m = t / 4, r = (t % 4) * 4;
+    float4 v = *reinterpret_cast<const float4*>(&down[0][m][r]);
+#pragma unroll
+    for (int i = 1; i < NW; ++i) {
+      const float4 u = *reinterpret_cast<const float4*>(&down[i][m][r]);
+      v.x += u.x; v.y += u.y; v.z += u.z; v.w += u.w;
+    }
+    st_async4(remote(smem_u32(&partial[part][tile * 16 + r]), m), v, remote(mb_d, m));
+  }
+  if (rank < M) {
+    if (t < RANK / 2) {
+      mb_wait(mb_d);
+      const int r = t * 2;
+      float lo, hi;
+      if constexpr (KPARTS == 2) {
+        lo = partial[0][r] + partial[1][r];
+        hi = partial[0][r + 1] + partial[1][r + 1];
+      } else {
+        lo = (partial[0][r] + partial[1][r]) + (partial[2][r] + partial[3][r]);
+        hi = (partial[0][r + 1] + partial[1][r + 1]) + (partial[2][r + 1] + partial[3][r + 1]);
+      }
+      grow[t] = nvfp4::pack_bf16(lo, hi);
+    }
+    __syncthreads();
+    if (t < CL * (RANK / 8)) {
+      const int d = t % CL, q = t / CL;
+      const uint4 u = *reinterpret_cast<const uint4*>(&grow[q * 4]);
+      const float4 v = make_float4(__uint_as_float(u.x), __uint_as_float(u.y),
+                                   __uint_as_float(u.z), __uint_as_float(u.w));
+      st_async4(remote(smem_u32(&gall[rank][q * 8]), d), v, remote(mb_g, d));
+    }
+  }
+
+#pragma unroll
+  for (int pass = 0; pass < C::PASSES; ++pass) {
+    if (pass > 0) {
+      __syncthreads();  // all warps finished reading the previous forget/gain tile
+      stage_fg<C, NT>(a, gate_channel + pass * C::TILE_C, fg, wpol);
+    }
+    asm volatile("cp.async.wait_all;" ::: "memory");
+    __syncthreads();
+    if (pass == 0) mb_wait(mb_g);
+
+    const int up_row = warp * 16 + row;
+    const uint8_t* fa = fg + up_row * C::RS;
+    const uint8_t* fb = fa + 8 * C::RS;
+    const __nv_bfloat16* gv = gall[row < M ? row : 0];
+    float df[4] = {}, dg[4] = {};
+#pragma unroll
+    for (int k = 0; k < RANK; k += 32) {
+      const int col = k + pair * 8;
+      const uint4 v = *reinterpret_cast<const uint4*>(gv + col);
+      const uint4 f0 = *reinterpret_cast<const uint4*>(fa + 2 * col);
+      const uint4 f1 = *reinterpret_cast<const uint4*>(fb + 2 * col);
+      const uint4 g0 = *reinterpret_cast<const uint4*>(fa + C::SLICE + 2 * col);
+      const uint4 g1 = *reinterpret_cast<const uint4*>(fb + C::SLICE + 2 * col);
+      nvfp4::mma_bf16(df, f0.x, f1.x, f0.y, f1.y, v.x, v.y);
+      nvfp4::mma_bf16(df, f0.z, f1.z, f0.w, f1.w, v.z, v.w);
+      nvfp4::mma_bf16(dg, g0.x, g1.x, g0.y, g1.y, v.x, v.y);
+      nvfp4::mma_bf16(dg, g0.z, g1.z, g0.w, g1.w, v.z, v.w);
+    }
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      const int m = 2 * pair + (i & 1);
+      const int c = pass * C::TILE_C + up_row + (i / 2) * 8;
+      if (m < M) {
+        const int j = m * H + c0 + c;
+        gated[m][c] = (1.f - tanhf(df[i])) * hg[j] + tanhf(dg[i]) * mg[j];
+      }
+    }
+  }
+  __syncthreads();
+
+  // Transpose the warp fragments back to one thread per channel for the same RMS exchange as the scalar
+  // kernel. The optional FP32 output is the gated mix before normalization.
+  const bool own = t < C::TILE_C;
+  float values[C::PASSES][M], norm[C::PASSES], sq[M] = {};
+  if (own) {
+#pragma unroll
+    for (int pass = 0; pass < C::PASSES; ++pass) {
+      const int c = pass * C::TILE_C + t, channel = c0 + c;
+      norm[pass] = a.norm_w[size_t(g) * H + channel];
+#pragma unroll
+      for (int m = 0; m < M; ++m) {
+        const float v = gated[m][c];
+        values[pass][m] = v;
+        sq[m] = pass == 0 ? v * v : fmaf(v, v, sq[m]);
+        if (a.out_f32) a.out_f32[(size_t(g) * M + m) * H + channel] = v;
+      }
+    }
+  }
+  exchange_squares<CL, M, NW>(sq, red, ssall, rank, mb_s);
+  if (own) {
+#pragma unroll
+    for (int m = 0; m < M; ++m) {
+      float ss = 0.f;
+#pragma unroll
+      for (int d = 0; d < CL; ++d) ss += ssall[d][m];
+      const float rinv = rsqrtf(ss / H + EPS);
+#pragma unroll
+      for (int pass = 0; pass < C::PASSES; ++pass) {
+        const int c = c0 + pass * C::TILE_C + t;
+        a.out_bf16[(size_t(g) * M + m) * H + c] = __float2bfloat16_rn(values[pass][m] * rinv * norm[pass]);
+      }
+    }
+  }
+}
+
+template <int CL, bool FG32, bool MMA = false>
 void launch_gates(int G, int M, const GateArgs& a, bool pdl, cudaStream_t stream) {
   using C = GateCfg<CL, FG32>;
   auto go = [&](auto mc) {
     constexpr int MM = decltype(mc)::value;
-    launch_ex(gates_kernel<CL, FG32, MM>, dim3(G * CL), C::NT, C::SMEM, CL, pdl, stream, a);
+    if constexpr (MMA && MM >= 2) {
+      static_assert(!MMA || !FG32);
+      constexpr int SMEM = C::SMEM + sizeof(float[MM][C::CPC]);
+      launch_ex(gates_mma_kernel<CL, MM>, dim3(G * CL), GATE_MMA_THREADS, SMEM, CL, pdl, stream, a);
+    } else {
+      launch_ex(gates_kernel<CL, FG32, MM>, dim3(G * CL), C::NT, C::SMEM, CL, pdl, stream, a);
+    }
   };
   switch (M) {
     case 1: go(std::integral_constant<int, 1>{}); break;
@@ -362,11 +609,16 @@ void message_gates(const float* h, bool h_shared, const float* msg, int G, int M
   a.out_bf16 = out_bf16;
   a.out_f32 = out_f32;
   a.zero = 0;
-  if (gates_cluster_size() == 16) {
-    if (fg_fp32) launch_gates<16, true>(G, M, a, pdl, stream);
+  const bool c16 = gates_cluster_size() == 16;
+  const char* mma = (!fg_fp32 && M >= 2) ? std::getenv("INGINE_GATES_MMA") : nullptr;
+  const bool use_mma = !fg_fp32 && M >= 2 && (mma ? mma[0] != '0' : c16);
+  if (c16) {
+    if (use_mma) launch_gates<16, false, true>(G, M, a, pdl, stream);
+    else if (fg_fp32) launch_gates<16, true>(G, M, a, pdl, stream);
     else launch_gates<16, false>(G, M, a, pdl, stream);
   } else {
-    if (fg_fp32) launch_gates<8, true>(G, M, a, pdl, stream);
+    if (use_mma) launch_gates<8, false, true>(G, M, a, pdl, stream);
+    else if (fg_fp32) launch_gates<8, true>(G, M, a, pdl, stream);
     else launch_gates<8, false>(G, M, a, pdl, stream);
   }
 }
