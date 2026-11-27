@@ -38,6 +38,10 @@ constexpr int CommitBatch = 128, Threads = 128;
 constexpr int Block = DFlash2::block, Proposals = Block - 1;
 constexpr int Rank = 256, Vocabulary = 201024, AttentionTile = 128;
 
+__host__ __device__ constexpr bool short_attention(int position) {
+  return position + Block <= AttentionTile;
+}
+
 bool enabled_by_default(const char* name) {
   const char* value = std::getenv(name);
   return !value || std::string_view(value) != "0";
@@ -96,6 +100,101 @@ __global__ void normalize(const Bf* x, const Bf* weight, int width, int heads,
                 out + (slot * heads + head_idx) * width, sums);
 }
 
+using Bf2 = __nv_bfloat162;
+constexpr int Warp = 32, Warps = Threads / Warp, VectorWidth = 8;
+static_assert(Warps == 4 && H % VectorWidth == 0 && (I / 2) % VectorWidth == 0);
+
+__device__ __forceinline__ Bf2 bf16_pair(unsigned bits) {
+  return __nv_bfloat162_raw{static_cast<unsigned short>(bits),
+                          static_cast<unsigned short>(bits >> 16)};
+}
+
+__device__ __forceinline__ unsigned pair_bits(Bf2 pair) {
+  const __nv_bfloat162_raw raw = pair;
+  return unsigned(raw.x) | (unsigned(raw.y) << 16);
+}
+
+__device__ __forceinline__ float warp_sum(float sum) {
+#pragma unroll
+  for (int offset = Warp / 2; offset; offset /= 2)
+    sum += __shfl_xor_sync(0xffffffff, sum, offset);
+  return sum;
+}
+
+__device__ __forceinline__ float hidden_rms_scale(float sum, float* warp_sums) {
+  const int lane = threadIdx.x % Warp;
+  sum = warp_sum(sum);
+  if (!lane) warp_sums[threadIdx.x / Warp] = sum;
+  __syncthreads();
+  sum = (warp_sums[0] + warp_sums[2]) + (warp_sums[1] + warp_sums[3]);
+  return rsqrtf(sum / H + 1e-6f);
+}
+
+__device__ __forceinline__ float add_squares(float sum, unsigned bits) {
+  const float2 x = __bfloat1622float2(bf16_pair(bits));
+  return (sum + x.x * x.x) + x.y * x.y;
+}
+
+__device__ __forceinline__ Bf2 normalize_pair(float2 x, Bf2 weight, float scale) {
+  const float2 w = __bfloat1622float2(weight);
+  return __floats2bfloat162_rn(x.x * scale * w.x, x.y * scale * w.y);
+}
+
+__device__ __forceinline__ unsigned normalize_pair_bits(unsigned x, unsigned weight, float scale) {
+  return pair_bits(normalize_pair(__bfloat1622float2(bf16_pair(x)), bf16_pair(weight), scale));
+}
+
+// 10000^(-2i/D), rounded to FP32. Each lane reads the frequencies for a pair.
+__device__ constexpr float RopeInvFreq[D / 2] = {
+  1.00000000f, 0.865964353f, 0.749894202f, 0.649381638f, 0.562341332f, 0.486967534f, 0.421696514f, 0.365174115f,
+  0.316227764f, 0.273841977f, 0.237137377f, 0.205352500f, 0.177827939f, 0.153992653f, 0.133352146f, 0.115478195f,
+  0.100000001f, 0.0865964293f, 0.0749894232f, 0.0649381652f, 0.0562341325f, 0.0486967526f, 0.0421696492f, 0.0365174115f,
+  0.0316227749f, 0.0273841955f, 0.0237137377f, 0.0205352511f, 0.0177827943f, 0.0153992651f, 0.0133352140f, 0.0115478197f,
+  0.00999999978f, 0.00865964312f, 0.00749894232f, 0.00649381615f, 0.00562341325f, 0.00486967526f, 0.00421696482f, 0.00365174119f,
+  0.00316227763f, 0.00273841969f, 0.00237137382f, 0.00205352507f, 0.00177827943f, 0.00153992651f, 0.00133352145f, 0.00115478202f,
+  0.00100000005f, 0.000865964335f, 0.000749894185f, 0.000649381604f, 0.000562341302f, 0.000486967532f, 0.000421696517f, 0.000365174114f,
+  0.000316227757f, 0.000273841957f, 0.000237137370f, 0.000205352510f, 0.000177827940f, 0.000153992660f, 0.000133352150f, 0.000115478200f,
+};
+
+__device__ __forceinline__ void normalize_head_row(const Bf* x, const Bf* weight, int position, Bf* out) {
+  constexpr int Half = D / 4;  // number of BF16 pairs in each rotary half
+  const int lane = threadIdx.x;
+  const auto* src = reinterpret_cast<const Bf2*>(x);
+  const auto* w = reinterpret_cast<const Bf2*>(weight);
+  auto* dst = reinterpret_cast<Bf2*>(out);
+  const float2 a = __bfloat1622float2(src[lane]);
+  const float2 b = __bfloat1622float2(src[lane + Half]);
+  // Target the same reduction tree as normalize_row: stride 64 first,
+  // then reduce even and odd channels independently before adding them.
+  const float even = __fadd_rn(__fmul_rn(a.x, a.x), __fmul_rn(b.x, b.x));
+  const float odd = __fadd_rn(__fmul_rn(a.y, a.y), __fmul_rn(b.y, b.y));
+  const float scale = rsqrtf((warp_sum(even) + warp_sum(odd)) / D + 1e-6f);
+  const Bf2 norm_a = normalize_pair(a, w[lane], scale);
+  const Bf2 norm_b = normalize_pair(b, w[lane + Half], scale);
+  if (position < 0) {
+    dst[lane] = norm_a;
+    dst[lane + Half] = norm_b;
+    return;
+  }
+  // Round both normalized halves to BF16 before rotating, as in normalize_row.
+  const float2 u = __bfloat1622float2(norm_a), v = __bfloat1622float2(norm_b);
+  float s0, c0, s1, c1;
+  sincosf(position * RopeInvFreq[2 * lane], &s0, &c0);
+  sincosf(position * RopeInvFreq[2 * lane + 1], &s1, &c1);
+  dst[lane] = __floats2bfloat162_rn(u.x * c0 + (-v.x) * s0, u.y * c1 + (-v.y) * s1);
+  dst[lane + Half] = __floats2bfloat162_rn(v.x * c0 + u.x * s0, v.y * c1 + u.y * s1);
+}
+
+__global__ void normalize_head(const Bf* x, const Bf* weight, int heads, int position,
+                               Bf* out, int ring, const int* device_position) {
+  if (device_position) position = *device_position;
+  const int row = blockIdx.x / heads;
+  const int head = blockIdx.x % heads;
+  const int slot = ring ? (position + row) % ring : row;
+  normalize_head_row(x + blockIdx.x * D, weight, position < 0 ? position : position + row,
+                     out + (slot * heads + head) * D);
+}
+
 // Copy the selected verify taps to a fixed input and zero the uncommitted
 // rows for the block-wide FP8 projection.
 __global__ void stage_commit(draft::RoundInputs round, Bf* taps, int start, int* position) {
@@ -136,6 +235,29 @@ __global__ void store_commit(const Bf* keys, const Bf* values, const Bf* knorm, 
   normalize_row(keys + source, knorm, D, pos, key_ring + destination, sums);
 }
 
+__global__ void store_commit_fast(const Bf* keys, const Bf* values, const Bf* knorm, int kv_heads,
+                                  const int* position, const int* accepted, Bf* key_ring,
+                                  Bf* value_ring, Bf* undo_keys, Bf* undo_values) {
+  const int row = blockIdx.x / kv_heads, head = blockIdx.x % kv_heads;
+  if (row > *accepted) return;
+  const int pos = *position + row;
+  const int source = (row * kv_heads + head) * D;
+  const int destination = (pos % W * kv_heads + head) * D;
+  const int lane = threadIdx.x;
+  if (lane < D / VectorWidth) {
+    auto* key_slot = reinterpret_cast<uint4*>(key_ring + destination) + lane;
+    auto* value_slot = reinterpret_cast<uint4*>(value_ring + destination) + lane;
+    if (pos >= W) {
+      reinterpret_cast<uint4*>(undo_keys + source)[lane] = *key_slot;
+      reinterpret_cast<uint4*>(undo_values + source)[lane] = *value_slot;
+    }
+    *value_slot = reinterpret_cast<const uint4*>(values + source)[lane];
+  }
+  // Finish saving the old key before any lane stores the new key.
+  __syncwarp();
+  normalize_head_row(keys + source, knorm, pos, key_ring + destination);
+}
+
 __global__ void undo_commit(Bf* keys, Bf* values, const Bf* undo_keys, const Bf* undo_values,
                             int start, int kv_dim) {
   const int row = blockIdx.x;
@@ -166,6 +288,23 @@ __global__ void normalize_qkv(const Bf* qkv, const Bf* qnorm, const Bf* knorm, i
   }
 }
 
+__global__ void normalize_qkv_fast(const Bf* qkv, const Bf* qnorm, const Bf* knorm, int q_heads,
+                                   int kv_heads, int position, const int* device_position,
+                                   Bf* q, Bf* k, Bf* v) {
+  if (device_position) position = *device_position;
+  const int heads = q_heads + 2 * kv_heads;
+  const int row = blockIdx.x / heads, head = blockIdx.x % heads;
+  const Bf* src = qkv + blockIdx.x * D;
+  if (head < q_heads) {
+    normalize_head_row(src, qnorm, position + row, q + (row * q_heads + head) * D);
+  } else if (head < q_heads + kv_heads) {
+    normalize_head_row(src, knorm, position + row, k + (row * kv_heads + head - q_heads) * D);
+  } else if (threadIdx.x < D / VectorWidth) {
+    auto* dst = reinterpret_cast<uint4*>(v + (row * kv_heads + head - q_heads - kv_heads) * D);
+    dst[threadIdx.x] = reinterpret_cast<const uint4*>(src)[threadIdx.x];
+  }
+}
+
 __global__ void convolution(const Bf* x, const Bf* coeff, const Bf* base, int part,
                             Bf* out, bool residual) {
   const int col = blockIdx.x * blockDim.x + threadIdx.x;
@@ -181,12 +320,106 @@ __global__ void convolution(const Bf* x, const Bf* coeff, const Bf* base, int pa
   out[index] = residual ? __hadd(out[index], value) : value;
 }
 
+__device__ __forceinline__ unsigned residual_pair(unsigned x, unsigned current, unsigned shifted,
+                                                   unsigned a, unsigned b, Bf2 ca, Bf2 cb) {
+  const Bf2 ac = __hadd2(bf16_pair(a), ca), bc = __hadd2(bf16_pair(b), cb);
+  const Bf2 update = __hadd2_rn(__hmul2_rn(ac, bf16_pair(current)),
+                                 __hmul2_rn(bc, bf16_pair(shifted)));
+  return pair_bits(__hadd2(bf16_pair(x), update));
+}
+
+template <bool Residual>
+__device__ __forceinline__ void normalize_hidden_row(const Bf* x, const Bf* weight, Bf* out,
+                                                    float* warp_sums, const Bf* projection = nullptr,
+                                                    const Bf* coeff = nullptr, const Bf* base = nullptr,
+                                                    Bf* residual_out = nullptr) {
+  constexpr int Vectors = H / VectorWidth;
+  constexpr int Loads = (Vectors + Threads - 1) / Threads;
+  const int tid = threadIdx.x;
+  const auto* input = reinterpret_cast<const uint4*>(x);
+  const auto* weights = reinterpret_cast<const uint4*>(weight);
+  auto* output = reinterpret_cast<uint4*>(out);
+  uint4 values[Loads];
+  float sum = 0.f;
+#pragma unroll
+  for (int i = 0; i < Loads; ++i) {
+    const int col = tid + i * Threads;
+    if (col >= Vectors) break;
+    uint4 value = input[col];
+    if constexpr (Residual) {
+      const auto* projected = reinterpret_cast<const uint4*>(projection);
+      const uint4 current = projected[col];
+      const uint4 shifted = blockIdx.x ? projected[col - Vectors] : make_uint4(0, 0, 0, 0);
+      const uint4 a = reinterpret_cast<const uint4*>(base)[col];
+      const uint4 b = reinterpret_cast<const uint4*>(base + H)[col];
+      const int group = col * VectorWidth / Group;
+      const Bf2 ca = __bfloat162bfloat162(coeff[group]);
+      const Bf2 cb = __bfloat162bfloat162(coeff[Groups + group]);
+      value = make_uint4(residual_pair(value.x, current.x, shifted.x, a.x, b.x, ca, cb),
+                          residual_pair(value.y, current.y, shifted.y, a.y, b.y, ca, cb),
+                          residual_pair(value.z, current.z, shifted.z, a.z, b.z, ca, cb),
+                          residual_pair(value.w, current.w, shifted.w, a.w, b.w, ca, cb));
+      reinterpret_cast<uint4*>(residual_out)[col] = value;
+    }
+    values[i] = value;
+    sum = add_squares(sum, value.x);
+    sum = add_squares(sum, value.y);
+    sum = add_squares(sum, value.z);
+    sum = add_squares(sum, value.w);
+  }
+  const float scale = hidden_rms_scale(sum, warp_sums);
+#pragma unroll
+  for (int i = 0; i < Loads; ++i) {
+    const int col = tid + i * Threads;
+    if (col >= Vectors) break;
+    const uint4 value = values[i], w = weights[col];
+    output[col] = make_uint4(normalize_pair_bits(value.x, w.x, scale),
+                             normalize_pair_bits(value.y, w.y, scale),
+                             normalize_pair_bits(value.z, w.z, scale),
+                             normalize_pair_bits(value.w, w.w, scale));
+  }
+}
+
+__global__ void normalize_hidden(const Bf* x, const Bf* weight, Bf* out) {
+  __shared__ float warp_sums[Warps];
+  const int offset = blockIdx.x * H;
+  normalize_hidden_row<false>(x + offset, weight, out + offset, warp_sums);
+}
+
+__global__ void residual_conv_and_norm(const Bf* projection, const Bf* coeff, const Bf* base,
+                                       const Bf* weight, Bf* x, Bf* out) {
+  __shared__ float warp_sums[Warps];
+  const int row = blockIdx.x;
+  const int offset = row * H;
+  normalize_hidden_row<true>(x + offset, weight, out + offset, warp_sums, projection + offset,
+                            coeff + row * Coefficients + 2 * Groups, base + 2 * H, x + offset);
+}
+
 template <bool Fused>
 __global__ void swiglu(const Bf* gate, const Bf* up, int width, Bf* out) {
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
   const int j = Fused ? i + i / width * width : i;
   const float x = __bfloat162float(gate[j]);
   out[i] = __hmul(__float2bfloat16(x / (1.f + expf(-x))), up[j]);
+}
+
+__device__ __forceinline__ unsigned swiglu_pair(unsigned gate, unsigned up) {
+  const float2 x = __bfloat1622float2(bf16_pair(gate));
+  const Bf2 silu = __floats2bfloat162_rn(x.x / (1.f + expf(-x.x)), x.y / (1.f + expf(-x.y)));
+  return pair_bits(__hmul2(silu, bf16_pair(up)));
+}
+
+constexpr int SwigluThreads = 64;
+
+template <bool Fused>
+__global__ void swiglu_fast(const Bf* gate, const Bf* up, int width, Bf* out) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= Block * width) return;
+  const int j = Fused ? i + i / width * width : i;
+  const uint4 g = reinterpret_cast<const uint4*>(gate)[j];
+  const uint4 u = reinterpret_cast<const uint4*>(up)[j];
+  reinterpret_cast<uint4*>(out)[i] = make_uint4(swiglu_pair(g.x, u.x), swiglu_pair(g.y, u.y),
+                                               swiglu_pair(g.z, u.z), swiglu_pair(g.w, u.w));
 }
 
 __global__ void convert(const float* x, Bf* out, int size) {
@@ -225,7 +458,7 @@ __global__ void attend(const Bf* query, const Bf* ring_k, const Bf* ring_v,
                        const int* device_position = nullptr, bool only_short = false) {
   constexpr int LocalKV = LocalKVHeads * D;
   if (device_position) position = *device_position;
-  if (only_short && position + Block > AttentionTile) return;
+  if (only_short && !short_attention(position)) return;
   __shared__ float scores[W + Block];
   __shared__ float reductions[Threads];
   const int tid = threadIdx.x;
@@ -286,7 +519,7 @@ __global__ void attend_split(const Bf* query, const Bf* ring_k, const Bf* ring_v
                              float* partial, const int* device_position = nullptr) {
   constexpr int LocalKV = LocalKVHeads * D;
   if (device_position) position = *device_position;
-  if (position + Block <= AttentionTile || int(blockIdx.y) * AttentionTile >= min(position, W - 1) + Block)
+  if (short_attention(position) || int(blockIdx.y) * AttentionTile >= min(position, W - 1) + Block)
     return;
   constexpr int Warps = Threads / 32;
   __shared__ float numerators[Warps][D];
@@ -352,6 +585,133 @@ __global__ void attend_split(const Bf* query, const Bf* ring_k, const Bf* ring_v
 // Reuse each 128-bit K/V load across all 32 queries in one KV group.
 constexpr int GqaTile = 32, QPerKV = QHeads / KVHeads, GqaRows = Block * QPerKV;
 constexpr int GqaSplits = (W + Block + GqaTile - 1) / GqaTile;
+constexpr int GqaShortRows = 16;
+
+template <int LocalKVHeads>
+__device__ __forceinline__ void stage_gqa_short(const Bf* ring, const Bf* block, int position,
+                                                int head, int begin, int count, int padded, Bf* tile) {
+  constexpr int Vectors = D / VectorWidth;
+  auto* dst = reinterpret_cast<uint4*>(tile);
+  for (int i = threadIdx.x; i < padded * Vectors; i += Threads) {
+    const int row = i / Vectors;
+    const int pos = begin + row;
+    uint4 value = make_uint4(0, 0, 0, 0);
+    if (row < count) {
+      const int slot = pos < position ? pos % W : pos - position;
+      const Bf* src = (pos < position ? ring : block) + (slot * LocalKVHeads + head) * D;
+      value = reinterpret_cast<const uint4*>(src)[i % Vectors];
+    }
+    dst[i] = value;
+  }
+}
+
+// Each CTA produces 16 queries from one KV group. The entire short window
+// fits in one CTA, so softmax needs neither global partials nor a merge.
+template <int LocalQHeads, int LocalKVHeads>
+__global__ void gqa_attention_short(const Bf* query, const Bf* ring_k, const Bf* ring_v,
+                                     const Bf* block_k, const Bf* block_v, int position, Bf* out,
+                                     const int* device_position, bool only_short) {
+  using namespace nvcuda::wmma;
+  constexpr int Tile = 16, Rows = GqaShortRows, ProbStride = 2 * AttentionTile;
+  static_assert(LocalQHeads / LocalKVHeads == QPerKV && GqaRows % Rows == 0);
+  static_assert(AttentionTile == Warps * GqaTile && D == Warps * GqaTile);
+  if (device_position) position = *device_position;
+  if (only_short && !short_attention(position)) return;
+
+  __shared__ __align__(32) Bf kv[AttentionTile * D];  // K during QK, V during PV
+  __shared__ __align__(32) Bf q_or_probs[Rows][ProbStride];
+  __shared__ __align__(32) float scores[Rows * AttentionTile];  // reused for PV output tiles
+  const int tid = threadIdx.x, warp = tid / Warp, lane = tid % Warp;
+  const int head = blockIdx.x, first_query = blockIdx.y * Rows;
+  const int begin = max(0, position + first_query / QPerKV - W + 1);
+  const int count = position + Block - begin;
+  const int padded = (count + Tile - 1) / Tile * Tile;
+
+  for (int i = tid; i < Rows * D / VectorWidth; i += Threads) {
+    const int row = i / (D / VectorWidth);
+    const int qr = first_query + row;
+    const int qidx = qr / QPerKV * LocalQHeads + head * QPerKV + qr % QPerKV;
+    const int col = i % (D / VectorWidth);
+    reinterpret_cast<uint4*>(q_or_probs[row])[col] =
+        reinterpret_cast<const uint4*>(query + qidx * D)[col];
+  }
+  stage_gqa_short<LocalKVHeads>(ring_k, block_k, position, head, begin, count, padded, kv);
+  __syncthreads();
+
+  fragment<matrix_a, Tile, Tile, Tile, Bf, row_major> a;
+  fragment<matrix_b, Tile, Tile, Tile, Bf, col_major> k;
+  fragment<accumulator, Tile, Tile, Tile, float> c;
+  for (int t = warp * GqaTile; t < min((warp + 1) * GqaTile, padded); t += Tile) {
+    fill_fragment(c, 0.f);
+#pragma unroll
+    for (int d = 0; d < D; d += Tile) {
+      load_matrix_sync(a, &q_or_probs[0][d], ProbStride);
+      load_matrix_sync(k, kv + t * D + d, D);
+      mma_sync(c, a, k, c);
+    }
+    store_matrix_sync(scores + t, c, AttentionTile, mem_row_major);
+  }
+  __syncthreads();
+
+  stage_gqa_short<LocalKVHeads>(ring_v, block_v, position, head, begin, count, padded, kv);
+  for (int row = warp; row < Rows; row += Warps) {
+    const int qrow = (first_query + row) / QPerKV;
+    const int left = max(0, position + qrow - W + 1) - begin;
+    constexpr int PerLane = AttentionTile / Warp;
+    float logits[PerLane];
+    float peak = -CUDART_INF_F;
+#pragma unroll
+    for (int j = 0; j < PerLane; ++j) {
+      const int i = lane + j * Warp;
+      logits[j] = i >= left && i < count ? scores[row * AttentionTile + i] * rsqrtf(float(D))
+                                         : -CUDART_INF_F;
+      peak = fmaxf(peak, logits[j]);
+    }
+#pragma unroll
+    for (int offset = Warp / 2; offset; offset /= 2)
+      peak = fmaxf(peak, __shfl_xor_sync(0xffffffff, peak, offset));
+    float sum = 0.f;
+#pragma unroll
+    for (int j = 0; j < PerLane; ++j) {
+      const int i = lane + j * Warp;
+      logits[j] = i >= left && i < count ? expf(logits[j] - peak) : 0.f;
+      sum += logits[j];
+    }
+    const float inverse_sum = 1.f / warp_sum(sum);
+#pragma unroll
+    for (int j = 0; j < PerLane; ++j) {
+      const int i = lane + j * Warp;
+      if (i >= padded) continue;
+      const float prob = logits[j] * inverse_sum;
+      const Bf hi = __float2bfloat16(prob);
+      // Compensate for the conversion to the BF16 tensor core input.
+      q_or_probs[row][i] = hi;
+      q_or_probs[row][AttentionTile + i] = __float2bfloat16(prob - __bfloat162float(hi));
+    }
+  }
+  __syncthreads();
+
+  fragment<matrix_b, Tile, Tile, Tile, Bf, row_major> v;
+  float* scratch = scores + warp * Tile * Tile;
+  for (int d = warp * GqaTile; d < (warp + 1) * GqaTile; d += Tile) {
+    fill_fragment(c, 0.f);
+    for (int t = 0; t < padded; t += Tile) {
+      load_matrix_sync(v, kv + t * D + d, D);
+      load_matrix_sync(a, &q_or_probs[0][t], ProbStride);
+      mma_sync(c, a, v, c);
+      load_matrix_sync(a, &q_or_probs[0][AttentionTile + t], ProbStride);
+      mma_sync(c, a, v, c);
+    }
+    store_matrix_sync(scratch, c, Tile, mem_row_major);
+    __syncwarp();
+    for (int i = lane; i < Rows * Tile; i += Warp) {
+      const int qr = first_query + i / Tile;
+      const int qidx = qr / QPerKV * LocalQHeads + head * QPerKV + qr % QPerKV;
+      out[qidx * D + d + i % Tile] = __float2bfloat16(scratch[i]);
+    }
+    __syncwarp();
+  }
+}
 
 template <int LocalQHeads, int LocalKVHeads>
 __global__ void gqa_attention(const Bf* query, const Bf* ring_k, const Bf* ring_v,
@@ -360,7 +720,7 @@ __global__ void gqa_attention(const Bf* query, const Bf* ring_k, const Bf* ring_
   constexpr int LocalKV = LocalKVHeads * D;
   static_assert(LocalQHeads / LocalKVHeads == QPerKV);
   if (device_position) position = *device_position;
-  if (position + Block <= AttentionTile) return;
+  if (short_attention(position)) return;
   using namespace nvcuda::wmma;
   __shared__ __align__(32) Bf qs[GqaRows][D], ks[GqaTile][D], vs[GqaTile][D];
   __shared__ __align__(32) float scores[GqaRows][GqaTile];
@@ -444,7 +804,7 @@ __global__ void merge_attention(const float* partial, int splits, Bf* out,
                                 const int* device_position) {
   if (device_position) {
     const int position = *device_position;
-    if (position + Block <= AttentionTile) return;
+    if (short_attention(position)) return;
     splits = (min(position, W - 1) + Block + TileSize - 1) / TileSize;
   }
   partial += blockIdx.x * Slots * (D + 2);
@@ -650,7 +1010,7 @@ struct DFlash2::Impl {
   std::size_t ring_bytes() const { return std::size_t(W) * kv_dim * sizeof(Bf); }
 
   static int attention_splits(int position) {
-    if (position + Block <= AttentionTile) return 0;
+    if (short_attention(position)) return 0;
     return (std::min(position, W - 1) + Block + AttentionTile - 1) / AttentionTile;
   }
   std::vector<DeviceBuffer> buffers;
@@ -682,6 +1042,7 @@ struct DFlash2::Impl {
   std::filesystem::path dump_dir;
   const bool cumulative = std::getenv("INKLING_DFLASH2_CUMULATIVE_CONFIDENCE") != nullptr;
   const bool fused_selector = enabled_by_default("INGINE_DFLASH2_FUSED_SELECTOR");
+  const bool fast_kernels = enabled_by_default("INGINE_DFLASH2_FAST_KERNELS");
   bool fused_head = false, small_head = false;
   bool dump_written = false;
   int dump_round = 0, proposal_round = 0;
@@ -1037,6 +1398,21 @@ struct DFlash2::Impl {
     }
   }
 
+  void hidden_norm_rows(const Bf* input, const Bf* weight, int rows, Bf* out) {
+    if (fast_kernels)
+      normalize_hidden<<<rows, Threads, 0, s>>>(input, weight, out);
+    else
+      normalize<<<rows, Threads, 0, s>>>(input, weight, H, 1, -1, out, 0);
+  }
+
+  void head_norm_rows(const Bf* input, const Bf* weight, int rows, int heads, int pos,
+                      Bf* out, int ring = 0, const int* position = nullptr) {
+    if (fast_kernels)
+      normalize_head<<<rows * heads, Warp, 0, s>>>(input, weight, heads, pos, out, ring, position);
+    else
+      normalize<<<rows * heads, Threads, 0, s>>>(input, weight, D, heads, pos, out, ring, position);
+  }
+
   void commit(const Bf* taps, int n, int start, bool decode) {
     if (start != length || n < 0)
       throw std::invalid_argument("DFlash2 commit must append to the committed context");
@@ -1060,12 +1436,11 @@ struct DFlash2::Impl {
       } else {
         gemm.run(taps + std::size_t(first) * 4 * H, count, fc.bf16, H, 4 * H, ctx, s);
       }
-      normalize<<<projected_rows, Threads, 0, s>>>(ctx, hidden_norm, H, 1, -1, ctx, 0);
+      hidden_norm_rows(ctx, hidden_norm, projected_rows, ctx);
       for (const auto& l : layers) {
         linear(ctx, projected_rows, l.k, commit_k);
         linear(ctx, projected_rows, l.v, commit_v);
-        normalize<<<count * kv_heads, Threads, 0, s>>>(
-            commit_k, l.knorm, D, kv_heads, pos, l.keys, W);
+        head_norm_rows(commit_k, l.knorm, count, kv_heads, pos, l.keys, W);
         const int slot = pos % W;
         const int contiguous = std::min(count, W - slot);
         CUDA_CHECK(cudaMemcpyAsync(l.values + slot * kv_dim, commit_v, contiguous * kv_dim * sizeof(Bf),
@@ -1088,13 +1463,18 @@ struct DFlash2::Impl {
       kernels::dense::dflash2_fp8(commit_taps, fc.fp8, ctx, s);
     else
       gemm.run(commit_taps, rows, fc.bf16, H, 4 * H, ctx, s);
-    normalize<<<rows, Threads, 0, s>>>(ctx, hidden_norm, H, 1, -1, ctx, 0);
+    hidden_norm_rows(ctx, hidden_norm, rows, ctx);
     for (int i = 0; i < int(layers.size()); ++i) {
       const auto& l = layers[i];
       linear(ctx, rows, l.k, commit_k);
       linear(ctx, rows, l.v, commit_v);
-      store_commit<<<rows * kv_heads, Threads, 0, s>>>(commit_k, commit_v, l.knorm, kv_heads,
-          device_position, round.accepted, l.keys, l.values, undo_keys(i), undo_values(i));
+      if (fast_kernels) {
+        store_commit_fast<<<rows * kv_heads, Warp, 0, s>>>(commit_k, commit_v, l.knorm, kv_heads,
+            device_position, round.accepted, l.keys, l.values, undo_keys(i), undo_values(i));
+      } else {
+        store_commit<<<rows * kv_heads, Threads, 0, s>>>(commit_k, commit_v, l.knorm, kv_heads,
+            device_position, round.accepted, l.keys, l.values, undo_keys(i), undo_values(i));
+      }
     }
     CUDA_CHECK(cudaGetLastError());
   }
@@ -1166,8 +1546,7 @@ struct DFlash2::Impl {
     anchor_dev = allocate<int>(1);
   }
 
-  void prepare(const Bf* weight, const Conv& conv) {
-    normalize<<<Block, Threads, 0, s>>>(x, weight, H, 1, -1, normed, 0);
+  void prepare(const Conv& conv) {
     linear(normed, Block, conv.projection, coeff);
     convolution<<<dim3((H + Threads - 1) / Threads, Block), Threads, 0, s>>>(
         normed, coeff, conv.base, 0, convolved, false);
@@ -1178,11 +1557,34 @@ struct DFlash2::Impl {
         projection, coeff, conv.base, 1, x, true);
   }
 
+  bool fuse_residual_norm() const { return fast_kernels && tp_size == 1; }
+
+  void residual_and_norm(const Conv& conv, const Bf* weight) {
+    residual_conv_and_norm<<<Block, Threads, 0, s>>>(projection, coeff, conv.base, weight, x, normed);
+  }
+
+  template <bool Fused>
+  void run_swiglu(const Bf* gate_src, const Bf* up_src) {
+    if (fast_kernels) {
+      const int width = i_dim / VectorWidth;
+      const int blocks = (Block * width + SwigluThreads - 1) / SwigluThreads;
+      swiglu_fast<Fused><<<blocks, SwigluThreads, 0, s>>>(gate_src, up_src, width, gate);
+    } else {
+      swiglu<Fused><<<Block * i_dim / Threads, Threads, 0, s>>>(gate_src, up_src, i_dim, gate);
+    }
+  }
+
   template <int LocalQHeads, int LocalKVHeads>
   void run_attention(const DraftLayer& l, int splits, const int* position, bool may_be_short) {
     if (!splits || may_be_short) {
-      attend<LocalQHeads, LocalKVHeads><<<Block * LocalQHeads, Threads, 0, s>>>(
-          q, l.keys, l.values, block_key, value, length, attention, position, may_be_short);
+      if (fast_kernels) {
+        gqa_attention_short<LocalQHeads, LocalKVHeads>
+            <<<dim3(LocalKVHeads, GqaRows / GqaShortRows), Threads, 0, s>>>(
+            q, l.keys, l.values, block_key, value, length, attention, position, may_be_short);
+      } else {
+        attend<LocalQHeads, LocalKVHeads><<<Block * LocalQHeads, Threads, 0, s>>>(
+            q, l.keys, l.values, block_key, value, length, attention, position, may_be_short);
+      }
     }
     if (!splits) return;
     if (gqa) {
@@ -1200,21 +1602,29 @@ struct DFlash2::Impl {
     }
   }
 
-  void layer_attn_partial(int idx, int splits, const int* position, bool to_f32, bool may_be_short = false) {
+  void layer_attn_partial(int idx, int splits, const int* position, bool to_f32,
+                          bool may_be_short = false, bool pre_normalized = false) {
     const auto& l = layers[idx];
     profile.begin(DraftProfile::Conv);
-    prepare(l.pre, l.attention);
+    if (!pre_normalized) hidden_norm_rows(x, l.pre, Block, normed);
+    prepare(l.attention);
     profile.end();
     profile.begin(DraftProfile::Linear);
     if (l.qkv.rows) {
       linear(convolved, Block, l.qkv, qkv);
-      normalize_qkv<<<Block * (q_heads + 2 * kv_heads), Threads, 0, s>>>(
-          qkv, l.qnorm, l.knorm, q_heads, kv_heads, length, position, q, block_key, value);
+      const int heads = Block * (q_heads + 2 * kv_heads);
+      if (fast_kernels) {
+        normalize_qkv_fast<<<heads, Warp, 0, s>>>(
+            qkv, l.qnorm, l.knorm, q_heads, kv_heads, length, position, q, block_key, value);
+      } else {
+        normalize_qkv<<<heads, Threads, 0, s>>>(
+            qkv, l.qnorm, l.knorm, q_heads, kv_heads, length, position, q, block_key, value);
+      }
     } else {
       linear(convolved, Block, l.q, projection);
-      normalize<<<Block * q_heads, Threads, 0, s>>>(projection, l.qnorm, D, q_heads, length, q, 0, position);
+      head_norm_rows(projection, l.qnorm, Block, q_heads, length, q, 0, position);
       linear(convolved, Block, l.k, key);
-      normalize<<<Block * kv_heads, Threads, 0, s>>>(key, l.knorm, D, kv_heads, length, block_key, 0, position);
+      head_norm_rows(key, l.knorm, Block, kv_heads, length, block_key, 0, position);
       linear(convolved, Block, l.v, value);
     }
     profile.end();
@@ -1231,26 +1641,32 @@ struct DFlash2::Impl {
   void layer_mlp_partial(int idx, bool to_f32) {
     const auto& l = layers[idx];
     profile.begin(DraftProfile::Conv);
-    residual(l.attention);
-    prepare(l.post, l.mlp);
+    if (fuse_residual_norm()) {
+      residual_and_norm(l.attention, l.post);
+    } else {
+      residual(l.attention);
+      hidden_norm_rows(x, l.post, Block, normed);
+    }
+    prepare(l.mlp);
     profile.end();
     profile.begin(DraftProfile::Linear);
     if (l.gate_up.rows) {
       linear(convolved, Block, l.gate_up, gate_up);
-      swiglu<true><<<Block * i_dim / Threads, Threads, 0, s>>>(gate_up, gate_up + i_dim, i_dim, gate);
+      run_swiglu<true>(gate_up, gate_up + i_dim);
     } else {
       linear(convolved, Block, l.gate, gate);
       linear(convolved, Block, l.up, up);
-      swiglu<false><<<Block * i_dim / Threads, Threads, 0, s>>>(gate, up, i_dim, gate);
+      run_swiglu<false>(gate, up);
     }
     if (to_f32) linear_f32(gate, l.down, partial_f32);
     else linear(gate, Block, l.down, projection);
     profile.end();
   }
 
-  void layer_mlp_epilogue(int idx) {
+  void layer_mlp_epilogue(int idx, const Bf* next_norm = nullptr) {
     profile.begin(DraftProfile::Conv);
-    residual(layers[idx].mlp);
+    if (next_norm) residual_and_norm(layers[idx].mlp, next_norm);
+    else residual(layers[idx].mlp);
     profile.end();
   }
 
@@ -1303,19 +1719,23 @@ struct DFlash2::Impl {
   const Bf* forward(const Bf* embeds, const int* position = nullptr, int splits = -1, bool may_be_short = false) {
     if (splits < 0) splits = attention_splits(length);
     const bool to_f32 = tp_size == 2 && shard_fp32;
+    const bool fuse_norm = fuse_residual_norm();
     CUDA_CHECK(cudaMemcpyAsync(x, embeds, Block * H * sizeof(Bf), cudaMemcpyDeviceToDevice, s));
     for (int i = 0; i < int(layers.size()); ++i) {
-      layer_attn_partial(i, splits, position, to_f32, may_be_short);
+      layer_attn_partial(i, splits, position, to_f32, may_be_short, fuse_norm && i > 0);
       if (tp_size == 2) reduce_partial(1u + 2u * i, to_f32);
       layer_mlp_partial(i, to_f32);
       if (tp_size == 2) reduce_partial(2u + 2u * i, to_f32);
-      layer_mlp_epilogue(i);
-
+      const Bf* next_norm = nullptr;
+      if (fuse_norm) next_norm = i + 1 < int(layers.size()) ? layers[i + 1].pre : final_norm;
+      layer_mlp_epilogue(i, next_norm);
     }
-    profile.begin(DraftProfile::Embedding);
-    normalize<<<Block, Threads, 0, s>>>(x, final_norm, H, 1, -1, normed, 0);
+    if (!fuse_norm) {
+      profile.begin(DraftProfile::Embedding);
+      hidden_norm_rows(x, final_norm, Block, normed);
+      profile.end();
+    }
     CUDA_CHECK(cudaGetLastError());
-    profile.end();
     return normed + H;
   }
 };
@@ -1640,7 +2060,7 @@ bool DFlash2::advance(int position, bool propose_next, float temperature, std::u
 
   const int earliest = position + 1, latest = position + Block;
   // A proposal crossing the short attention cutoff captures both paths.
-  // Their device guards select the legacy reduction order at the actual position.
+  // Their device guards select the attention path at the actual position.
   const bool may_be_short = !Impl::attention_splits(earliest) && Impl::attention_splits(latest);
   input_ids<<<1, Block, 0, d.s>>>(d.ids, d.anchor_dev, 0, d.device_position, position,
                                  d.temperature, temperature, d.seed, seed, d.round.next_greedy, d.round.accepted);
@@ -1717,7 +2137,15 @@ bool dflash2_shard_backbone() {
 }
 
 bool dflash2_gqa() {
-  return std::getenv("INKLING_DFLASH2_GQA") != nullptr;
+  const char* value = std::getenv("INKLING_DFLASH2_GQA");
+  if (value) return std::string_view(value) != "0";
+  int device = 0, sms = 0;
+  if (cudaGetDevice(&device) != cudaSuccess ||
+      cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device) != cudaSuccess) {
+    (void)cudaGetLastError();
+    return false;
+  }
+  return sms >= 96;
 }
 
 bool dflash2_shard_fp32() {
@@ -1814,8 +2242,8 @@ const Bf* DFlash2::forward_pair(DFlash2& rank0, DFlash2& rank1, const Bf* embedd
     d1.layer_mlp_epilogue(i);
 
   }
-  normalize<<<Block, Threads, 0, s>>>(d0.x, d0.final_norm, H, 1, -1, d0.normed, 0);
-  normalize<<<Block, Threads, 0, s>>>(d1.x, d1.final_norm, H, 1, -1, d1.normed, 0);
+  d0.hidden_norm_rows(d0.x, d0.final_norm, Block, d0.normed);
+  d1.hidden_norm_rows(d1.x, d1.final_norm, Block, d1.normed);
   CUDA_CHECK(cudaGetLastError());
   return d0.normed + H;
 }
