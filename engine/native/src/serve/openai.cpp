@@ -246,6 +246,11 @@ ChatRequest parse_request(const Json& body, const text::ChatFormat& fmt, int max
   std::optional<int64_t> max_tokens = num_int(body, "max_completion_tokens", Bound{1, "1"});
   if (!max_tokens) max_tokens = num_int(body, "max_tokens", Bound{1, "1"});
 
+  // The renderer adds the assistant content prefix for enable_thinking=false.
+  // The template also renders a zero effort level for "none" and numeric zero.
+  const auto normalized_effort = text::normalize_effort(options.reasoning_effort);
+  req.sampling.thinking_enabled =
+      prompt.prefill_ids.empty() && normalized_effort != "none" && normalized_effort != 0.0;
   req.sampling.temperature =
       float(num_float(body, "temperature", Bound{0.0, "0.0"}, Bound{2.0, "2.0"}).value_or(defaults.temperature));
   req.sampling.top_p = float(num_float(body, "top_p", Bound{0.0, "0.0"}, Bound{1.0, "1.0"}).value_or(defaults.top_p));

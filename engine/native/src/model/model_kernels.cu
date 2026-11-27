@@ -223,14 +223,30 @@ __global__ void verify_proposal_kernel(const float* conf, const int* drafts, flo
 }
 
 __global__ void verify_select_kernel(const float* __restrict__ conf, const int* __restrict__ drafts, float threshold,
-                                     Widths widths, long long* __restrict__ token, int* __restrict__ m_out,
+                                     Widths widths, int fixed_width, long long* __restrict__ token,
+                                     int* __restrict__ m_out,
                                      cudaGraphConditionalHandle handle) {
   const int i = threadIdx.x;
   if (i < 7) token[1 + i] = drafts[i];
   if (i == 0) {
-    const int m = choose_width(conf, threshold, widths);
+    const int m = fixed_width ? fixed_width : choose_width(conf, threshold, widths);
     *m_out = m;
     cudaGraphSetConditional(handle, width_index(widths, m));
+  }
+}
+
+__global__ void set_verify_inputs_from_device_kernel(int anchor, int position, int m, const int* drafts,
+                                                     long long* tokens, long long* pos, VerifyProposal* proposal) {
+  const int i = threadIdx.x;
+  if (i < 7) {
+    const int draft = drafts[i];
+    tokens[i + 1] = draft;
+    proposal->drafts[i] = draft;
+  }
+  if (i == 0) {
+    tokens[0] = anchor;
+    *pos = position;
+    proposal->width = m;
   }
 }
 
@@ -331,14 +347,29 @@ void verify_rollback(const StatePtrs& st, const VerifyBackup& bk, const float* c
 void verify_select(const float* conf, const std::int32_t* drafts, float threshold, const Widths& widths,
                    std::int64_t* token, std::int32_t* m_out, cudaGraphConditionalHandle handle, cudaStream_t stream) {
   if (widths.n < 1 || widths.n > 8) throw std::invalid_argument("verify_select: 1 to 8 widths");
-  verify_select_kernel<<<1, 32, 0, stream>>>(conf, drafts, threshold, widths, reinterpret_cast<long long*>(token),
-                                             m_out, handle);
+  verify_select_dflash2(conf, drafts, threshold, widths, 0, token, m_out, handle, stream);
+}
+
+void verify_select_dflash2(const float* conf, const std::int32_t* drafts, float threshold, const Widths& widths,
+                           int fixed_width, std::int64_t* tokens, std::int32_t* width,
+                           cudaGraphConditionalHandle handle, cudaStream_t stream) {
+  verify_select_kernel<<<1, 32, 0, stream>>>(conf, drafts, threshold, widths, fixed_width,
+                                             reinterpret_cast<long long*>(tokens), width, handle);
   CUDA_CHECK(cudaGetLastError());
 }
 
 void verify_proposal(const float* conf, const std::int32_t* drafts, float threshold, const Widths& widths,
                      int fixed_width, VerifyProposal* proposal, cudaStream_t stream) {
   verify_proposal_kernel<<<1, 32, 0, stream>>>(conf, drafts, threshold, widths, fixed_width, proposal);
+  CUDA_CHECK(cudaGetLastError());
+}
+
+void set_verify_inputs_from_device(std::int32_t anchor, int position, int width, const std::int32_t* drafts,
+                                   std::int64_t* tokens, std::int64_t* pos, VerifyProposal* proposal,
+                                   cudaStream_t stream) {
+  set_verify_inputs_from_device_kernel<<<1, 32, 0, stream>>>(
+      anchor, position, width, drafts, reinterpret_cast<long long*>(tokens), reinterpret_cast<long long*>(pos),
+      proposal);
   CUDA_CHECK(cudaGetLastError());
 }
 

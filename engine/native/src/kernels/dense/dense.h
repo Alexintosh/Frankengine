@@ -25,6 +25,13 @@ namespace ingine::kernels::dense {
 void loopcd_hidden(const float* base, const float* write, const float* ref_stream, float* out,
                    float* depth, const float* ref_depth, std::size_t elements, float omega, cudaStream_t stream);
 // The combination consumes softcapped rows and leaves padding untouched.
+void set_loopcd_omega(float* omega_dev, float omega, cudaStream_t stream);
+void loopcd_hidden_device(const float* base, const float* write, const float* ref_stream, float* out,
+                          float* depth, const float* ref_depth, std::size_t elements,
+                          const float* omega_dev, cudaStream_t stream);
+void loopcd_hidden_rows(const float* base, const float* write, const float* ref_stream, float* out,
+                        float* depth, const float* ref_depth, int rows, int hidden,
+                        const float* row_omegas, cudaStream_t stream);
 void loopcd_combine_logits(float* main, const float* ref, int rows, int ld, int vocab, model::LoopCdMode mode,
                            float omega, cudaStream_t stream);
 void loopcd_softcap_logits(float* logits, int rows, int ld, int vocab, cudaStream_t stream);

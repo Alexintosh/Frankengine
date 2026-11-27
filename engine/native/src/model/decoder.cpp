@@ -41,15 +41,18 @@ DeviceBuffer upload_ints(const std::vector<int>& v) {
 
 }  // namespace
 
-Decoder::Decoder(const Weights& w, const Ablation& abl, State& st, bool pdl, TpSimulation* simulation, TpRuntime* tp)
+Decoder::Decoder(const Weights& w, const Ablation& abl, State& st, bool pdl, TpSimulation* simulation, TpRuntime* tp,
+                 const float* loopcd_omega)
     : w_(w), abl_(abl), st_(st),
       pdl_(pdl && !simulation && (!tp || (tp->gb10_spec && !tp->profile))),
-      simulation_(simulation), tp_(tp),
+      simulation_(simulation), tp_(tp), loopcd_omega_(loopcd_omega),
       down_workspace_(tp && tp->gb10_spec ? sizeof(float) * std::size_t(8) * TOP_K * HIDDEN : 0),
       cert_head_ws_(!simulation && !tp && !st.loopcd.uses_ref_coda() && w.unembed_certified.bounds
           ? kernels::head::cert_head_workspace(w.unembed.rows()) : 0),
       attn_ws_(simulation ? 0 : attn::workspace_bytes(8, tp ? tp->layout.hkv_local : KV_HEADS)) {
   validate_loopcd_tp(st.loopcd, tp ? tp->layout.tp_size : simulation ? 2 : 1);
+  if (st.loopcd.auto_mode() && !loopcd_omega_)
+    throw std::invalid_argument("Decoder requires a device weight for LoopCD Auto");
   if (simulation_) return;
   attn_ws_.fill(0);  // zeroed once; the kernel resets its counter itself
   const TpLayout layout = tp_ ? tp_->layout : TpLayout{};
@@ -221,13 +224,21 @@ void Decoder::decode_impl(Buffers& b, const std::int64_t* pos, bool history, cud
     const int pv = prev_v >= 0 ? prev_v : 0;
     const float* r_prev = mlp_dirs + std::size_t(pv) * H;
     const float* w_prev = mlp_w + 4 * std::size_t(pv);
-    if (l == LOOP_END && loopcd.hidden()) {
+    if (l == LOOP_END && (loopcd.hidden() || loopcd.auto_mode())) {
       if (abl.active) {
         dense::mix(mix_params({}, base, write, r_prev, w_prev, hid, nullptr, nullptr, nullptr, nullptr), pdl, stream);
         base = hid, write = nullptr;
       }
-      dense::loopcd_hidden(base, write, f32p(b.E[loopcd.ref_idx]), hid, f32m(b.B2[main_pass]),
-                           f32p(b.B2[loopcd.ref_idx]), slab, loopcd.omega, stream);
+      const float* ref_stream = f32p(b.E[loopcd.ref_idx]);
+      float* depth = f32m(b.B2[main_pass]);
+      const float* ref_depth = f32p(b.B2[loopcd.ref_idx]);
+      if (!loopcd.auto_mode())
+        dense::loopcd_hidden(base, write, ref_stream, hid, depth, ref_depth, slab, loopcd.omega, stream);
+      else if (slots)
+        dense::loopcd_hidden_rows(base, write, ref_stream, hid, depth, ref_depth, m, H,
+                                  reinterpret_cast<const float*>(slots + 1), stream);
+      else
+        dense::loopcd_hidden_device(base, write, ref_stream, hid, depth, ref_depth, slab, loopcd_omega_, stream);
       base = hid, write = nullptr;
     }
     dense::MixParams msg_mix;  // message visits: launched together with the attention read (independent of it)

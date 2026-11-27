@@ -10,6 +10,8 @@
 #include <filesystem>
 #include <memory>
 
+namespace ingine::kernels::draft { struct RoundInputs; }
+
 namespace ingine::model {
 
 // In-order committed context. Proposal KV is held separately from the ring.
@@ -57,6 +59,16 @@ class DFlash2 {
   const __nv_bfloat16* forward(const __nv_bfloat16* embeddings);
   const int* select(const int* candidates, const float* unary, const int* anchor);
 
+  // Device-driven solo speculation. advance commits the latest verify result
+  // and returns whether the next proposal was enqueued. advanced updates the
+  // host length after the round result is available.
+  bool supports_device_loop() const;
+  const int* tokens_device() const;
+  void bind_round(const kernels::draft::RoundInputs& round);
+  bool advance(int position, bool propose_next, float temperature, std::uint64_t seed);
+  void advanced(int count);
+  void trim_advance(const __nv_bfloat16* taps, int position, int kept, int committed);
+
   // Single-GPU two-rank simulation helpers for parity verification (rank0 and rank1 constructed with
   // tp == nullptr, tp_size == 2, tp_rank == 0 / 1 on the same stream).
   static const __nv_bfloat16* forward_pair(DFlash2& rank0, DFlash2& rank1,
@@ -67,6 +79,7 @@ class DFlash2 {
 
  private:
   const int* propose(int anchor, float temperature, std::uint64_t seed, bool warming_up);
+  void launch_proposal(int max_position, bool may_be_short = false);
   void propose_sharded_head(const __nv_bfloat16* hidden, bool replicated);
   struct Impl;
   std::unique_ptr<Impl> impl_;

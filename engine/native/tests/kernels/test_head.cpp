@@ -5,10 +5,12 @@
 #include "kernels/oracle.h"
 
 #include "kernels/head/head.h"
+#include "kernels/head/nvfp4_head.h"
 
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <bit>
 #include <numeric>
 
 using namespace ingine::test;
@@ -59,6 +61,76 @@ std::vector<double> probs_oracle(const std::vector<float>& logits, int n, const 
     for (auto& v : pr) v /= kept;
   }
   return pr;
+}
+
+void test_nvfp4_topk16_small(Rng& rng) {
+  constexpr int H = 2304, K = 16, MMax = 8;
+  using Bf = __nv_bfloat16;
+  std::vector<Bf> inputs(MMax * H);
+  for (auto& value : inputs) value = float_to_bf16(float(rng.uniform(-0.1, 0.1)));
+  DeviceArray<Bf> x(inputs);
+  // Repeated packed rows force ties in and across the tiles, including at rank 16.
+  std::vector<std::uint8_t> patterns(97 * H / 2);
+  for (auto& code : patterns) code = rng.next() & 255;
+  DeviceArray<std::uint8_t> codes([&] {
+    std::vector<std::uint8_t> packed(std::size_t(V) * H / 2);
+    for (int row = 0; row < V; ++row)
+      std::copy_n(patterns.data() + (row % 97) * H / 2, H / 2, packed.data() + std::size_t(row) * H / 2);
+    return packed;
+  }());
+  DeviceArray<std::uint8_t> scales(std::vector<std::uint8_t>(std::size_t(V) * H / 16, 0x38));
+  DeviceArray<float> logits(std::size_t(MMax) * V), values(MMax * K);
+  DeviceArray<int> ids(MMax * K);
+  DeviceArray<std::byte> scratch(head::nvfp4_topk16_small_workspace(MMax, V));
+  struct Shape { int rows, offset; bool mapped; };
+  for (const Shape shape : {Shape{V, 0, false}, {100032, 100026, false}, {1031, 42, true},
+                            {16, 0, false}, {17, 0, false}, {65, 132, true}}) {
+    const head::Nvfp4Matrix w{codes.get(), scales.get(), 0.125f, shape.rows, shape.offset};
+    std::vector<int> global_ids(shape.rows);
+    for (int row = 0; row < shape.rows; ++row)
+      global_ids[row] = shape.mapped ? 2 * (shape.rows - row) + 101 : shape.offset + row;
+    DeviceArray<int> map(global_ids);
+    std::vector<int> order(shape.rows);
+    for (int m : {1, 4, 7, 8}) {
+      head::project_nvfp4(x.get(), m, H, w, logits.get(), g_stream);
+      const auto launch = [&] {
+        head::project_nvfp4_topk16_small(x.get(), m, H, w, shape.mapped ? map.get() : nullptr,
+                                       values.get(), ids.get(), scratch.get(), g_stream);
+      };
+      if (shape.mapped && m == 7) {
+        cudaGraph_t graph = nullptr;
+        cudaGraphExec_t exec = nullptr;
+        INGINE_TEST_CUDA(cudaStreamBeginCapture(g_stream, cudaStreamCaptureModeThreadLocal));
+        launch();
+        INGINE_TEST_CUDA(cudaStreamEndCapture(g_stream, &graph));
+        INGINE_TEST_CUDA(cudaGraphInstantiate(&exec, graph, 0));
+        INGINE_TEST_CUDA(cudaGraphLaunch(exec, g_stream));
+        INGINE_TEST_CUDA(cudaGraphLaunch(exec, g_stream));
+        sync();
+        INGINE_TEST_CUDA(cudaGraphExecDestroy(exec));
+        INGINE_TEST_CUDA(cudaGraphDestroy(graph));
+      } else {
+        launch();
+        sync();
+      }
+      const auto legacy = logits.download();
+      const auto got_values = values.download();
+      const auto got_ids = ids.download();
+      for (int token = 0; token < m; ++token) {
+        const float* row = legacy.data() + std::size_t(token) * shape.rows;
+        std::iota(order.begin(), order.end(), 0);
+        std::partial_sort(order.begin(), order.begin() + K, order.end(), [&](int a, int b) {
+          return row[a] != row[b] ? row[a] > row[b] : global_ids[a] < global_ids[b];
+        });
+        for (int k = 0; k < K; ++k) {
+          INGINE_CHECK(got_ids[token * K + k] == global_ids[order[k]]);
+          INGINE_CHECK(std::bit_cast<std::uint32_t>(got_values[token * K + k]) ==
+                       std::bit_cast<std::uint32_t>(row[order[k]]));
+        }
+      }
+    }
+  }
+  std::puts("PASS small NVFP4 top-16 scores, IDs, ties and graph replay");
 }
 
 bool test_argmax(Rng& rng) {
@@ -333,6 +405,7 @@ int main() {
   if (skip_without_gpu()) return kSkip;
   INGINE_TEST_CUDA(cudaStreamCreateWithFlags(&g_stream, cudaStreamNonBlocking));
   Rng rng(31337);
+  test_nvfp4_topk16_small(rng);
   bool ok = test_argmax(rng);
   ok &= test_probs(rng, {1.0f, 0, 1.0f});
   ok &= test_probs(rng, {0.7f, 50, 1.0f});

@@ -337,7 +337,7 @@ void Scheduler::batch_loop() {
         int first_free_non_anchor = -1;
         for (int id = 0; id < max_batch_; ++id) {
           if (is_active_id(id)) continue;
-          const int reuse = generator_.reusable_prefix(id, job->prompt_ids);
+          const int reuse = generator_.reusable_prefix(id, job->prompt_ids, job->sampling.thinking_enabled);
           if (is_anchor_id(id)) {
             if (reuse > anchor_prefix) {
               best_anchor = id;
@@ -459,7 +459,7 @@ void Scheduler::batch_loop() {
         // Only clone once src has reached the full shared-prefix boundary with `other` (avoids redundant mid-chunk clones).
         if (lcp != src.offset) continue;
         try {
-          if (generator_.clone_slot(src.slot, other.slot)) {
+          if (generator_.clone_slot(src.slot, other.slot, other.job->sampling.thinking_enabled)) {
             other.offset = src.offset;
             other.job->cached_tokens_.store(src.offset);
             ++cloned;
@@ -481,16 +481,17 @@ void Scheduler::batch_loop() {
     const auto is_slot_active = [&](int id) {
       return std::any_of(slots_.begin(), slots_.end(), [&](const auto& s) { return s.slot == id; });
     };
-    const auto has_matching_anchor = [&](std::span<const int32_t> prompt, int len) -> int {
+    const auto has_matching_anchor = [&](std::span<const int32_t> prompt, int len, bool thinking_enabled) -> int {
       for (int aid : anchor_slots_) {
         if (is_slot_active(aid)) continue;
-        if (generator_.reusable_prefix(aid, prompt) == len) return aid;
+        if (generator_.reusable_prefix(aid, prompt, thinking_enabled) == len) return aid;
       }
       return -1;
     };
     const auto save_anchor = [&](const ActiveSlot& src) {
       if (max_anchors <= 0 || src.offset < kMinAnchorPrefix || !needs_prefill(src)) return;
-      if (const int existing = has_matching_anchor(src.job->prompt_ids, src.offset); existing >= 0) {
+      const bool thinking_enabled = src.job->sampling.thinking_enabled;
+      if (const int existing = has_matching_anchor(src.job->prompt_ids, src.offset, thinking_enabled); existing >= 0) {
         auto it = std::find(anchor_slots_.begin(), anchor_slots_.end(), existing);
         if (it != anchor_slots_.end()) {
           anchor_slots_.erase(it);
@@ -519,7 +520,7 @@ void Scheduler::batch_loop() {
       }
       if (dst < 0) return;
       try {
-        if (generator_.clone_slot(src.slot, dst)) {
+        if (generator_.clone_slot(src.slot, dst, thinking_enabled)) {
           anchor_slots_.push_back(dst);
           server_log().info("prefix-anchor saved: src_slot={} -> anchor_slot={} at {} tokens (pool={}/{})",
                             src.slot, dst, src.offset, anchor_slots_.size(), max_anchors);
@@ -539,7 +540,7 @@ void Scheduler::batch_loop() {
       if (max_anchors <= 0 || int(slots_.size()) >= max_batch_) return 0;
       const int sys_end = find_system_boundary(slot.job->prompt_ids);
       if (sys_end > slot.offset && (fork_at == 0 || sys_end <= fork_at) &&
-          has_matching_anchor(slot.job->prompt_ids, sys_end) < 0)
+          has_matching_anchor(slot.job->prompt_ids, sys_end, slot.job->sampling.thinking_enabled) < 0)
         return sys_end;
       return 0;
     };
@@ -554,8 +555,10 @@ void Scheduler::batch_loop() {
         slot.pending_anchor_src = -1;
         slot.pending_anchor_len = 0;
         if (slot.done || slot.job->cancelled() || slot.offset > 0) continue;
+        const bool thinking_enabled = slot.job->sampling.thinking_enabled;
+        if (generator_.reusable_prefix(src_id, slot.job->prompt_ids, thinking_enabled) != len) continue;
         try {
-          if (generator_.clone_slot(src_id, slot.slot)) {
+          if (generator_.clone_slot(src_id, slot.slot, thinking_enabled)) {
             slot.offset = len;
             slot.job->cached_tokens_.store(len);
             ++anchor_hits;
@@ -652,7 +655,8 @@ void Scheduler::batch_loop() {
       int call_stop_at = fork_at;
       bool paced_chunk = false;
       if (generator_.batch_spec() > 0 && has_decoding && active_prefill_chunk > 0) {
-        const int est_off = slot.offset > 0 ? slot.offset : generator_.reusable_prefix(slot.slot, slot.job->prompt_ids);
+        const int est_off = slot.offset > 0 ? slot.offset :
+            generator_.reusable_prefix(slot.slot, slot.job->prompt_ids, slot.job->sampling.thinking_enabled);
         const int goal = (fork_at > est_off) ? fork_at : prompt_len;
         const int capped = std::min(goal, est_off + active_prefill_chunk);
         if (capped < prompt_len && (call_stop_at == 0 || capped < call_stop_at)) {

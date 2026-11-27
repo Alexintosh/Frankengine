@@ -86,6 +86,11 @@ struct Widths {
 void verify_select(const float* conf, const std::int32_t* drafts, float threshold, const Widths& widths,
                    std::int64_t* token, std::int32_t* m_out, cudaGraphConditionalHandle handle, cudaStream_t stream);
 
+// Select a fixed width when supplied; otherwise apply the same confidence test as verify_proposal.
+void verify_select_dflash2(const float* conf, const std::int32_t* drafts, float threshold, const Widths& widths,
+                           int fixed_width, std::int64_t* tokens, std::int32_t* width,
+                           cudaGraphConditionalHandle handle, cudaStream_t stream);
+
 // The fixed-size proposal broadcast before a TP verify graph. Width zero signals cancellation.
 struct VerifyProposal {
   std::int32_t drafts[7];
@@ -95,6 +100,11 @@ static_assert(sizeof(VerifyProposal) == 32);
 
 void verify_proposal(const float* conf, const std::int32_t* drafts, float threshold, const Widths& widths,
                      int fixed_width, VerifyProposal* proposal, cudaStream_t stream);
+
+// Set the sampled verify inputs from the proposal without copying the draft tokens to the host.
+void set_verify_inputs_from_device(std::int32_t anchor, int position, int width, const std::int32_t* drafts,
+                                   std::int64_t* tokens, std::int64_t* pos, VerifyProposal* proposal,
+                                   cudaStream_t stream);
 
 // The switch condition `handle` = index of *m in `widths`. Captured into the graph that owns `handle`.
 void width_select(const std::int32_t* m, const Widths& widths, cudaGraphConditionalHandle handle,

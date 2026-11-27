@@ -40,7 +40,7 @@ struct ChatRequest {
   std::vector<int32_t> prefill_ids;  // tail of prompt_ids the model would otherwise have generated
   std::vector<model::PromptImage> images;  // by position in prompt_ids
   int max_new_tokens = 0;
-  model::Sampling sampling;
+  model::Sampling sampling;  // thinking_enabled follows the rendered prompt
   std::vector<std::string> stop;
   bool stream = false;
   bool include_usage = false;

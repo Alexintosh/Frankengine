@@ -48,7 +48,8 @@ class Prefiller {
 
   // Tokens with a negative id must be covered by `rows` (their embedding is the image placeholder's otherwise).
   void run(State& state, const std::int32_t* tokens, int T, int pos0, float* logits, Tensor* taps,
-           std::span<const EmbedRows> rows = {}, int32_t* greedy = nullptr, bool emit_head = true);
+           std::span<const EmbedRows> rows = {}, int32_t* greedy = nullptr, bool emit_head = true,
+           float loopcd_omega = -1.f);
 
   int max_chunk() const { return max_chunk_; }
   std::size_t device_bytes() const;  // scratch held by this object

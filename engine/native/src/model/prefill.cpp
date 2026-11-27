@@ -128,12 +128,14 @@ const float* const* Prefiller::block_table(const std::vector<const float*>& bloc
 }
 
 void Prefiller::run(State& st, const std::int32_t* tokens, int T, int pos0, float* logits, Tensor* taps,
-                    std::span<const EmbedRows> rows, int32_t* greedy, bool emit_head) {
+                    std::span<const EmbedRows> rows, int32_t* greedy, bool emit_head, float loopcd_omega) {
   if (T < 1 || T > max_chunk_) throw std::invalid_argument("Prefiller::run: T outside 1..max_chunk");
   if (pos0 < 0 || pos0 + T > st.max_ctx)
     throw std::invalid_argument("context " + std::to_string(pos0 + T) + " exceeds max_ctx " +
                                 std::to_string(st.max_ctx));
   const auto& loopcd = st.loopcd;
+  const float omega = loopcd_omega < 0.f ? loopcd.omega : loopcd_omega;
+  const bool hidden_loopcd = (loopcd.hidden() || loopcd.auto_mode()) && omega > 0.f;
   const bool uses_ref_coda = loopcd.uses_ref_coda();
   if (uses_ref_coda && !ref_logits_)
     throw std::invalid_argument("Prefiller requires reference coda workspace for this state");
@@ -309,13 +311,13 @@ void Prefiller::run(State& st, const std::int32_t* tokens, int T, int pos0, floa
     const int pv = prev_v >= 0 ? prev_v : 0;
     const float* r_prev = mlp_dirs + std::size_t(pv) * H;
     const float* w_prev = mlp_w + 4 * std::size_t(pv);
-    if (l == LOOP_END && loopcd.hidden()) {
+    if (l == LOOP_END && hidden_loopcd) {
       if (abl_.active) {
         dense::mix(mix_params({}, base, write, r_prev, w_prev, hid, nullptr, 1, nullptr, nullptr, nullptr), false, s);
         base = hid, write = nullptr;
       }
       dense::loopcd_hidden(base, write, E_[loopcd.ref_idx], hid, B2_[PASSES - 1], B2_[loopcd.ref_idx],
-                           slab, loopcd.omega, s);
+                           slab, omega, s);
       base = hid, write = nullptr;
     }
     dense::MixParams msg_mix;

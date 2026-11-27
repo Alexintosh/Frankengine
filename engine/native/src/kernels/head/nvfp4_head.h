@@ -34,6 +34,12 @@ void gemv_nvfp4(const __nv_bfloat16* x, int cols, Nvfp4Matrix w, float* out, cud
 
 void project_nvfp4(const __nv_bfloat16* x, int M, int cols, Nvfp4Matrix w, float* out, cudaStream_t stream);
 
+// BF16-rounded top-16 for 1..8 tokens, with ties ordered by ascending ID.
+// Mapped IDs are global; otherwise the output ID is w.v_begin + row.
+std::size_t nvfp4_topk16_small_workspace(int M, int rows);
+void project_nvfp4_topk16_small(const __nv_bfloat16* x, int M, int cols, Nvfp4Matrix w, const int* token_ids,
+                              float* out_values, int* out_ids, void* workspace, cudaStream_t stream);
+
 std::size_t nvfp4_candidate_workspace(int M, int rows);
 
 // Supply at least logits [M, rows] or candidates [M]. Scratch is required only for candidates.

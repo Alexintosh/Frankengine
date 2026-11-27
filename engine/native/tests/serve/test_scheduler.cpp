@@ -179,39 +179,118 @@ void test_persistent_prefix_anchor_across_waves() {
     }
     for (auto& job : wave1) CHECK(drain(*job) == std::vector<int32_t>(4, 100));
   }
-  const int prefilled_after_w1 = gen.prefilled_tokens.load();
-
-  // Wave 2: 4 brand-new requests with DIFFERENT suffixes -> ALL 4 must hit persistent anchor (0 shared tokens prefilled!).
-  {
-    std::vector<std::shared_ptr<Job>> wave2;
+  // Every batch lane in later waves must hit the anchor. One request can begin in solo mode
+  // if the worker wakes before the rest of the wave is queued.
+  for (int suffix : {3000, 5000}) {
+    const int before = gen.prefilled_tokens.load();
+    std::vector<std::shared_ptr<Job>> wave;
     for (int i = 0; i < 4; ++i) {
       auto p = shared;
-      p.push_back(3000 + i);
-      p.push_back(4000 + i);
-      wave2.push_back(std::make_shared<Job>(std::move(p), 4, Sampling{}));
-      CHECK(scheduler.submit(wave2.back()));
+      p.push_back(suffix + i);
+      p.push_back(suffix + 1000 + i);
+      wave.push_back(std::make_shared<Job>(std::move(p), 4, Sampling{}));
+      CHECK(scheduler.submit(wave.back()));
     }
-    for (auto& job : wave2) CHECK(drain(*job) == std::vector<int32_t>(4, 100));
-    for (auto& job : wave2) CHECK(job->cached_tokens() == 512);
+    for (auto& job : wave) CHECK(drain(*job) == std::vector<int32_t>(4, 100));
+    const auto hits = std::count_if(wave.begin(), wave.end(),
+                                    [](const auto& job) { return job->cached_tokens() == 512; });
+    CHECK(hits >= 3);
+    CHECK(gen.prefilled_tokens.load() - before == 2 * hits);
   }
-  const int prefilled_w2 = gen.prefilled_tokens.load() - prefilled_after_w1;
-  CHECK(prefilled_w2 == 8);  // only 2 suffix tokens x 4 lanes!
+}
 
-  // Wave 3: anchor must STILL be intact and reusable across waves.
-  {
-    std::vector<std::shared_ptr<Job>> wave3;
-    for (int i = 0; i < 4; ++i) {
-      auto p = shared;
-      p.push_back(5000 + i);
-      p.push_back(6000 + i);
-      wave3.push_back(std::make_shared<Job>(std::move(p), 4, Sampling{}));
-      CHECK(scheduler.submit(wave3.back()));
-    }
-    for (auto& job : wave3) CHECK(drain(*job) == std::vector<int32_t>(4, 100));
-    for (auto& job : wave3) CHECK(job->cached_tokens() == 512);
+class ThinkingBatchGenerator final : public ingine::model::Generator {
+ public:
+  ThinkingBatchGenerator() { inner_.spec_ = 4; }
+  std::string model_id() const override { return inner_.model_id(); }
+  int max_model_len() const override { return inner_.max_model_len(); }
+  int max_batch() const override { return inner_.max_batch(); }
+  int batch_spec() const override { return inner_.batch_spec(); }
+  GenerateStats generate(std::span<const int32_t> prompt, int limit, const Sampling& sample,
+                         std::span<const int32_t> stops,
+                         const std::function<bool(std::span<const int32_t>)>& emit) override {
+    solo_thinking_ = sample.thinking_enabled;
+    return inner_.generate(prompt, limit, sample, stops, emit);
   }
-  const int prefilled_w3 = gen.prefilled_tokens.load() - (prefilled_after_w1 + prefilled_w2);
-  CHECK(prefilled_w3 == 8);
+  bool promote_solo_to_batch(int slot, int32_t) override {
+    inner_.histories_[slot].clear();
+    thinking_[slot] = solo_thinking_;
+    return true;
+  }
+  int prefilled_tokens() const { return inner_.prefilled_tokens.load(); }
+
+  int reusable_prefix(int slot, std::span<const int32_t> prompt, bool thinking_enabled) const override {
+    return thinking_[slot] == thinking_enabled ? inner_.reusable_prefix(slot, prompt) : 0;
+  }
+  ingine::model::PrefillChunkResult prefill_slot_chunk(
+      int slot, std::span<const int32_t> prompt, int offset, ingine::model::BatchSampling& sample,
+      int stop_at) override {
+    if (offset > 0 && thinking_[slot] != sample.params.thinking_enabled)
+      throw std::logic_error("prefill used a prefix from the other thinking mode");
+    if (offset == 0 && thinking_[slot] != sample.params.thinking_enabled) inner_.histories_[slot].clear();
+    thinking_[slot] = sample.params.thinking_enabled;
+    return inner_.prefill_slot_chunk(slot, prompt, offset, sample, stop_at);
+  }
+  bool clone_slot(int src, int dst, bool thinking_enabled) override {
+    if (thinking_[src] != thinking_enabled || !inner_.clone_slot(src, dst)) return false;
+    thinking_[dst] = thinking_enabled;
+    return true;
+  }
+  std::vector<int32_t> decode_batch_step(std::span<const ingine::model::BatchSlotStep> rows) override {
+    for (const auto& row : rows) {
+      if (thinking_[row.slot] && thinking_[row.slot] != row.sampling->params.thinking_enabled)
+        throw std::logic_error("decode used a slot from the other thinking mode");
+    }
+    return inner_.decode_batch_step(rows);
+  }
+
+ private:
+  BatchGenerator inner_{100};
+  std::optional<bool> thinking_[8];
+  bool solo_thinking_ = true;
+};
+
+void test_thinking_prefix_isolation() {
+  ThinkingBatchGenerator gen;
+  Scheduler scheduler(gen, {}, 16);
+  const auto wave = [&](int suffix, std::span<const bool> thinking) {
+    std::vector<std::shared_ptr<Job>> jobs;
+    for (std::size_t i = 0; i < thinking.size(); ++i) {
+      std::vector<int32_t> prompt(512, 42);
+      prompt.push_back(suffix + int(i));
+      prompt.push_back(5000);
+      Sampling sample;
+      sample.thinking_enabled = thinking[i];
+      auto job = std::make_shared<Job>(std::move(prompt), 8, sample);
+      CHECK(scheduler.submit(job));
+      jobs.push_back(std::move(job));
+    }
+    for (auto& job : jobs) CHECK(drain(*job) == std::vector<int32_t>(8, 100));
+    return jobs;
+  };
+
+  const bool all_on[] = {true, true, true, true};
+  const auto first = wave(1000, all_on);
+  CHECK(std::count_if(first.begin(), first.end(), [](const auto& j) { return j->cached_tokens() == 512; }) >= 2);
+
+  // The thinking-on anchor survives this wave. The lone thinking-off lane must prefill from zero.
+  const bool mixed[] = {true, true, false, true};
+  const auto second = wave(2000, mixed);
+  CHECK(second[2]->cached_tokens() == 0);
+  CHECK(second[1]->cached_tokens() == 512 && second[3]->cached_tokens() == 512);
+
+  // No match for the old anchor. Within this wave, the first thinking-off lane builds its own prefix.
+  const bool all_off[] = {false, false, false, false};
+  const auto third = wave(3000, all_off);
+  CHECK(std::count_if(third.begin(), third.end(), [](const auto& j) { return j->cached_tokens() == 0; }) >= 1);
+  CHECK(std::count_if(third.begin(), third.end(), [](const auto& j) { return j->cached_tokens() == 512; }) >= 2);
+
+  const int prefilled = gen.prefilled_tokens();
+  const auto fourth = wave(4000, all_off);
+  const auto hits = std::count_if(fourth.begin(), fourth.end(),
+                                  [](const auto& j) { return j->cached_tokens() == 512; });
+  CHECK(hits >= 3);
+  CHECK(gen.prefilled_tokens() - prefilled == 2 * hits);
 }
 
 void test_prefix_anchor_eviction_at_full_capacity() {
@@ -360,6 +439,7 @@ int main() {
   test_batch_capacity_and_cancel();
   test_shared_prefix_fork();
   test_persistent_prefix_anchor_across_waves();
+  test_thinking_prefix_isolation();
   test_prefix_anchor_eviction_at_full_capacity();
   test_system_prompt_anchor_boundary();
   test_solo_telemetry_and_prefill_pacing();

@@ -179,9 +179,9 @@ int main(int argc, char** argv) {
   ap.flag("--kv-q4", "Q4_G64 INT4 full-attention KV caches", &kv_q4);
   ap.flag("--kv-12", "Bit-exact KV12 full-attention KV caches", &kv_12);
   ap.flag("--spec", "DSpark speculative decoding", &spec);
-  ap.option("--loopcd", "{off,hidden,logits,adaptive}", "LoopCD contrastive decoding (default off)", &loopcd,
+  ap.option("--loopcd", "{off,hidden,logits,adaptive,auto}", "LoopCD contrastive decoding (auto uses hidden when thinking is off, default off)", &loopcd,
             {"off", "hidden", "logits", "adaptive"});
-  ap.option("--loopcd-omega", "<float>", "LoopCD weight (default 0.3 for hidden/logits, 0.5 for adaptive)", &loopcd_omega);
+  ap.option("--loopcd-omega", "<float>", "LoopCD weight (default 0.3 for hidden/logits/auto, 0.5 for adaptive)", &loopcd_omega);
   ap.option("--loopcd-ref", "<int>", "Reference loop pass (1 or 2, default 1)", &loopcd_ref);
   ap.option("--spec-widths", "{coarse,fine,fine2}", "verify widths: 2/4/8, 1..8 or 2..8", &spec_widths, {"coarse", "fine", "fine2"});
   ap.option("--draft-type", "", "Drafter implementation", &draft_type, {"dspark", "dflash2", "hybrid"});
@@ -272,6 +272,7 @@ int main(int argc, char** argv) {
       chat.reasoning_effort = effort;
       const nlohmann::ordered_json messages = nlohmann::ordered_json::array({{{"role", "user"}, {"content", prompt}}});
       const std::vector<int32_t> ids = fmt.render(messages, nlohmann::ordered_json(), chat).ids;
+      const auto normalized_effort = ingine::text::normalize_effort(chat.reasoning_effort);
       std::vector<double> rates, prefill_seconds, prefill_rates;
       ingine::model::GenerateStats st;
       ingine::model::DecodeTiming timing;
@@ -280,6 +281,7 @@ int main(int argc, char** argv) {
         ingine::model::Sampling sampling;
         sampling.temperature = float(temperature);
         sampling.seed = uint64_t(r);
+        sampling.thinking_enabled = normalized_effort != "none" && normalized_effort != 0.0;
         // every run stops at the end-of-turn token: tokens after it are not what a request generates (and
         // speculative decoding accepts few drafts there, which made later runs look slow)
         st = gen->generate(ids, tokens, sampling, std::span<const int32_t>(stop),

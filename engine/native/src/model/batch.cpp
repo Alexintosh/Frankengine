@@ -164,6 +164,10 @@ BatchDecoder::BatchDecoder(const Weights& w, const Ablation& abl, BatchState& st
   auto i64 = [&](std::size_t n) { return static_cast<std::int64_t*>(alloc(n * 8)); };
   tokens_ = i32(N), slots_ = i32(S), sampled_ = i32(N), rows_ = i32(S + 1);
   temps_ = f32(N);
+  if (st.loopcd.auto_mode()) {
+    pin_omegas_ = MappedHostBuffer(N * sizeof(float));
+    omegas_dev_ = f32(N);
+  }
   pos_ = i64(S), ids_ = i64(N);
   d_seed_ = static_cast<std::uint64_t*>(alloc(sizeof(std::uint64_t)));
   B0_ = f32(N * H), B1_ = f32(N * H);
@@ -360,11 +364,11 @@ void BatchDecoder::accept(const std::int32_t* kept) {
 std::span<const std::int32_t> BatchDecoder::step(int n, const std::int32_t* m, const std::int32_t* tokens,
                                                  const std::int32_t* slots, const std::int64_t* pos,
                                                  const float* temperature, std::uint64_t seed,
-                                                 const BatchRejectInputs* reject) {
+                                                 const BatchRejectInputs* reject, const float* omegas) {
   if (n < 1 || n > max_seqs_) throw std::invalid_argument("BatchDecoder::step: n outside 1..max_seqs");
   rows_host_.resize(std::size_t(n) + 1), last_m_.assign(m, m + n);
   rows_host_[0] = 0;
-  const bool may_wrap = (st_.loopcd.hidden() || st_.loopcd.uses_ref_coda()) && st_.ring_rows == WINDOW;
+  const bool may_wrap = (st_.loopcd.hidden() || st_.loopcd.auto_mode() || st_.loopcd.uses_ref_coda()) && st_.ring_rows == WINDOW;
   bool backup_rings = false;
   int M = 0;  // the most rows of a sequence
   for (int b = 0; b < n; ++b) {
@@ -399,6 +403,12 @@ std::span<const std::int32_t> BatchDecoder::step(int n, const std::int32_t* m, c
   CUDA_CHECK(cudaMemcpyAsync(rows_, pin_rows_.data(), (std::size_t(n) + 1) * 4, cudaMemcpyHostToDevice, s));
   CUDA_CHECK(cudaMemcpyAsync(temps_, pin_temps_.data(), std::size_t(T) * 4, cudaMemcpyHostToDevice, s));
   CUDA_CHECK(cudaMemcpyAsync(d_seed_, pin_seed_.data(), sizeof(seed), cudaMemcpyHostToDevice, s));
+  if (omegas_dev_) {
+    auto* dst = static_cast<float*>(pin_omegas_.data());
+    for (int b = 0; b < n; ++b)
+      std::fill(dst + rows_host_[b], dst + rows_host_[b + 1], omegas ? omegas[b] : 0.f);
+    CUDA_CHECK(cudaMemcpyAsync(omegas_dev_, dst, std::size_t(T) * sizeof(float), cudaMemcpyHostToDevice, s));
+  }
   if (use_reject) {
     const auto stage = [&](void* dst, const MappedHostBuffer& pin, const void* src, std::size_t bytes) {
       std::memcpy(pin.data(), src, bytes);
@@ -623,13 +633,17 @@ void BatchDecoder::run_body(int n, int T, int M, bool verify, std::uint64_t seed
     const int pv = prev_v >= 0 ? prev_v : 0;
     const float* r_prev = mlp_dirs + std::size_t(pv) * H;
     const float* w_prev = mlp_w + 4 * std::size_t(pv);
-    if (l == LOOP_END && loopcd.hidden()) {
+    if (l == LOOP_END && (loopcd.hidden() || loopcd.auto_mode())) {
       if (abl_.active) {
         mix({}, base, write, r_prev, w_prev, hid, nullptr, 1, nullptr, nullptr, nullptr);
         base = hid, write = nullptr;
       }
-      dense::loopcd_hidden(base, write, E_[loopcd.ref_idx], hid, B2_[PASSES - 1], B2_[loopcd.ref_idx],
-                           slab, loopcd.omega, s);
+      if (loopcd.auto_mode())
+        dense::loopcd_hidden_rows(base, write, E_[loopcd.ref_idx], hid, B2_[PASSES - 1], B2_[loopcd.ref_idx],
+                                  T, H, omegas_dev_, s);
+      else
+        dense::loopcd_hidden(base, write, E_[loopcd.ref_idx], hid, B2_[PASSES - 1], B2_[loopcd.ref_idx],
+                             slab, loopcd.omega, s);
       base = hid, write = nullptr;
     }
     if (msgs) {

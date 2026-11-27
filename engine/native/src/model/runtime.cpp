@@ -4,6 +4,7 @@
 #include "model/runtime.h"
 
 #include "core/device.h"
+#include "kernels/dense/dense.h"
 
 #include <cstdlib>
 #include <cstring>
@@ -131,7 +132,12 @@ void Runtime::init() {
   const int rings = state_.loopcd.ring_visits();
   const bool ref_coda = state_.loopcd.uses_ref_coda();
   if (layout.tp_size > 1) tp_ = std::make_unique<TpRuntime>(options);
-  decoder_ = std::make_unique<Decoder>(weights_, ablation_, state_, true, nullptr, tp_.get());
+  if (state_.loopcd.auto_mode()) {
+    d_loopcd_omega_ = DeviceBuffer(sizeof(float));
+    CUDA_CHECK(cudaMemsetAsync(d_loopcd_omega_.p, 0, sizeof(float), stream_));
+  }
+  decoder_ = std::make_unique<Decoder>(weights_, ablation_, state_, true, nullptr, tp_.get(),
+                                       static_cast<const float*>(d_loopcd_omega_.p));
   pos_ = DeviceBuffer(sizeof(std::int64_t));
   pos_.fill(0);
   token_ = DeviceBuffer(kMaxWidth * sizeof(std::int64_t));
@@ -191,9 +197,10 @@ void Runtime::set_batch_inputs(std::span<const BatchInput> rows) {
   auto& table = *static_cast<BatchSlotTable*>(host_batch_table_.data());
   const int visits = state_.loopcd.visits();
   auto* ref = reinterpret_cast<BatchRefSlotTable*>(&table + 1);
+  auto* omegas = reinterpret_cast<float*>(&table + 1);  // Auto and the reference coda are mutually exclusive.
   unsigned used = 0;
   for (std::size_t i = 0; i < rows.size(); ++i) {
-    const auto [slot, token] = rows[i];
+    const auto [slot, token, omega] = rows[i];
     if (slot < 0 || slot >= options_.max_batch || (used & (1u << slot)))
       throw std::invalid_argument("batch slots must be distinct and in range");
     used |= 1u << slot;
@@ -203,6 +210,7 @@ void Runtime::set_batch_inputs(std::span<const BatchInput> rows) {
     if (token < 0 || token >= UNPADDED_VOCAB)
       throw std::invalid_argument("batch token outside vocabulary");
     table.tokens[i] = token;
+    if (state_.loopcd.auto_mode()) omegas[i] = omega;
     for (int v = 0; v < visits; ++v) {
       const bool reference = v >= NUM_VISITS;
       const int r = v - NUM_VISITS;
@@ -236,7 +244,8 @@ void Runtime::init_batch(const TpLayout& layout) {
   for (int i = 1; i < options_.max_batch; ++i)
     extra_slots_.push_back(make_state(options_.max_ctx, options_.kv_fp8, layout, options_.kv_q4, options_.kv_12, state_.loopcd));
   const bool ref_coda = state_.loopcd.uses_ref_coda();
-  const std::size_t bytes = sizeof(BatchSlotTable) + (ref_coda ? sizeof(BatchRefSlotTable) : 0);
+  const std::size_t bytes = sizeof(BatchSlotTable) + (ref_coda ? sizeof(BatchRefSlotTable) : 0) +
+      (state_.loopcd.auto_mode() ? options_.max_batch * sizeof(float) : 0);
   batch_table_ = DeviceBuffer(bytes);
   host_batch_table_ = MappedHostBuffer(bytes);
   std::memset(host_batch_table_.data(), 0, bytes);
@@ -350,6 +359,12 @@ void Runtime::capture(int m, bool history, std::map<int, cudaGraphExec_t>& dest,
   dest[m] = exec;
   restore(saved);
   CUDA_CHECK(cudaStreamSynchronize(stream_));
+}
+
+void Runtime::set_loopcd_omega(float omega) {
+  if (!d_loopcd_omega_.p || omega == loopcd_omega_) return;
+  kernels::dense::set_loopcd_omega(static_cast<float*>(d_loopcd_omega_.p), omega, stream_);
+  loopcd_omega_ = omega;
 }
 
 void Runtime::set_inputs(std::span<const std::int32_t> tokens, int position) {

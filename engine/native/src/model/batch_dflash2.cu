@@ -10,6 +10,7 @@
 #include "kernels/batch/draft.h"
 #include "kernels/batch/mx_gemm.h"
 #include "kernels/dense/dense.h"
+#include "kernels/draft/dflash2_selector.h"
 #include "kernels/draft/gemm.h"
 #include "kernels/draft/shortlist.h"
 
@@ -519,12 +520,26 @@ __global__ void __launch_bounds__(Threads)
   out[out_row * Q + qh * D + d] = __float2bfloat16(denominator > 0.f ? num / denominator : 0.f);
 }
 
-// Batched candidate selector edge scoring: exact match to kernels/draft/dflash2_selector.cu.
+// Keep BF16 rounding, lane accumulation, and warp reduction identical in both paths.
+__device__ __forceinline__ float batch_edge_score(const Bf* pred_row, const Bf* succ_row, const Bf* proj_row,
+                                                 const float* unary, int lane) {
+  float dot = 0.f;
+  for (int r = lane; r < Rank; r += 32) {
+    const auto weighted = __float2bfloat16_rn(__bfloat162float(pred_row[r]) * __bfloat162float(proj_row[r]));
+    dot = fmaf(__bfloat162float(weighted), __bfloat162float(succ_row[r]), dot);
+  }
+  for (int offset = 16; offset > 0; offset /= 2) dot += __shfl_down_sync(0xffffffffu, dot, offset);
+  if (lane == 0) {
+    const float score = *unary + __bfloat162float(__float2bfloat16_rn(dot));
+    return 30.0f * tanhf(score / 30.0f);
+  }
+  return 0.f;
+}
+
 __global__ void batch_score_edges(const std::int32_t* __restrict__ ids, const float* __restrict__ unary,
                                   const Bf* __restrict__ projected, const Bf* __restrict__ predecessors,
                                   const Bf* __restrict__ successors, const std::int32_t* __restrict__ anchors,
-                                  const std::int32_t* __restrict__ row_map,
-                                  float* __restrict__ lattice) {
+                                  const std::int32_t* __restrict__ row_map, float* __restrict__ lattice) {
   const int row = blockIdx.x;
   const int seq = row_map[2 * row];
   const int edge = row_map[2 * row + 1];
@@ -535,19 +550,10 @@ __global__ void batch_score_edges(const std::int32_t* __restrict__ ids, const fl
   const int predecessor = (edge == 0) ? anchors[seq] : ids[(row - 1) * 16 + previous];
   const int candidate = ids[row * 16 + next];
   if (unsigned(predecessor) >= Vocabulary || unsigned(candidate) >= Vocabulary) return;
-  float dot = 0.f;
-  const Bf* pred_row = predecessors + std::size_t(predecessor) * Rank;
-  const Bf* succ_row = successors + std::size_t(candidate) * Rank;
-  const Bf* proj_row = projected + std::size_t(row) * Rank;
-  for (int r = lane; r < Rank; r += 32) {
-    const auto weighted = __float2bfloat16_rn(__bfloat162float(pred_row[r]) * __bfloat162float(proj_row[r]));
-    dot = fmaf(__bfloat162float(weighted), __bfloat162float(succ_row[r]), dot);
-  }
-  for (int offset = 16; offset > 0; offset /= 2) dot += __shfl_down_sync(0xffffffffu, dot, offset);
-  if (lane == 0) {
-    const float score = unary[row * 16 + next] + __bfloat162float(__float2bfloat16_rn(dot));
-    lattice[(row * 16 + previous) * 16 + next] = 30.0f * tanhf(score / 30.0f);
-  }
+  const float score = batch_edge_score(predecessors + std::size_t(predecessor) * Rank,
+                                       successors + std::size_t(candidate) * Rank,
+                                       projected + std::size_t(row) * Rank, unary + row * 16 + next, lane);
+  if (lane == 0) lattice[(row * 16 + previous) * 16 + next] = score;
 }
 
 __device__ __forceinline__ float draft_uniform(std::uint64_t seed, int seq, int edge) {
@@ -560,12 +566,63 @@ __device__ __forceinline__ float draft_uniform(std::uint64_t seed, int seq, int 
   return float(h >> 40) * 0x1p-24f;
 }
 
+__device__ __forceinline__ int batch_pick_candidate(const float* scores, float temperature, std::uint64_t seed,
+                                                    int seq, int edge, bool cumulative, float& prod,
+                                                    float& confidence, float* probs) {
+  int best = 0;
+  for (int next = 1; next < 16; ++next) {
+    if (scores[next] > scores[best]) best = next;
+  }
+  float mass = 0.f;
+  for (int next = 0; next < 16; ++next) mass += expf(scores[next] - scores[best]);
+  const float c = 1.f / mass;
+  prod *= c;
+  confidence = cumulative ? prod : c;
+
+  int picked = best;
+  if (temperature > 0.f) {
+    float q[16], sum = 0.f;
+    for (int next = 0; next < 16; ++next) {
+      // Center before scaling so the maximum stays finite at very small temperatures.
+      q[next] = expf((scores[next] - scores[best]) / temperature);
+      sum += q[next];
+    }
+    const float inv_sum = 1.f / sum;
+    for (int next = 0; next < 16; ++next) {
+      q[next] *= inv_sum;
+      probs[next] = q[next];
+    }
+
+    const float u = draft_uniform(seed, seq, edge);
+    float cdf = 0.f;
+    for (int next = 0; next < 16; ++next) {
+      // If rounding leaves a gap at the end, pick the last entry with positive mass.
+      if (q[next] > 0.f) picked = next;
+      cdf += q[next];
+      if (u < cdf) break;
+    }
+  } else {
+    for (int next = 0; next < 16; ++next) probs[next] = next == picked ? 1.f : 0.f;
+  }
+  return picked;
+}
+
+__device__ __forceinline__ void batch_clear_draft(int out, std::int32_t* tokens, float* confidence,
+                                                  kernels::draft::DFlash2Support support) {
+  tokens[out] = 0;
+  confidence[out] = 0.f;
+  support.picked[out] = 0;
+  for (int next = 0; next < 16; ++next) {
+    support.ids[out * 16 + next] = -1;
+    support.probs[out * 16 + next] = 0.f;
+  }
+}
+
 __global__ void batch_walk(const std::int32_t* __restrict__ ids, const float* __restrict__ lattice,
                            const std::int32_t* __restrict__ prop_off, const std::int32_t* __restrict__ prop_cnt,
                            const float* __restrict__ temps, const std::uint64_t* __restrict__ d_seed, bool cumulative,
                            std::int32_t* __restrict__ tokens, float* __restrict__ confidence,
-                           std::int32_t* __restrict__ support_ids, float* __restrict__ support_probs,
-                           std::int32_t* __restrict__ support_picked) {
+                           kernels::draft::DFlash2Support support) {
   const int seq = blockIdx.x;
   const int start = prop_off[seq];
   const int count = prop_cnt[seq];
@@ -582,61 +639,67 @@ __global__ void batch_walk(const std::int32_t* __restrict__ ids, const float* __
     bool valid = true;
     for (int next = 0; next < 16; ++next) {
       valid &= unsigned(row_ids[next]) < Vocabulary;
-      support_ids[out * 16 + next] = row_ids[next];
+      support.ids[out * 16 + next] = row_ids[next];
     }
     // A row with a missing candidate invalidates the remaining suffix.
     if (!valid) break;
 
     const float* scores = lattice + (row * 16 + previous) * 16;
-    int best = 0;
-    for (int next = 1; next < 16; ++next) {
-      if (scores[next] > scores[best]) best = next;
-    }
-    float mass = 0.f;
-    for (int next = 0; next < 16; ++next) mass += expf(scores[next] - scores[best]);
-    const float c = 1.f / mass;
-    prod *= c;
-    confidence[out] = cumulative ? prod : c;
-
-    int picked = best;
-    if (temperature > 0.f) {
-      float q[16], sum = 0.f;
-      for (int next = 0; next < 16; ++next) {
-        // Center before scaling so the maximum stays finite at very small temperatures.
-        q[next] = expf((scores[next] - scores[best]) / temperature);
-        sum += q[next];
-      }
-      const float inv_sum = 1.f / sum;
-      for (int next = 0; next < 16; ++next) {
-        q[next] *= inv_sum;
-        support_probs[out * 16 + next] = q[next];
-      }
-
-      const float u = draft_uniform(seed, seq, edge);
-      float cdf = 0.f;
-      for (int next = 0; next < 16; ++next) {
-        // If rounding leaves a gap at the end, pick the last entry with positive mass.
-        if (q[next] > 0.f) picked = next;
-        cdf += q[next];
-        if (u < cdf) break;
-      }
-    } else {
-      for (int next = 0; next < 16; ++next) support_probs[out * 16 + next] = next == picked ? 1.f : 0.f;
-    }
+    const int picked = batch_pick_candidate(scores, temperature, seed, seq, edge, cumulative, prod,
+                                            confidence[out], support.probs + out * 16);
     tokens[out] = row_ids[picked];
-    support_picked[out] = picked;
+    support.picked[out] = picked;
     previous = picked;
   }
-  for (; edge < Proposals; ++edge) {
+  for (; edge < Proposals; ++edge) batch_clear_draft(output + edge, tokens, confidence, support);
+}
+
+__global__ void __launch_bounds__(512) batch_fused_selector(
+    const std::int32_t* __restrict__ ids, const float* __restrict__ unary, const Bf* __restrict__ projected,
+    const Bf* __restrict__ predecessors, const Bf* __restrict__ successors, const std::int32_t* __restrict__ anchors,
+    const std::int32_t* __restrict__ prop_off, const std::int32_t* __restrict__ prop_cnt,
+    const float* __restrict__ temps, const std::uint64_t* __restrict__ d_seed, bool cumulative,
+    std::int32_t* __restrict__ tokens, float* __restrict__ confidence, kernels::draft::DFlash2Support support) {
+  __shared__ float scores[16];
+  __shared__ int picked_token;
+  const int seq = blockIdx.x;
+  const int next = threadIdx.x >> 5;
+  const int lane = threadIdx.x & 31;
+  const int start = prop_off[seq];
+  const int count = prop_cnt[seq];
+  const int output = seq * Proposals;
+  const float temperature = temps[seq];
+  const std::uint64_t seed = *d_seed;
+  int predecessor = anchors[seq];
+  float prod = 1.f;
+  int edge = 0;
+  for (; edge < count; ++edge) {
+    const int row = start + edge;
     const int out = output + edge;
-    tokens[out] = 0;
-    confidence[out] = 0.f;
-    support_picked[out] = 0;
-    for (int next = 0; next < 16; ++next) {
-      support_ids[out * 16 + next] = -1;
-      support_probs[out * 16 + next] = 0.f;
+    const std::int32_t* row_ids = ids + row * 16;
+    const int candidate = row_ids[next];
+    if (lane == 0) support.ids[out * 16 + next] = candidate;
+    // Every warp must agree before any codebook read or suffix write.
+    if (!__syncthreads_and(unsigned(candidate) < Vocabulary && unsigned(predecessor) < Vocabulary)) break;
+
+    const float score = batch_edge_score(predecessors + std::size_t(predecessor) * Rank,
+                                         successors + std::size_t(candidate) * Rank,
+                                         projected + std::size_t(row) * Rank, unary + row * 16 + next, lane);
+    if (lane == 0) scores[next] = score;
+    __syncthreads();
+
+    if (threadIdx.x == 0) {
+      const int picked = batch_pick_candidate(scores, temperature, seed, seq, edge, cumulative, prod,
+                                              confidence[out], support.probs + out * 16);
+      picked_token = row_ids[picked];
+      tokens[out] = picked_token;
+      support.picked[out] = picked;
     }
+    __syncthreads();
+    predecessor = picked_token;
   }
+  if (threadIdx.x == 0)
+    for (; edge < Proposals; ++edge) batch_clear_draft(output + edge, tokens, confidence, support);
 }
 
 __global__ void pack_batch_candidates(const float* __restrict__ values, const std::int32_t* __restrict__ ids,
@@ -679,6 +742,33 @@ struct LayerW {
 };
 
 }  // namespace
+
+// The selector test calls the same dispatcher with synthetic device rows.
+namespace batch_dflash2_detail {
+
+std::size_t selector_lattice_elements(int total_rows) {
+  const char* env = std::getenv("INGINE_BATCH_DFLASH2_FUSED_SELECTOR");
+  return env && std::strcmp(env, "0") == 0 ? std::size_t(total_rows) * 16 * 16 : 0;
+}
+
+void launch_selector(int n, int total_rows, const std::int32_t* ids, const float* unary, const Bf* projected,
+                     const Bf* pred, const Bf* succ, const std::int32_t* anchors, const std::int32_t* row_map,
+                     const std::int32_t* prop_off, const std::int32_t* prop_cnt, const float* temps,
+                     const std::uint64_t* seed, bool cumulative, float* lattice, std::int32_t* tokens,
+                     float* confidence, kernels::draft::DFlash2Support support, cudaStream_t stream) {
+  if (lattice) {
+    batch_score_edges<<<dim3(total_rows, 16, 16), 32, 0, stream>>>(
+        ids, unary, projected, pred, succ, anchors, row_map, lattice);
+    batch_walk<<<n, 1, 0, stream>>>(ids, lattice, prop_off, prop_cnt, temps, seed, cumulative, tokens, confidence,
+                                    support);
+  } else {
+    batch_fused_selector<<<n, 512, 0, stream>>>(ids, unary, projected, pred, succ, anchors, prop_off, prop_cnt, temps,
+                                               seed, cumulative, tokens, confidence, support);
+  }
+  CUDA_CHECK(cudaGetLastError());
+}
+
+}  // namespace batch_dflash2_detail
 
 // =================================================================================================
 // BatchDFlash2Head (TP=2 sharded NVFP4 head)
@@ -1046,7 +1136,8 @@ struct BatchDFlash2::Impl {
       top_vals = alloc<float>(std::size_t(MH) * 16);
       top_ids = alloc<std::int32_t>(std::size_t(MH) * 16);
     }
-    lattice = alloc<float>(std::size_t(MH) * 16 * 16);
+    if (const auto elements = batch_dflash2_detail::selector_lattice_elements(MH))
+      lattice = alloc<float>(elements);
     tokens = alloc<std::int32_t>(MH);
     conf = alloc<float>(MH);
     support_ids_ = alloc<std::int32_t>(std::size_t(MH) * 16);
@@ -1338,11 +1429,9 @@ struct BatchDFlash2::Impl {
 
     // 5. Batched DFlash2 path selector
     gemm.run(hidden_props, total_rows, selector_w, Rank, H, projected, s);
-    batch_score_edges<<<dim3(total_rows, 16, 16), 32, 0, s>>>(
-        cand_ids, cand_vals, projected, pred, succ, d_anchors, d_row_map, lattice);
-    batch_walk<<<n, 1, 0, s>>>(cand_ids, lattice, d_prop_off, d_prop_cnt, d_temps_, d_seed_, cumulative,
-                              tokens, conf, support_ids_, support_probs_, support_picked_);
-    CUDA_CHECK(cudaGetLastError());
+    batch_dflash2_detail::launch_selector(n, total_rows, cand_ids, cand_vals, projected, pred, succ, d_anchors,
+                                         d_row_map, d_prop_off, d_prop_cnt, d_temps_, d_seed_, cumulative, lattice,
+                                         tokens, conf, {support_ids_, support_probs_, support_picked_}, s);
   }
 };
 

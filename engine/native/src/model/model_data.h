@@ -60,6 +60,11 @@ struct LoopCdConfig {
   int ref_idx = 0;
 
   bool hidden() const { return mode == LoopCdMode::Hidden && omega > 0.f; }
+  bool auto_mode() const { return mode == LoopCdMode::Auto && omega > 0.f; }
+  float effective_omega(bool thinking_enabled) const {
+    if (mode == LoopCdMode::Off || (mode == LoopCdMode::Auto && thinking_enabled)) return 0.f;
+    return omega;
+  }
   bool uses_ref_coda() const {
     return (mode == LoopCdMode::Logits || mode == LoopCdMode::Adaptive) && omega > 0.f;
   }

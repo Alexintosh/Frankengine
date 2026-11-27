@@ -89,9 +89,11 @@ class BatchDecoder {
   // m, tokens, slots, pos and temperature [n] are host arrays; temperature <= 0: greedy. Returns the sampled tokens,
   // one per row (row r's token follows row r; host memory owned by the decoder, valid until the next step);
   // synchronises the stream. Optional reject inputs provide the proposal distribution for active rows.
+  // In Auto mode, omegas[n] sets the weight per sequence. Omitting it gives every sequence zero weight.
   std::span<const std::int32_t> step(int n, const std::int32_t* m, const std::int32_t* tokens,
                                      const std::int32_t* slots, const std::int64_t* pos, const float* temperature,
-                                     std::uint64_t seed, const BatchRejectInputs* reject = nullptr);
+                                     std::uint64_t seed, const BatchRejectInputs* reject = nullptr,
+                                     const float* omegas = nullptr);
   // every sequence with M rows
   std::span<const std::int32_t> step(int n, int M, const std::int32_t* tokens, const std::int32_t* slots,
                                      const std::int64_t* pos, const float* temperature, std::uint64_t seed) {
@@ -163,6 +165,7 @@ class BatchDecoder {
   std::map<GraphKey, DecodeGraphExecutable> graphs_;
   MappedHostBuffer pin_ring_backup_;
   MappedHostBuffer pin_tokens_, pin_slots_, pin_pos_, pin_rows_, pin_temps_, pin_seed_, pin_sampled_;
+  MappedHostBuffer pin_omegas_;
   std::vector<std::int32_t> sampled_host_;
   std::vector<float> temps_host_;            // per row
   std::vector<std::int32_t> rows_host_, last_m_;  // the last step's row offsets [n + 1] and rows per sequence
@@ -171,6 +174,7 @@ class BatchDecoder {
   std::int32_t *tokens_, *slots_, *sampled_;
   std::int32_t* rows_;  // row offsets, device [max_seqs + 1]
   float* temps_;        // per row
+  float* omegas_dev_ = nullptr;  // per row, Auto only
   std::int64_t *pos_, *ids_;
   std::uint64_t* d_seed_ = nullptr;
   float *B0_, *B1_, *B2_[PASSES], *E_[PASSES], *hid_, *part_, *y_, *y2_;

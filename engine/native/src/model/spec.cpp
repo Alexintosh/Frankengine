@@ -53,6 +53,21 @@ struct DFlash2VerifyEma {
   }
 };
 
+int dflash2_width(const RuntimeOptions& options) {
+  if (options.spec_verify_width) return options.spec_verify_width;
+  return options.dflash2_adaptive || options.draft_type == "hybrid" ? 0 : kd::BLOCK;
+}
+
+float dflash2_threshold(const RuntimeOptions& options) {
+  return options.draft_type == "hybrid" ? options.hybrid_dflash2_threshold : options.spec_threshold;
+}
+
+int sampled_dflash2_width(const Widths& widths, int fixed_width, bool adaptive_ema, const DFlash2VerifyEma& ema) {
+  if (fixed_width) return fixed_width;
+  const int desired = adaptive_ema ? ema.sampled_width() : kd::BLOCK;
+  return *std::lower_bound(widths.w, widths.w + widths.n, desired);
+}
+
 static_assert(sizeof(VerifyRecord::drafts) / sizeof(std::int32_t) == kd::GAMMA);
 
 Widths verify_widths(const Runtime& rt) {
@@ -70,6 +85,8 @@ Widths verify_widths(const Runtime& rt) {
 SpecLoop::SpecLoop(Runtime& rt, Drafter* drafter, DFlash2* dflash2, DFlash2Head* dflash2_head)
     : rt_(rt), drafter_(drafter), dflash2_(dflash2), dflash2_head_(dflash2_head),
       host_verify_(rt.tp() || dflash2 || rt.options().draft_type == "hybrid"),
+      dflash2_device_(!rt.tp() && !drafter && dflash2 && dflash2->supports_device_loop() &&
+                      !rt.options().spec_trace && enabled_by_default("INGINE_DFLASH2_DEVICE_LOOP")),
       width_(sizeof(std::int32_t)), record_(sizeof(VerifyRecord)), forced_window_(kd::BLOCK * sizeof(std::int32_t)) {
   const bool sharded_dflash2 = dflash2 && dflash2->is_sharded();
   if (drafter && rt.options().tp.rank != 0)
@@ -108,22 +125,54 @@ SpecLoop::SpecLoop(Runtime& rt, Drafter* drafter, DFlash2* dflash2, DFlash2Head*
     verify_ = capture(false);
     if (rt_.has_cert_head()) certified_verify_ = capture(true);
   }
-  // where a round's outcome lives on the device: after the acceptance the drafter commits the accepted
-  // rows and drafts for the next anchor from these (one graph, no host round trip in between)
-  if (drafter) {
+  if (dflash2_device_) {
+    const int* drafts = dflash2_->tokens_device();
+    const float* conf = dflash2_->confidence();
+    auto* width = &static_cast<VerifyProposal*>(proposal_.p)->width;
+    auto* result = static_cast<kd::AcceptResult*>(host_accept_.p);
+    auto* record = static_cast<VerifyRecord*>(record_.device_ptr());
+    auto* target = static_cast<std::int32_t*>(target_tokens_.p);
+    const bool certified = rt_.has_cert_head();
+    verify_ = rt_.capture_switch(
+        [&](cudaStream_t s, cudaGraphConditionalHandle h) {
+          verify_select_dflash2(conf, drafts, dflash2_threshold(rt_.options()), widths, dflash2_width(rt_.options()),
+                               rt_.tokens(), width, h, s);
+        },
+        [&](cudaStream_t s, int m) {
+          rt_.record_save_verify(m, s);
+          rt_.record_step(m, s, certified);
+        });
+    accept_ = rt_.capture_switch(
+        [&](cudaStream_t s, cudaGraphConditionalHandle h) { width_select(width, widths, h, s); },
+        [&](cudaStream_t s, int m) {
+          const auto& b = rt_.buffers(m);
+          if (!certified)
+            kh::argmax(static_cast<const float*>(b.logits.data), m, UNPADDED_VOCAB, UNPADDED_VOCAB, target, s);
+          kd::greedy_accept(certified ? ptr<const std::int32_t>(b.greedy) : target, drafts, m - 1, result, s);
+          rt_.record_rollback(m, &result->accepted, s);
+          verify_publish(width, &result->accepted, &result->next, rt_.tokens(), record, s);
+        });
+  }
+  // Bind the verify outputs at fixed device addresses for the next draft.
+  if (drafter || dflash2_device_) {
     kd::RoundInputs round;
     round.nwidths = widths.n;
     for (int i = 0; i < widths.n; ++i) {
       round.widths[i] = widths.w[i];
       round.taps[i] = ptr<const __nv_bfloat16>(rt.buffers(widths.w[i]).taps);
     }
-    auto* result = rt_.tp() ? static_cast<kd::AcceptResult*>(host_accept_.p) : drafter->accept_scratch().result;
+    auto* result = !rt_.tp() && drafter ? drafter->accept_scratch().result
+                                         : static_cast<kd::AcceptResult*>(host_accept_.p);
     round.m = host_verify_ ? &static_cast<VerifyProposal*>(proposal_.p)->width
-                      : static_cast<const std::int32_t*>(width_.p);
+                           : static_cast<const std::int32_t*>(width_.p);
     round.accepted = &result->accepted;
     round.next_greedy = &result->next;
-    round.next_sampled = &static_cast<VerifyRecord*>(record_.device_ptr())->next;  // sample_from_probs
-    drafter->bind_round(round);
+    if (drafter) {
+      round.next_sampled = &static_cast<VerifyRecord*>(record_.device_ptr())->next;  // sample_from_probs
+      drafter->bind_round(round);
+    } else {
+      dflash2_->bind_round(round);
+    }
   }
   CUDA_CHECK(cudaEventCreateWithFlags(&done_, cudaEventDisableTiming));
   CUDA_CHECK(cudaStreamSynchronize(rt.stream()));
@@ -176,6 +225,11 @@ void SpecLoop::generate(std::int32_t token, int max_new_tokens, const Sampling& 
                         std::span<const std::int32_t> stop_ids,
                         const std::function<bool(std::span<const std::int32_t>)>& on_tokens, GenerateStats& stats,
                         std::vector<std::int32_t>& tokens_in_state) {
+  if (dflash2_device_ && sampling.forced.empty() &&
+      (sampling.temperature <= 0.f || enabled_by_default("INGINE_DFLASH2_EXACT_REJECT"))) {
+    generate_dflash2_device(token, max_new_tokens, sampling, rng, stop_ids, on_tokens, stats, tokens_in_state);
+    return;
+  }
   // Hybrid can switch between greedy and arbitrary sampling settings without
   // recapturing acceptance. The target uses its startup per-width graphs.
   if (host_verify_) {
@@ -299,6 +353,123 @@ void SpecLoop::generate(std::int32_t token, int max_new_tokens, const Sampling& 
   stats.spec_accepted = accepted;
 }
 
+void SpecLoop::prepare_dflash2_exact() {
+  if (dflash2_accept_.p) return;
+  constexpr int V = UNPADDED_VOCAB;
+  const auto floats = (kd::BLOCK + 1) * V + kd::GAMMA + kd::dflash2_accept_workspace_floats(V);
+  dflash2_accept_ = DeviceBuffer(floats * sizeof(float));
+}
+
+void SpecLoop::accept_dflash2_exact(const float* logits, int width, const std::int32_t* drafts,
+                                   const Sampling& sampling, kh::SamplerRng& rng, kd::AcceptResult* result) {
+  constexpr int V = UNPADDED_VOCAB;
+  const cudaStream_t stream = rt_.stream();
+  auto* probs = static_cast<float*>(dflash2_accept_.p);
+  auto* resid = probs + kd::BLOCK * V;
+  auto* uniforms = resid + V;
+  auto* ws = uniforms + kd::GAMMA;
+  kh::uniform(kd::GAMMA, rng, uniforms, stream);
+  kh::sampling_probs(logits, width, V, V, {sampling.temperature, sampling.top_k, sampling.top_p}, probs, stream);
+  kd::dflash2_exact_accept(probs, V, drafts, width - 1, dflash2_->support_ids(), dflash2_->support_probs(),
+                           dflash2_->support_picked(), uniforms, ws, resid, result, stream);
+  kh::sample_from_probs(resid, 1, V, V, rng, &result->next, stream);
+}
+
+void SpecLoop::generate_dflash2_device(
+    std::int32_t token, int max_new_tokens, const Sampling& sampling, kh::SamplerRng& rng,
+    std::span<const std::int32_t> stop_ids, const std::function<bool(std::span<const std::int32_t>)>& on_tokens,
+    GenerateStats& stats, std::vector<std::int32_t>& tokens_in_state) {
+  const cudaStream_t stream = rt_.stream();
+  const bool sampled = sampling.temperature > 0.f;
+  const float temperature = sampled ? sampling.temperature : 0.f;
+  const Widths widths = verify_widths(rt_);
+  const int fixed_width = rt_.options().spec_verify_width;
+  const bool adaptive_ema = sampled && !fixed_width && enabled_by_default("INGINE_DFLASH2_ADAPTIVE_EMA");
+  DFlash2VerifyEma ema;
+  auto* proposal = static_cast<VerifyProposal*>(proposal_.p);
+  auto* result = static_cast<kd::AcceptResult*>(host_accept_.p);
+  auto* record_dev = static_cast<VerifyRecord*>(record_.device_ptr());
+  const auto* record_host = static_cast<const VerifyRecord*>(record_.data());
+  const int* drafts = dflash2_->tokens_device();
+  int position = int(tokens_in_state.size());
+  if (dflash2_->length() != position)
+    throw std::logic_error("SpecLoop: DFlash2 context does not match the state");
+  if (sampled) prepare_dflash2_exact();
+  auto proposal_seed = [&] { return sampled ? splitmix64(rng.seed ^ splitmix64(rng.counter)) : 0; };
+
+  std::vector<std::int32_t> out{token};
+  int last_width = 0, last_accepted = 0;
+  bool proposed = false;
+  for (;;) {
+    int count = 0;
+    bool done = false;
+    for (const std::int32_t id : out) {
+      ++count;
+      ++stats.generated_tokens;
+      if (stats.generated_tokens == max_new_tokens ||
+          std::find(stop_ids.begin(), stop_ids.end(), id) != stop_ids.end()) {
+        done = true;
+        break;
+      }
+    }
+    const bool keep_running = on_tokens(std::span(out).first(count));
+    if (done || !keep_running) {
+      const int keep = count - 1;
+      if (keep < last_accepted) {
+        const int start = position - last_accepted - 1;
+        rt_.rollback(start, keep + 1, last_width);
+        dflash2_->trim_advance(ptr<const __nv_bfloat16>(rt_.buffers(last_width).taps), start, keep + 1,
+                              last_accepted + 1);
+        tokens_in_state.resize(tokens_in_state.size() - (last_accepted - keep));
+      }
+      break;
+    }
+
+    const std::int32_t anchor = out.back();
+    if (!proposed) dflash2_->propose(anchor, temperature, proposal_seed());
+    // Overlapped proposals use the next counter in advance. Only a proposal
+    // that reaches verification consumes it, preserving the host RNG stream.
+    if (sampled) {
+      ++rng.counter;
+      const int m = sampled_dflash2_width(widths, fixed_width, adaptive_ema, ema);
+      set_verify_inputs_from_device(anchor, position, m, drafts, rt_.tokens(), rt_.pos(), proposal, stream);
+      rt_.save_verify(position, m);
+      const float* logits = rt_.run_step(m);
+      if (m > 1) {
+        accept_dflash2_exact(logits, m, proposal->drafts, sampling, rng, result);
+      } else {
+        auto* ids = static_cast<std::int32_t*>(target_tokens_.p);
+        kh::sample(logits, m, UNPADDED_VOCAB, UNPADDED_VOCAB,
+                   {sampling.temperature, sampling.top_k, sampling.top_p}, rng, ids, stream);
+        kd::greedy_accept(ids, proposal->drafts, 0, result, stream);
+      }
+      rt_.record_rollback(m, &result->accepted, stream);
+      verify_publish(&proposal->width, &result->accepted, &result->next, rt_.tokens(), record_dev, stream);
+    } else {
+      rt_.set_inputs(std::span(&anchor, 1), position);
+      verify_.launch(stream);
+      accept_.launch(stream);
+    }
+    CUDA_CHECK(cudaEventRecord(done_, stream));
+    proposed = dflash2_->advance(position, stats.generated_tokens + 1 < max_new_tokens, temperature, proposal_seed());
+    CUDA_CHECK(cudaEventSynchronize(done_));
+
+    const VerifyRecord r = *record_host;
+    if (adaptive_ema) ema.observe(r.accepted, r.m - 1);
+    const int commit = r.accepted + 1;
+    dflash2_->advanced(commit);
+    tokens_in_state.push_back(anchor);
+    tokens_in_state.insert(tokens_in_state.end(), r.drafts, r.drafts + r.accepted);
+    position += commit;
+    last_width = r.m;
+    last_accepted = r.accepted;
+    ++stats.spec_rounds;
+    stats.spec_accepted += r.accepted;
+    out.assign(r.drafts, r.drafts + r.accepted);
+    out.push_back(r.next);
+  }
+}
+
 void SpecLoop::generate_host_verified(std::int32_t token, int max_new_tokens, const Sampling& sampling, kh::SamplerRng& rng,
                            std::span<const std::int32_t> stop_ids,
                            const std::function<bool(std::span<const std::int32_t>)>& on_tokens,
@@ -311,7 +482,7 @@ void SpecLoop::generate_host_verified(std::int32_t token, int max_new_tokens, co
   if (fixed_width && std::find(widths.w, widths.w + widths.n, fixed_width) == widths.w + widths.n)
     throw std::invalid_argument("Fixed verify width is outside the configured grid");
   if (fixed_width && !forced && rt_.options().draft_type != "dflash2") throw std::invalid_argument("fixed verify widths require forced replay");
-  const bool trace = (forced && drafter_) || dflash2_ || (drafter_ && rt_.options().spec_trace);
+  const bool trace = (drafter_ || dflash2_) && (forced || rt_.options().spec_trace);
   const bool sampled = sampling.temperature > 0.f && !forced;
   const bool flash_root = dflash2_ && (!tp || tp->layout.tp_rank == 0);
   const bool exact_reject = flash_root && sampled && enabled_by_default("INGINE_DFLASH2_EXACT_REJECT");
@@ -351,17 +522,11 @@ void SpecLoop::generate_host_verified(std::int32_t token, int max_new_tokens, co
       verify_proposal(draft_.conf, draft_.tokens, rt_.options().spec_threshold, widths, stop ? -1 : fixed_width,
                       proposal, stream);
     if (flash_root) {
-      const bool hybrid = rt_.options().draft_type == "hybrid";
-      const bool adaptive = hybrid || rt_.options().dflash2_adaptive;
-      const float threshold = hybrid ? rt_.options().hybrid_dflash2_threshold : rt_.options().spec_threshold;
-      int width = fixed_width ? fixed_width : (adaptive ? 0 : kd::BLOCK);
-      if (!fixed_width && exact_reject) {
-        // The sampled width depends only on past rounds. Gating on the realized
-        // draft token's probability would condition q and bias exact rejection.
-        const int desired = adaptive_ema ? ema.sampled_width() : kd::BLOCK;
-        const auto* chosen = std::lower_bound(widths.w, widths.w + widths.n, desired);
-        width = chosen < widths.w + widths.n ? *chosen : widths.w[widths.n - 1];
-      }
+      // The sampled width depends only on past rounds. Gating on the realized
+      // draft token's probability would condition q and bias exact rejection.
+      const int width = exact_reject ? sampled_dflash2_width(widths, fixed_width, adaptive_ema, ema)
+                                    : dflash2_width(rt_.options());
+      const float threshold = dflash2_threshold(rt_.options());
       verify_proposal(dflash2_->confidence(), draft_.tokens, threshold, widths,
                       stop ? -1 : width, proposal, stream);
     }
@@ -475,20 +640,8 @@ void SpecLoop::generate_host_verified(std::int32_t token, int max_new_tokens, co
         constexpr int V = UNPADDED_VOCAB;
         const kh::SamplingParams params{sampling.temperature, sampling.top_k, sampling.top_p};
         if (exact_reject && eligible > 0) {
-          if (!dflash2_accept_.p) {
-            const auto floats = (kd::BLOCK + 1) * V + kd::GAMMA + kd::dflash2_accept_workspace_floats(V);
-            dflash2_accept_ = DeviceBuffer(floats * sizeof(float));
-          }
-          auto* probs = static_cast<float*>(dflash2_accept_.p);
-          auto* resid = probs + kd::BLOCK * V;
-          auto* uniforms = resid + V;
-          auto* ws = uniforms + kd::GAMMA;
-          kh::uniform(kd::GAMMA, rng, uniforms, stream);
-          kh::sampling_probs(logits, m, V, V, params, probs, stream);
-          kd::dflash2_exact_accept(probs, V, proposal->drafts, eligible, dflash2_->support_ids(),
-                                   dflash2_->support_probs(), dflash2_->support_picked(), uniforms,
-                                   ws, resid, result, stream);
-          kh::sample_from_probs(resid, 1, V, V, rng, &result->next, stream);
+          prepare_dflash2_exact();
+          accept_dflash2_exact(logits, m, proposal->drafts, sampling, rng, result);
         } else {
           auto* ids = static_cast<std::int32_t*>(target_tokens_.p);
           kh::sample(logits, m, V, V, params, rng, ids, stream);

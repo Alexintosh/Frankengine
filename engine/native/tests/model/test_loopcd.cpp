@@ -112,6 +112,16 @@ void test_options() {
   INGINE_CHECK(loopcd_config(options).uses_ref_coda() && options.loopcd_omega == 0.3f);
   set_loopcd_options(options, "adaptive", std::nullopt, 1);
   INGINE_CHECK(loopcd_config(options).uses_ref_coda() && options.loopcd_omega == 0.5f);
+  set_loopcd_options(options, "auto", std::nullopt, 1);
+  const auto automatic = loopcd_config(options);
+  INGINE_CHECK(automatic.auto_mode() && !automatic.uses_ref_coda() && automatic.ref_idx == 0);
+  INGINE_CHECK(automatic.visits() == NUM_VISITS && automatic.full_visits() == NUM_FULL_VISITS &&
+               automatic.ring_visits() == NUM_SLIDING_VISITS);
+  INGINE_CHECK(automatic.effective_omega(Sampling{}.thinking_enabled) == 0.f);
+  INGINE_CHECK(automatic.effective_omega(false) == 0.3f);
+  validate_loopcd_tp(automatic, 2);
+  set_loopcd_options(options, "auto", 0., 2);
+  INGINE_CHECK(!loopcd_config(options).auto_mode());
   set_loopcd_options(options, "adaptive", 0., 1);
   INGINE_CHECK(loopcd_config(options).mode == LoopCdMode::Off);
   set_loopcd_options(options, "off", 4., 9);
@@ -169,6 +179,22 @@ void test_kernels(cudaStream_t stream) {
     const float h_final = h[i] + mlp[i];
     INGINE_CHECK(h_out[i] == std::fma(omega, h_final - hr[i], h_final));
     INGINE_CHECK(d_out[i] == std::fma(omega, depth[i] - dr[i], depth[i]));
+  }
+
+  const std::array<float, 3> weights{0.f, omega, 0.f};
+  auto device_weights = upload<float>(weights);
+  dh = upload<float>(h);
+  dd = upload<float>(depth);
+  dense::loopcd_hidden_rows(static_cast<const float*>(dh.p), static_cast<const float*>(dmlp.p),
+                            static_cast<const float*>(dhr.p), static_cast<float*>(dh.p),
+                            static_cast<float*>(dd.p), static_cast<const float*>(ddr.p), 3, HIDDEN,
+                            static_cast<const float*>(device_weights.p), stream);
+  const auto rows_hidden = read_device(static_cast<const float*>(dh.p), n, stream);
+  const auto rows_depth = read_device(static_cast<const float*>(dd.p), n, stream);
+  for (int i = 0; i < n; ++i) {
+    const bool on = weights[i / HIDDEN] != 0.f;
+    INGINE_CHECK(rows_hidden[i] == (on ? h_out[i] : h[i] + mlp[i]));
+    INGINE_CHECK(rows_depth[i] == (on ? d_out[i] : depth[i]));
   }
 
   constexpr int vocab = UNPADDED_VOCAB, ld = vocab + 6, rows = 6;
@@ -344,6 +370,135 @@ void test_runtime(Weights weights, Ablation abl, const RuntimeOptions& options, 
   }
 }
 
+// The outer test owns the GPU allocations shared by these independent runtimes.
+Weights borrow_weights(const Weights& w) {
+  return {w.layers, w.embed, w.embed_norm, w.final_query, w.final_norm, w.unembed, w.unembed_nvfp4,
+          w.unembed_certified, w.message_queries, w.expert_formats, w.dense_fp8, w.dense_pico12, {}};
+}
+
+void test_auto_runtime(const Weights& weights, RuntimeOptions options) {
+  options.max_batch = 2;
+  const auto solo = [](Runtime& rt, bool thinking_enabled) {
+    reset_state(rt.state(), rt.stream());
+    rt.set_loopcd_omega(rt.state().loopcd.effective_omega(thinking_enabled));
+    const float* logits = nullptr;
+    for (int p = 0; p < int(kTokens.size()); ++p) logits = rt.decode_logits(kTokens[p], p);
+    return read_device(logits, UNPADDED_VOCAB, rt.stream());
+  };
+  const auto batch = [](Runtime& rt, float first, float second) {
+    for (int slot : {0, 1}) reset_state(rt.state_slot(slot), rt.stream());
+    const float* logits = nullptr;
+    for (int32_t token : kTokens) {
+      const Runtime::BatchInput rows[]{{1, token, first}, {0, token, second}};
+      logits = ptr<float>(rt.run_batch(rows, true).logits);
+    }
+    return read_device(logits, 2 * UNPADDED_VOCAB, rt.stream());
+  };
+  const auto fixed = [&](std::string_view mode) {
+    set_loopcd_options(options, mode, std::nullopt, 1);
+    Runtime rt(options, borrow_weights(weights), load_ablation({}));
+    return std::pair(solo(rt, true), batch(rt, 0.f, 0.f));
+  };
+  const auto [off, batch_off] = fixed("off");
+  const auto [hidden, batch_hidden] = fixed("hidden");
+  INGINE_CHECK(off != hidden);
+
+  set_loopcd_options(options, "auto", std::nullopt, 1);
+  Runtime rt(options, borrow_weights(weights), load_ablation({}));
+  for (bool thinking : {true, false, true, false}) {
+    compare_exactly("Auto captured solo", solo(rt, thinking), thinking ? off : hidden, 0.);
+  }
+  const auto mixed = batch(rt, 0.f, options.loopcd_omega);
+  compare_exactly("Auto captured plain batch, thinking on", std::span(mixed).first(UNPADDED_VOCAB),
+                  std::span(batch_off).first(UNPADDED_VOCAB), 0.);
+  compare_exactly("Auto captured plain batch, thinking off", std::span(mixed).subspan(UNPADDED_VOCAB),
+                  std::span(batch_hidden).subspan(UNPADDED_VOCAB), 0.);
+}
+
+void test_auto_prefill_and_batch(const Weights& w, const Ablation& abl, cudaStream_t stream) {
+  constexpr std::size_t vocab = UNPADDED_VOCAB;
+  const auto tokens = upload<int32_t>(kTokens);
+  const auto prefill = [&](LoopCdConfig config, float omega) {
+    auto state = make_state(kCtx, true, TpLayout{}, false, false, config);
+    Prefiller prefiller(w, abl, int(kTokens.size()), stream, nullptr, config);
+    DeviceBuffer logits(vocab * sizeof(float));
+    auto* out = static_cast<float*>(logits.p);
+    prefiller.run(state, static_cast<const int32_t*>(tokens.p), int(kTokens.size()), 0, out, nullptr,
+                  {}, nullptr, true, omega);
+    return read_device(out, vocab, stream);
+  };
+  const LoopCdConfig off{}, hidden{LoopCdMode::Hidden, 0.3f, 0}, automatic{LoopCdMode::Auto, 0.3f, 0};
+  compare_exactly("Auto prefill, thinking on", prefill(automatic, 0.f), prefill(off, -1.f), 0.);
+  compare_exactly("Auto prefill, thinking off", prefill(automatic, hidden.omega), prefill(hidden, -1.f), 0.);
+
+  const auto verify = [&](BatchDecoder& decoder, const float* omega) {
+    const int32_t slots[] = {0, 1}, widths[] = {2, 1};
+    const int32_t input[] = {kTokens[0], kTokens[1], kTokens[0]};
+    const int64_t pos[] = {0, 0};
+    const float temps[] = {0.f, 0.f};
+    decoder.step(2, widths, input, slots, pos, temps, 42, nullptr, omega);
+    return read_device(decoder.logits(), 3 * decoder.kLogitsLd, stream);
+  };
+  const auto fixed = [&](LoopCdConfig config) {
+    auto state = make_batch_state(2, kCtx, true, TpLayout{}, false, false, config);
+    BatchDecoder decoder(w, abl, state, 2, stream, 8);
+    decoder.keep_logits(true);
+    return verify(decoder, nullptr);
+  };
+  const auto expected_off = fixed(off);
+  const auto expected_hidden = fixed(hidden);
+  auto state = make_batch_state(2, kCtx, true, TpLayout{}, false, false, automatic);
+  BatchDecoder decoder(w, abl, state, 2, stream, 8);
+  decoder.keep_logits(true);
+  for (bool first_on : {true, false, true}) {
+    for (int slot : {0, 1}) reset_slot(state, slot, stream);
+    const float omegas[] = {first_on ? 0.f : hidden.omega, first_on ? hidden.omega : 0.f};
+    const auto mixed = verify(decoder, omegas);
+    for (int row = 0; row < 3; ++row) {
+      const auto& expected = (row < 2) == first_on ? expected_off : expected_hidden;
+      const auto offset = std::size_t(row) * decoder.kLogitsLd;
+      compare_exactly("Auto mixed ragged BatchDecoder", std::span(mixed).subspan(offset, vocab),
+                      std::span(expected).subspan(offset, vocab), 0.);
+    }
+  }
+}
+
+void test_auto_prefix_cache(const Weights& weights, RuntimeOptions options) {
+  set_loopcd_options(options, "auto", std::nullopt, 1);
+  options.park_mb = 768;
+  options.prefill_chunk = 256;
+  options.max_batch = 2;
+  auto generator = make_generator(options, borrow_weights(weights), load_ablation({}));
+  Sampling sample;
+  sample.temperature = 0;
+  std::vector<int32_t> prompt(256, kTokens[1]);
+  const auto run = [&](bool thinking_enabled) {
+    sample.thinking_enabled = thinking_enabled;
+    return generator->generate(prompt, 1, sample, {}, [](auto) { return true; });
+  };
+  INGINE_CHECK(run(true).reused_tokens == 0);
+  INGINE_CHECK(run(false).reused_tokens == 0);
+  const auto repeat = run(false);
+  INGINE_CHECK(repeat.reuse == Reuse::Checkpoint && repeat.reused_tokens == int(prompt.size()));
+  const auto parked = run(true);
+  INGINE_CHECK(parked.reuse == Reuse::Parked && parked.reused_tokens == int(prompt.size()));
+
+  BatchSampling batch_sample;
+  batch_sample.params.temperature = 0;
+  std::vector<int32_t> extended{1, 2, 3, 4};
+  const auto result = generator->prefill_slot_chunk(1, std::span(extended).first(3), 0, batch_sample);
+  INGINE_CHECK(result.offset == 3 && result.token.has_value());
+  INGINE_CHECK(generator->reusable_prefix(1, extended) == 3);
+  INGINE_CHECK(generator->reusable_prefix(1, extended, false) == 0);
+  batch_sample.params.thinking_enabled = false;
+  const auto flipped = generator->prefill_slot_chunk(1, extended, 0, batch_sample);
+  INGINE_CHECK(flipped.reused_tokens == 0 && flipped.offset == 4);
+  extended.push_back(kOther);
+  INGINE_CHECK(generator->reusable_prefix(1, extended, false) == 4);
+  generator->release_slot(1);
+  INGINE_CHECK(generator->reusable_prefix(1, extended, false) == 0);
+}
+
 int test_real_model() {
   const char* env = std::getenv("INGINE_MODEL_DIR");
   const std::filesystem::path dir = env && *env ? env : INGINE_MODEL_DIR;
@@ -372,6 +527,10 @@ int test_real_model() {
   options.loopcd_mode = LoopCdMode::Off;
   options.loopcd_omega = 42.f;
   compare_exactly("off with custom omega vs default off", stepwise(weights, abl, options, stream), baseline, 0.);
+
+  test_auto_runtime(weights, options);
+  test_auto_prefill_and_batch(weights, abl, stream);
+  test_auto_prefix_cache(weights, options);
 
   std::vector<float> adaptive;
   for (const auto mode : {LoopCdMode::Hidden, LoopCdMode::Logits, LoopCdMode::Adaptive}) {

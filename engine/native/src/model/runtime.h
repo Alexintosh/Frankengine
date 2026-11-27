@@ -59,7 +59,7 @@ Buffers make_buffers(int m, const TpLayout& tp = TpLayout{}, bool full_logits = 
 void reset_state(State& state, cudaStream_t stream);
 
 // Device table indexed by visit, then by compact batch row. Slots may move
-// between rows on successive graph launches.
+// between rows on successive graph launches. Auto appends one float per compact row after this table.
 struct BatchSlotTable {
   std::int64_t tokens[8];
   kernels::attn::BatchAttnSlot attn[NUM_VISITS][8];
@@ -78,7 +78,7 @@ struct BatchRefSlotTable {
 class Decoder {
  public:
   Decoder(const Weights& w, const Ablation& abl, State& st, bool pdl = true, TpSimulation* simulation = nullptr,
-          TpRuntime* tp = nullptr);
+          TpRuntime* tp = nullptr, const float* loopcd_omega = nullptr);
   ~Decoder();
   Decoder(const Decoder&) = delete;
   Decoder& operator=(const Decoder&) = delete;
@@ -105,6 +105,7 @@ class Decoder {
   bool pdl_;
   TpSimulation* simulation_;
   TpRuntime* tp_;
+  const float* loopcd_omega_;
   DeviceBuffer down_workspace_;  // sharded GB10 speculative W2 expert dots
   DeviceBuffer cert_head_ws_;
   DeviceBuffer batch_attn_ws_;
@@ -154,6 +155,7 @@ class Runtime {
   struct BatchInput {
     int slot;
     std::int32_t token;
+    float loopcd_omega = 0.f;
   };
   State& state_slot(int slot);
   // Advances each participating slot by one token. Outputs are in compact row order.
@@ -168,6 +170,8 @@ class Runtime {
 
   // Stream-ordered step inputs: buffers(tokens.size()).token = tokens, pos = position (a kernel; no copy).
   void set_inputs(std::span<const std::int32_t> tokens, int position);
+  // Updates the Auto weight in stream order. Captured decode steps read the same device address.
+  void set_loopcd_omega(float omega);
   // A certified TP=1 greedy-only step writes buffers(m).greedy and returns nullptr.
   // TP=2 selects logits or IDs through its existing rank configuration.
   bool has_cert_head() const { return !state_.loopcd.uses_ref_coda() && weights_.unembed_certified.bounds != nullptr; }
@@ -244,6 +248,8 @@ class Runtime {
   Ablation ablation_;
   State state_;
   std::unique_ptr<TpRuntime> tp_;
+  DeviceBuffer d_loopcd_omega_;
+  float loopcd_omega_ = 0.f;
   std::unique_ptr<Decoder> decoder_;
   DeviceBuffer pos_, token_;
   struct BatchWidth {

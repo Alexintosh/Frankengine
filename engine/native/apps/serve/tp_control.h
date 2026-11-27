@@ -122,7 +122,7 @@ class TpGenerator final : public model::Generator {
     nlohmann::json request = {{"prompt", std::vector<int32_t>(prompt.begin(), prompt.end())},
                               {"limit", max_new_tokens}, {"temperature", sample.temperature},
                               {"top_p", sample.top_p}, {"top_k", sample.top_k},
-                              {"stops", std::vector<int32_t>(stops.begin(), stops.end())}};
+                              {"thinking_enabled", sample.thinking_enabled}, {"stops", std::vector<int32_t>(stops.begin(), stops.end())}};
     if (sample.seed) request["seed"] = *sample.seed;
     socket_->send_frame(request.dump());
     return inner_->generate(prompt, max_new_tokens, sample, stops, emit);
@@ -131,7 +131,10 @@ class TpGenerator final : public model::Generator {
   int batch_max_ctx() const override { return inner_->batch_max_ctx(); }
   int batch_spec() const override { return inner_->batch_spec(); }
   int reusable_prefix(int slot, std::span<const int32_t> prompt) const override {
-    return inner_->reusable_prefix(slot, prompt);
+    return reusable_prefix(slot, prompt, true);
+  }
+  int reusable_prefix(int slot, std::span<const int32_t> prompt, bool thinking_enabled) const override {
+    return inner_->reusable_prefix(slot, prompt, thinking_enabled);
   }
 
   model::PrefillChunkResult prefill_slot_chunk(int slot, std::span<const int32_t> prompt, int offset,
@@ -139,7 +142,7 @@ class TpGenerator final : public model::Generator {
     socket_->send_frame(nlohmann::json{
         {"op", "prefill"}, {"slot", slot}, {"offset", offset}, {"stop_at", stop_at},
         {"prompt", std::vector<int32_t>(prompt.begin(), prompt.end())},
-        {"temperature", sampling.params.temperature}}.dump());
+        {"temperature", sampling.params.temperature}, {"thinking_enabled", sampling.params.thinking_enabled}}.dump());
     return inner_->prefill_slot_chunk(slot, prompt, offset, sampling, stop_at);
   }
 
@@ -153,7 +156,8 @@ class TpGenerator final : public model::Generator {
       const auto& sample = input.sampling->params;
       packed.push_back({{"slot", input.slot}, {"offset", input.offset},
                         {"prompt", std::vector<int32_t>(input.prompt.begin(), input.prompt.end())},
-                        {"temperature", sample.temperature}, {"top_p", sample.top_p}, {"top_k", sample.top_k}});
+                        {"temperature", sample.temperature}, {"top_p", sample.top_p}, {"top_k", sample.top_k},
+                        {"thinking_enabled", sample.thinking_enabled}});
     }
     socket_->send_frame(nlohmann::json{{"op", "prefill_batch_short"}, {"max_steps", max_steps},
                                       {"slots", std::move(packed)}}.dump());
@@ -161,14 +165,20 @@ class TpGenerator final : public model::Generator {
   }
 
   bool clone_slot(int src_slot, int dst_slot) override {
-    socket_->send_frame(nlohmann::json{{"op", "clone"}, {"src", src_slot}, {"dst", dst_slot}}.dump());
-    return inner_->clone_slot(src_slot, dst_slot);
+    return clone_slot(src_slot, dst_slot, true);
+  }
+
+  bool clone_slot(int src_slot, int dst_slot, bool thinking_enabled) override {
+    socket_->send_frame(nlohmann::json{{"op", "clone"}, {"src", src_slot}, {"dst", dst_slot},
+                                      {"thinking_enabled", thinking_enabled}}.dump());
+    return inner_->clone_slot(src_slot, dst_slot, thinking_enabled);
   }
 
   std::vector<int32_t> decode_batch_step(std::span<const model::BatchSlotStep> rows) override {
     auto packed = nlohmann::json::array();
     for (const auto& row : rows)
-      packed.push_back({row.slot, row.token, row.sampling->params.temperature});
+      packed.push_back({row.slot, row.token, row.sampling->params.temperature,
+                        row.sampling->params.thinking_enabled});
     socket_->send_frame(nlohmann::json{{"op", "decode"}, {"rows", packed}}.dump());
     return inner_->decode_batch_step(rows);
   }
@@ -176,7 +186,8 @@ class TpGenerator final : public model::Generator {
   std::vector<std::vector<int32_t>> decode_batch_step_multi(std::span<const model::BatchSlotStep> rows) override {
     auto packed = nlohmann::json::array();
     for (const auto& row : rows)
-      packed.push_back({row.slot, row.token, row.sampling->params.temperature});
+      packed.push_back({row.slot, row.token, row.sampling->params.temperature,
+                        row.sampling->params.thinking_enabled});
     socket_->send_frame(nlohmann::json{{"op", "decode_multi"}, {"rows", packed}}.dump());
     return inner_->decode_batch_step_multi(rows);
   }
@@ -199,7 +210,7 @@ class TpGenerator final : public model::Generator {
     socket_->send_frame(nlohmann::json{
         {"op", "solo"}, {"prompt", std::vector<int32_t>(prompt.ids.begin(), prompt.ids.end())},
         {"limit", limit}, {"temperature", sample.temperature}, {"top_p", sample.top_p},
-        {"top_k", sample.top_k}, {"seed", sampling.seed},
+        {"top_k", sample.top_k}, {"seed", sampling.seed}, {"thinking_enabled", sample.thinking_enabled},
         {"stops", std::vector<int32_t>(stops.begin(), stops.end())}}.dump());
     return inner_->generate_interruptible(prompt, limit, sampling, stops, emit);
   }
@@ -224,31 +235,24 @@ inline void run_tp_worker(model::Generator& generator, TpControl& socket) {
       continue;
     }
     if (op == "clone") {
-      generator.clone_slot(request.at("src").get<int>(), request.at("dst").get<int>());
+      generator.clone_slot(request.at("src").get<int>(), request.at("dst").get<int>(),
+                           request.value("thinking_enabled", true));
       continue;
     }
-    if (op == "decode_multi") {
+    if (op == "decode_multi" || op == "decode") {
       const auto& packed = request.at("rows");
       std::vector<model::BatchSampling> samples(packed.size());
       std::vector<model::BatchSlotStep> rows;
+      rows.reserve(packed.size());
       for (std::size_t i = 0; i < packed.size(); ++i) {
         const auto& row = packed.at(i);
         samples[i].params.temperature = row.at(2).get<float>();
+        // Older senders only include the slot, token and temperature.
+        samples[i].params.thinking_enabled = row.size() <= 3 || row.at(3).get<bool>();
         rows.push_back({row.at(0).get<int>(), row.at(1).get<int32_t>(), &samples[i]});
       }
-      generator.decode_batch_step_multi(rows);
-      continue;
-    }
-    if (op == "decode") {
-      const auto& packed = request.at("rows");
-      std::vector<model::BatchSampling> samples(packed.size());
-      std::vector<model::BatchSlotStep> rows;
-      for (std::size_t i = 0; i < packed.size(); ++i) {
-        const auto& row = packed.at(i);
-        samples[i].params.temperature = row.at(2).get<float>();
-        rows.push_back({row.at(0).get<int>(), row.at(1).get<int32_t>(), &samples[i]});
-      }
-      generator.decode_batch_step(rows);
+      if (op == "decode_multi") generator.decode_batch_step_multi(rows);
+      else generator.decode_batch_step(rows);
       continue;
     }
     if (op == "prefill_batch_short") {
@@ -264,6 +268,7 @@ inline void run_tp_worker(model::Generator& generator, TpControl& socket) {
         sample.temperature = input.at("temperature").get<float>();
         sample.top_p = input.at("top_p").get<float>();
         sample.top_k = input.at("top_k").get<int>();
+        sample.thinking_enabled = input.value("thinking_enabled", true);
         slots.push_back({input.at("slot").get<int>(), prompts[i], input.at("offset").get<int>(), &samples[i]});
       }
       try {
@@ -276,6 +281,7 @@ inline void run_tp_worker(model::Generator& generator, TpControl& socket) {
     if (op == "prefill") {
       model::BatchSampling sample;
       sample.params.temperature = request.at("temperature").get<float>();
+      sample.params.thinking_enabled = request.value("thinking_enabled", true);
       try {
         generator.prefill_slot_chunk(request.at("slot").get<int>(),
                                      request.at("prompt").get<std::vector<int32_t>>(),
@@ -292,6 +298,7 @@ inline void run_tp_worker(model::Generator& generator, TpControl& socket) {
     sampling.temperature = request.at("temperature").get<float>();
     sampling.top_p = request.at("top_p").get<float>();
     sampling.top_k = request.at("top_k").get<int>();
+    sampling.thinking_enabled = request.value("thinking_enabled", true);
     if (request.contains("seed")) sampling.seed = request.at("seed").get<uint64_t>();
     try {
       const int limit = request.at("limit").get<int>();

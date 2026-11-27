@@ -36,11 +36,23 @@ constexpr int D = 128, QHeads = Q / D, KVHeads = KV / D;
 constexpr int Group = 16, Groups = H / Group, Coefficients = 4 * Groups;
 constexpr int CommitBatch = 128, Threads = 128;
 constexpr int Block = DFlash2::block, Proposals = Block - 1;
-constexpr int Rank = 256, Vocabulary = 201024;
+constexpr int Rank = 256, Vocabulary = 201024, AttentionTile = 128;
 
 bool enabled_by_default(const char* name) {
   const char* value = std::getenv(name);
   return !value || std::string_view(value) != "0";
+}
+
+bool batch_head_requested() {
+  const char* value = std::getenv("INGINE_DFLASH2_FUSED_HEAD");
+  return value && std::string_view(value) == "1";
+}
+
+bool small_head_enabled() {
+  const char* value = std::getenv("INGINE_DFLASH2_GEMV_TOPK");
+  // Opt-in (=1): uses 62 regs vs 44 on Split=6 GEMV (+61 us on 48-SM GB10); keep for high-SM GPU A/B.
+  return !std::getenv("INKLING_DFLASH2_DUMP") && !batch_head_requested() &&
+         value && std::string_view(value) == "1";
 }
 
 __device__ __forceinline__ void normalize_row(const Bf* x, const Bf* weight, int width, int position,
@@ -82,6 +94,58 @@ __global__ void normalize(const Bf* x, const Bf* weight, int width, int heads,
   const int slot = ring ? (position + row) % ring : row;
   normalize_row(x + blockIdx.x * width, weight, width, position < 0 ? position : position + row,
                 out + (slot * heads + head_idx) * width, sums);
+}
+
+// Copy the selected verify taps to a fixed input and zero the uncommitted
+// rows for the block-wide FP8 projection.
+__global__ void stage_commit(draft::RoundInputs round, Bf* taps, int start, int* position) {
+  const int count = *round.accepted + 1;
+  const int m = *round.m;
+  const int row = blockIdx.x;
+  int index = 0;
+  while (index < round.nwidths && round.widths[index] != m) ++index;
+  if (index == round.nwidths) return;
+  const auto* src = reinterpret_cast<const uint4*>(round.taps[index]);
+  auto* dst = reinterpret_cast<uint4*>(taps);
+  constexpr int Vectors = 4 * H / 8;
+  for (int i = threadIdx.x; i < Vectors; i += blockDim.x)
+    dst[row * Vectors + i] = row < count ? src[row * Vectors + i] : make_uint4(0, 0, 0, 0);
+  if (row == 0 && threadIdx.x == 0) *position = start;
+}
+
+__global__ void select_commit_count(const int* accepted, cudaGraphConditionalHandle handle) {
+  cudaGraphSetConditional(handle, *accepted);
+}
+
+__global__ void store_commit(const Bf* keys, const Bf* values, const Bf* knorm, int kv_heads,
+                             const int* position, const int* accepted, Bf* key_ring, Bf* value_ring,
+                             Bf* undo_keys, Bf* undo_values) {
+  const int head = blockIdx.x % kv_heads, row = blockIdx.x / kv_heads;
+  if (row > *accepted) return;
+  const int pos = *position + row;
+  const int slot = pos % W;
+  const int source = (row * kv_heads + head) * D;
+  const int destination = (slot * kv_heads + head) * D;
+  const int lane = threadIdx.x;
+  if (pos >= W) {
+    undo_keys[source + lane] = key_ring[destination + lane];
+    undo_values[source + lane] = value_ring[destination + lane];
+  }
+  value_ring[destination + lane] = values[source + lane];
+  __shared__ float sums[Threads];
+  normalize_row(keys + source, knorm, D, pos, key_ring + destination, sums);
+}
+
+__global__ void undo_commit(Bf* keys, Bf* values, const Bf* undo_keys, const Bf* undo_values,
+                            int start, int kv_dim) {
+  const int row = blockIdx.x;
+  const int pos = start + row;
+  if (pos < W) return;
+  const int stride = kv_dim / 8, slot = pos % W;
+  for (int i = threadIdx.x; i < stride; i += blockDim.x) {
+    reinterpret_cast<uint4*>(keys)[slot * stride + i] = reinterpret_cast<const uint4*>(undo_keys)[row * stride + i];
+    reinterpret_cast<uint4*>(values)[slot * stride + i] = reinterpret_cast<const uint4*>(undo_values)[row * stride + i];
+  }
 }
 
 __global__ void normalize_qkv(const Bf* qkv, const Bf* qnorm, const Bf* knorm, int q_heads,
@@ -158,9 +222,10 @@ __global__ void sum_f32_pair_to_bf16(const float* a, const float* b, Bf* out_a, 
 template <int LocalQHeads, int LocalKVHeads>
 __global__ void attend(const Bf* query, const Bf* ring_k, const Bf* ring_v,
                        const Bf* block_k, const Bf* block_v, int position, Bf* out,
-                       const int* device_position = nullptr) {
+                       const int* device_position = nullptr, bool only_short = false) {
   constexpr int LocalKV = LocalKVHeads * D;
   if (device_position) position = *device_position;
+  if (only_short && position + Block > AttentionTile) return;
   __shared__ float scores[W + Block];
   __shared__ float reductions[Threads];
   const int tid = threadIdx.x;
@@ -213,7 +278,6 @@ __global__ void attend(const Bf* query, const Bf* ring_k, const Bf* ring_v,
 
 // Split long windows across CTAs. Each warp streams one subset of rows
 // and accumulates a local online softmax in registers.
-constexpr int AttentionTile = 128;
 constexpr int MaxSplits = (W + Block + AttentionTile - 1) / AttentionTile;
 
 template <int LocalQHeads, int LocalKVHeads>
@@ -222,6 +286,8 @@ __global__ void attend_split(const Bf* query, const Bf* ring_k, const Bf* ring_v
                              float* partial, const int* device_position = nullptr) {
   constexpr int LocalKV = LocalKVHeads * D;
   if (device_position) position = *device_position;
+  if (position + Block <= AttentionTile || int(blockIdx.y) * AttentionTile >= min(position, W - 1) + Block)
+    return;
   constexpr int Warps = Threads / 32;
   __shared__ float numerators[Warps][D];
   __shared__ float peaks[Warps], sums[Warps];
@@ -294,6 +360,7 @@ __global__ void gqa_attention(const Bf* query, const Bf* ring_k, const Bf* ring_
   constexpr int LocalKV = LocalKVHeads * D;
   static_assert(LocalQHeads / LocalKVHeads == QPerKV);
   if (device_position) position = *device_position;
+  if (position + Block <= AttentionTile) return;
   using namespace nvcuda::wmma;
   __shared__ __align__(32) Bf qs[GqaRows][D], ks[GqaTile][D], vs[GqaTile][D];
   __shared__ __align__(32) float scores[GqaRows][GqaTile];
@@ -372,11 +439,14 @@ __global__ void gqa_attention(const Bf* query, const Bf* ring_k, const Bf* ring_
   }
 }
 
-template <int Slots>
+template <int Slots, int TileSize>
 __global__ void merge_attention(const float* partial, int splits, Bf* out,
                                 const int* device_position) {
-  if (device_position)
-    splits = (min(*device_position, W - 1) + Block + GqaTile - 1) / GqaTile;
+  if (device_position) {
+    const int position = *device_position;
+    if (position + Block <= AttentionTile) return;
+    splits = (min(position, W - 1) + Block + TileSize - 1) / TileSize;
+  }
   partial += blockIdx.x * Slots * (D + 2);
   __shared__ float factors[Slots], denominator;
   if (threadIdx.x == 0) {
@@ -399,7 +469,10 @@ __global__ void merge_attention(const float* partial, int splits, Bf* out,
 
 __global__ void input_ids(int64_t* ids, int* anchor_out, int anchor,
                           int* position_out, int position, float* temperature_out, float temperature,
-                          std::uint64_t* seed_out, std::uint64_t seed) {
+                          std::uint64_t* seed_out, std::uint64_t seed,
+                          const int* next = nullptr, const int* accepted = nullptr) {
+  if (next) anchor = *next;
+  if (accepted) position += *accepted + 1;
   ids[threadIdx.x] = threadIdx.x ? DFlash2::mask_token : anchor;
   if (threadIdx.x == 0) {
     *anchor_out = anchor;
@@ -562,18 +635,23 @@ struct DFlash2::Impl {
   int* device_position = nullptr;
   bool warmed = false;
   bool gqa = false;
-  std::array<cudaGraphExec_t, MaxSplits + 1> graphs{};
-  std::array<int, MaxSplits + 1> graph_profile_spans{};
+  std::array<cudaGraphExec_t, MaxSplits + 2> graphs{};
+  std::array<int, MaxSplits + 2> graph_profile_spans{};
+  cudaGraphExec_t commit_graph = nullptr;
+  draft::RoundInputs round;
+  Bf* commit_taps = nullptr;
+  Bf* undo = nullptr;
   ~Impl() {
+    if (commit_graph) cudaGraphExecDestroy(commit_graph);
     for (auto graph : graphs)
       if (graph) cudaGraphExecDestroy(graph);
   }
 
   std::size_t ring_bytes() const { return std::size_t(W) * kv_dim * sizeof(Bf); }
 
-  int attention_splits() const {
-    if (length + Block <= AttentionTile) return 0;
-    return (std::min(length, W - 1) + Block + AttentionTile - 1) / AttentionTile;
+  static int attention_splits(int position) {
+    if (position + Block <= AttentionTile) return 0;
+    return (std::min(position, W - 1) + Block + AttentionTile - 1) / AttentionTile;
   }
   std::vector<DeviceBuffer> buffers;
   kernels::draft::Bf16Gemm gemm;
@@ -604,7 +682,7 @@ struct DFlash2::Impl {
   std::filesystem::path dump_dir;
   const bool cumulative = std::getenv("INKLING_DFLASH2_CUMULATIVE_CONFIDENCE") != nullptr;
   const bool fused_selector = enabled_by_default("INGINE_DFLASH2_FUSED_SELECTOR");
-  bool fused_head = false;
+  bool fused_head = false, small_head = false;
   bool dump_written = false;
   int dump_round = 0, proposal_round = 0;
   float *unary = nullptr, *pool_values = nullptr, *top_values = nullptr;
@@ -1002,6 +1080,81 @@ struct DFlash2::Impl {
     if (decode) profile.end();
   }
 
+  Bf* undo_keys(int layer) const { return undo + layer * 2 * Block * kv_dim; }
+  Bf* undo_values(int layer) const { return undo_keys(layer) + Block * kv_dim; }
+
+  void record_commit(int rows) {
+    if (fc.fp8.w)
+      kernels::dense::dflash2_fp8(commit_taps, fc.fp8, ctx, s);
+    else
+      gemm.run(commit_taps, rows, fc.bf16, H, 4 * H, ctx, s);
+    normalize<<<rows, Threads, 0, s>>>(ctx, hidden_norm, H, 1, -1, ctx, 0);
+    for (int i = 0; i < int(layers.size()); ++i) {
+      const auto& l = layers[i];
+      linear(ctx, rows, l.k, commit_k);
+      linear(ctx, rows, l.v, commit_v);
+      store_commit<<<rows * kv_heads, Threads, 0, s>>>(commit_k, commit_v, l.knorm, kv_heads,
+          device_position, round.accepted, l.keys, l.values, undo_keys(i), undo_values(i));
+    }
+    CUDA_CHECK(cudaGetLastError());
+  }
+
+  void bind_round(const draft::RoundInputs& inputs) {
+    if (commit_graph) {
+      cudaGraphExecDestroy(commit_graph);
+      commit_graph = nullptr;
+    }
+    round = inputs;
+    if (!commit_taps) commit_taps = padded_taps ? padded_taps : allocate(Block * 4 * H);
+    if (!undo) undo = allocate(layers.size() * 2 * Block * kv_dim);
+
+    cudaGraph_t graph = nullptr;
+    CUDA_CHECK(cudaGraphCreate(&graph, 0));
+    struct GraphOwner {
+      cudaGraph_t graph;
+      ~GraphOwner() { cudaGraphDestroy(graph); }
+    } owner{graph};
+    auto capture = [&](cudaGraph_t body, int rows) {
+      CUDA_CHECK(cudaStreamBeginCaptureToGraph(s, body, nullptr, nullptr, 0, cudaStreamCaptureModeThreadLocal));
+      try {
+        record_commit(rows);
+      } catch (...) {
+        cudaGraph_t failed = nullptr;
+        cudaStreamEndCapture(s, &failed);
+        throw;
+      }
+      cudaGraph_t captured = nullptr;
+      CUDA_CHECK(cudaStreamEndCapture(s, &captured));
+    };
+    if (fc.fp8.w) {
+      capture(graph, Block);
+    } else {
+      // BF16 cuBLASLt plans are specific to M. Select the same plan the host
+      // commit uses for the actual accepted count.
+      cudaGraphConditionalHandle handle;
+      CUDA_CHECK(cudaGraphConditionalHandleCreate(&handle, graph, 0, 0));
+      cudaKernelNodeParams select{};
+      auto* accepted = round.accepted;
+      void* args[] = {&accepted, &handle};
+      select.func = reinterpret_cast<void*>(select_commit_count);
+      select.gridDim = dim3(1);
+      select.blockDim = dim3(1);
+      select.kernelParams = args;
+      cudaGraphNode_t select_node = nullptr;
+      CUDA_CHECK(cudaGraphAddKernelNode(&select_node, graph, nullptr, 0, &select));
+      cudaGraphNodeParams branch{};
+      branch.type = cudaGraphNodeTypeConditional;
+      branch.conditional.handle = handle;
+      branch.conditional.type = cudaGraphCondTypeSwitch;
+      branch.conditional.size = Block;
+      cudaGraphNode_t switch_node = nullptr;
+      CUDA_CHECK(cudaGraphAddNode(&switch_node, graph, &select_node, nullptr, 1, &branch));
+      for (int i = 0; i < Block; ++i) capture(branch.conditional.phGraph_out[i], i + 1);
+    }
+    CUDA_CHECK(cudaGraphInstantiate(&commit_graph, graph, 0));
+    CUDA_CHECK(cudaGraphUpload(commit_graph, s));
+  }
+
   void bind_embeddings(const Bf* weight, const float* norm) {
     if (embed || !weight || !norm)
       throw std::invalid_argument("DFlash2 requires target embeddings");
@@ -1026,26 +1179,28 @@ struct DFlash2::Impl {
   }
 
   template <int LocalQHeads, int LocalKVHeads>
-  void run_attention(const DraftLayer& l, int splits, const int* position) {
-    if (!splits) {
+  void run_attention(const DraftLayer& l, int splits, const int* position, bool may_be_short) {
+    if (!splits || may_be_short) {
       attend<LocalQHeads, LocalKVHeads><<<Block * LocalQHeads, Threads, 0, s>>>(
-          q, l.keys, l.values, block_key, value, length, attention, position);
-    } else if (gqa) {
+          q, l.keys, l.values, block_key, value, length, attention, position, may_be_short);
+    }
+    if (!splits) return;
+    if (gqa) {
       const int tiles = (std::min(length, W - 1) + Block + GqaTile - 1) / GqaTile;
       const int grid_tiles = position ? GqaSplits : tiles;
       gqa_attention<LocalQHeads, LocalKVHeads><<<dim3(LocalKVHeads, grid_tiles), Threads, 0, s>>>(
           q, l.keys, l.values, block_key, value, length, attention_partial, position);
-      merge_attention<GqaSplits><<<Block * LocalQHeads, Threads, 0, s>>>(
+      merge_attention<GqaSplits, GqaTile><<<Block * LocalQHeads, Threads, 0, s>>>(
           attention_partial, tiles, attention, position);
     } else {
       attend_split<LocalQHeads, LocalKVHeads><<<dim3(Block * LocalQHeads, splits), Threads, 0, s>>>(
           q, l.keys, l.values, block_key, value, length, attention_partial, position);
-      merge_attention<MaxSplits><<<Block * LocalQHeads, Threads, 0, s>>>(
-          attention_partial, splits, attention, nullptr);
+      merge_attention<MaxSplits, AttentionTile><<<Block * LocalQHeads, Threads, 0, s>>>(
+          attention_partial, splits, attention, position);
     }
   }
 
-  void layer_attn_partial(int idx, int splits, const int* position, bool to_f32) {
+  void layer_attn_partial(int idx, int splits, const int* position, bool to_f32, bool may_be_short = false) {
     const auto& l = layers[idx];
     profile.begin(DraftProfile::Conv);
     prepare(l.pre, l.attention);
@@ -1064,8 +1219,8 @@ struct DFlash2::Impl {
     }
     profile.end();
     profile.begin(DraftProfile::Attention);
-    if (tp_size == 2) run_attention<QHeads / 2, KVHeads / 2>(l, splits, position);
-    else run_attention<QHeads, KVHeads>(l, splits, position);
+    if (tp_size == 2) run_attention<QHeads / 2, KVHeads / 2>(l, splits, position, may_be_short);
+    else run_attention<QHeads, KVHeads>(l, splits, position, may_be_short);
     profile.end();
     profile.begin(DraftProfile::Linear);
     if (to_f32) linear_f32(attention, l.o, partial_f32);
@@ -1116,6 +1271,11 @@ struct DFlash2::Impl {
 
   void project_head(const Bf* hidden) {
     const auto matrix = draft_head.matrix();
+    if (small_head) {
+      head::project_nvfp4_topk16_small(hidden, Proposals, H, matrix, draft_head.token_ids(),
+                                     top_values, top_ids, top_workspace, s);
+      return;
+    }
     if (fused_head) {
       // The batch head ranks raw FP32 dots. The legacy path keeps its BF16-rounded logits.
       batch::head_topk16_nvfp4(hidden, H, matrix, Proposals, top_workspace, top_values, top_ids, s);
@@ -1140,12 +1300,12 @@ struct DFlash2::Impl {
     return tokens;
   }
 
-  const Bf* forward(const Bf* embeds, const int* position = nullptr) {
-    const int splits = attention_splits();
+  const Bf* forward(const Bf* embeds, const int* position = nullptr, int splits = -1, bool may_be_short = false) {
+    if (splits < 0) splits = attention_splits(length);
     const bool to_f32 = tp_size == 2 && shard_fp32;
     CUDA_CHECK(cudaMemcpyAsync(x, embeds, Block * H * sizeof(Bf), cudaMemcpyDeviceToDevice, s));
     for (int i = 0; i < int(layers.size()); ++i) {
-      layer_attn_partial(i, splits, position, to_f32);
+      layer_attn_partial(i, splits, position, to_f32, may_be_short);
       if (tp_size == 2) reduce_partial(1u + 2u * i, to_f32);
       layer_mlp_partial(i, to_f32);
       if (tp_size == 2) reduce_partial(2u + 2u * i, to_f32);
@@ -1187,7 +1347,7 @@ struct DFlash2Head::Impl {
   TpRuntime& tp;
   kernels::draft::DFlash2DraftHead draft_head;
   cudaStream_t stream;
-  bool fused;
+  bool fused, small;
   DeviceBuffer hidden{Proposals * H * sizeof(Bf)};
   DeviceBuffer logits, pool_values, pool_ids;
   DeviceBuffer top_values{HeadCandidates * sizeof(float)}, top_ids{HeadCandidates * sizeof(int)};
@@ -1197,12 +1357,14 @@ struct DFlash2Head::Impl {
   Impl(TpRuntime& tp_in, head::Nvfp4Matrix matrix, cudaStream_t s)
       : tp(tp_in), draft_head(matrix, s), stream(s) {
     const char* dump = std::getenv("INKLING_DFLASH2_DUMP");
-    const char* fh = std::getenv("INGINE_DFLASH2_FUSED_HEAD");
     // Opt-in only: batch head_topk16_nvfp4 uses TM=32 MMA tiles (+0.88 ms slower at M=7 solo than GEMV).
-    fused = (fh && std::string_view(fh) == "1") && (!dump || !*dump) && !draft_head.token_ids();
+    fused = batch_head_requested() && (!dump || !*dump) && !draft_head.token_ids();
+    small = small_head_enabled();
     const int rows = draft_head.matrix().rows;
     if (fused) {
       workspace = DeviceBuffer(batch::head_topk16_nvfp4_workspace_bytes(Proposals, rows));
+    } else if (small) {
+      workspace = DeviceBuffer(head::nvfp4_topk16_small_workspace(Proposals, rows));
     } else {
       logits = DeviceBuffer(std::size_t(Proposals) * rows * sizeof(float));
       pool_values = DeviceBuffer(Proposals * draft::CANDIDATES * sizeof(float));
@@ -1237,6 +1399,9 @@ void DFlash2Head::run(const Bf* hidden, bool replicated, bool run_merge) {
   const auto matrix = d.draft_head.matrix();
   if (d.fused) {
     batch::head_topk16_nvfp4(input, H, matrix, Proposals, d.workspace.p, values, ids, d.stream);
+  } else if (d.small) {
+    head::project_nvfp4_topk16_small(input, Proposals, H, matrix, d.draft_head.token_ids(),
+                                   values, ids, d.workspace.p, d.stream);
   } else {
     head::project_nvfp4(input, Proposals, H, matrix, logits, d.stream);
     draft::topk_candidates(logits, Proposals, matrix.rows, d.draft_head.token_ids(),
@@ -1245,7 +1410,8 @@ void DFlash2Head::run(const Bf* hidden, bool replicated, bool run_merge) {
   }
   // The fused head and mapped shortlists already return global token IDs.
   pack_head_candidates<<<1, HeadCandidates, 0, d.stream>>>(
-      values, ids, d.fused ? 0 : matrix.v_begin, static_cast<head::Candidate*>(d.local.p));
+      values, ids, d.fused || d.small || d.draft_head.token_ids() ? 0 : matrix.v_begin,
+      static_cast<head::Candidate*>(d.local.p));
   d.tp.exchange_draft_head(d.local.p, d.local.bytes, d.gathered.p, d.stream);
   if (replicated ? run_merge : (hidden != nullptr))
     merge_head_candidates<<<1, Proposals, 0, d.stream>>>(
@@ -1275,14 +1441,15 @@ void DFlash2::bind_head(head::Nvfp4Matrix matrix, const Bf* embed, const float* 
   // Oracle dumps use full-vocabulary tensors with token IDs as row indices.
   d.draft_head = kernels::draft::DFlash2DraftHead(matrix, d.s, d.dump_dir.empty());
   const int rows = d.draft_head.matrix().rows;
-  const char* fh = std::getenv("INGINE_DFLASH2_FUSED_HEAD");
   // Opt-in only: batch head_topk16_nvfp4 uses TM=32 MMA tiles (+0.88 ms slower at M=7 solo than GEMV).
-  d.fused_head = (fh && std::string_view(fh) == "1") &&
-                 !d.draft_head.token_ids() && d.dump_dir.empty();
+  d.fused_head = batch_head_requested() && !d.draft_head.token_ids() && d.dump_dir.empty();
+  d.small_head = small_head_enabled();
   d.top_values = d.allocate<float>(HeadCandidates);
   d.top_ids = d.allocate<int>(HeadCandidates);
   if (d.fused_head) {
     d.top_workspace = d.allocate<std::byte>(batch::head_topk16_nvfp4_workspace_bytes(Proposals, rows));
+  } else if (d.small_head) {
+    d.top_workspace = d.allocate<std::byte>(head::nvfp4_topk16_small_workspace(Proposals, rows));
   } else {
     d.unary = d.allocate<float>(Proposals * rows);
     d.pool_values = d.allocate<float>(Proposals * draft::CANDIDATES);
@@ -1320,6 +1487,10 @@ void DFlash2::warmup() {
   for (int length = AttentionTile - Block + 1; length < W; length += AttentionTile) {
     d.commit(static_cast<const Bf*>(taps.p), length - d.length, d.length, false);
     propose(0, 0.f, 0, true);
+    if (length == AttentionTile - Block + 1 && supports_device_loop() &&
+        enabled_by_default("INGINE_DFLASH2_DEVICE_LOOP")) {
+      launch_proposal(AttentionTile, true);
+    }
     if (d.gqa) break;
   }
   // When sharded (d.tp != nullptr), sharded_head runs inside every captured graph in lockstep.
@@ -1349,56 +1520,8 @@ const int* DFlash2::propose(int anchor, float temperature, std::uint64_t seed, b
   }
   input_ids<<<1, Block, 0, d.s>>>(d.ids, d.anchor_dev, anchor, d.device_position, d.length,
                                    d.temperature, temperature, d.seed, seed);
+  launch_proposal(d.length);
   const bool in_graph_sharded_head = d.sharded_head && d.tp != nullptr;
-  auto launch = [&](const int* position) {
-    d.profile.begin(DraftProfile::Embedding);
-    kernels::dense::embed(d.ids, Block, d.embed, d.embed_norm, d.embed_output, false, d.s);
-    convert<<<Block * H / Threads, Threads, 0, d.s>>>(d.embed_output, d.embeddings, Block * H);
-    d.profile.end();
-    const auto* hidden = d.forward(d.embeddings, position);
-    if (in_graph_sharded_head) {
-      // Replicated hidden state across both ranks: skip hidden broadcast and capture the sharded
-      // head + candidate allgather (+ rank-0 selector) right inside the CUDA graph.
-      propose_sharded_head(hidden, true);
-      return;
-    }
-    if (d.sharded_head || !d.target_head.codes) return;
-    d.profile.begin(DraftProfile::Head);
-    d.project_head(hidden);
-    d.profile.end();
-    d.profile.begin(DraftProfile::Selector);
-    d.select(d.top_ids, d.top_values, d.anchor_dev, true);
-    d.profile.end();
-  };
-  if (d.device_position && d.warmed) {
-    const int splits = d.attention_splits();
-    const int graph_index = d.gqa && splits ? 1 : splits;
-    auto& graph = d.graphs[graph_index];
-    if (!graph) {
-      d.profile.capturing = true;
-      CUDA_CHECK(cudaStreamBeginCapture(d.s, cudaStreamCaptureModeThreadLocal));
-      try {
-        launch(d.device_position);
-      } catch (...) {
-        cudaGraph_t failed = nullptr;
-        cudaStreamEndCapture(d.s, &failed);
-        if (failed) cudaGraphDestroy(failed);
-        throw;
-      }
-      d.profile.capturing = false;
-      d.graph_profile_spans[graph_index] = d.profile.used;
-      cudaGraph_t captured = nullptr;
-      CUDA_CHECK(cudaStreamEndCapture(d.s, &captured));
-      const auto status = cudaGraphInstantiate(&graph, captured, 0);
-      cudaGraphDestroy(captured);
-      CUDA_CHECK(status);
-    }
-    d.profile.used = d.graph_profile_spans[graph_index];
-    CUDA_CHECK(cudaGraphLaunch(graph, d.s));
-  } else {
-    launch(nullptr);
-    d.warmed = true;
-  }
   const auto* hidden = d.normed + H;
   if (d.sharded_head && !in_graph_sharded_head && !warming_up) propose_sharded_head(hidden, false);
   if (!warming_up) d.profile.finish(d.length);
@@ -1434,6 +1557,112 @@ const int* DFlash2::propose(int anchor, float temperature, std::uint64_t seed, b
     d.dump_written = true;
   }
   return tokens;
+}
+
+void DFlash2::launch_proposal(int max_position, bool may_be_short) {
+  auto& d = *impl_;
+  const bool in_graph_sharded_head = d.sharded_head && d.tp != nullptr;
+  const int splits = Impl::attention_splits(max_position);
+  auto launch = [&](const int* position) {
+    d.profile.begin(DraftProfile::Embedding);
+    kernels::dense::embed(d.ids, Block, d.embed, d.embed_norm, d.embed_output, false, d.s);
+    convert<<<Block * H / Threads, Threads, 0, d.s>>>(d.embed_output, d.embeddings, Block * H);
+    d.profile.end();
+    const auto* hidden = d.forward(d.embeddings, position, splits, may_be_short);
+    if (in_graph_sharded_head) {
+      // Replicated hidden state across both ranks: skip hidden broadcast and capture the sharded
+      // head + candidate allgather (+ rank-0 selector) right inside the CUDA graph.
+      propose_sharded_head(hidden, true);
+      return;
+    }
+    if (d.sharded_head || !d.target_head.codes) return;
+    d.profile.begin(DraftProfile::Head);
+    d.project_head(hidden);
+    d.profile.end();
+    d.profile.begin(DraftProfile::Selector);
+    d.select(d.top_ids, d.top_values, d.anchor_dev, true);
+    d.profile.end();
+  };
+  if (d.device_position && d.warmed) {
+    const int graph_index = may_be_short ? MaxSplits + 1 : (d.gqa && splits ? 1 : splits);
+    auto& graph = d.graphs[graph_index];
+    if (!graph) {
+      d.profile.capturing = true;
+      CUDA_CHECK(cudaStreamBeginCapture(d.s, cudaStreamCaptureModeThreadLocal));
+      try {
+        launch(d.device_position);
+      } catch (...) {
+        cudaGraph_t failed = nullptr;
+        cudaStreamEndCapture(d.s, &failed);
+        if (failed) cudaGraphDestroy(failed);
+        throw;
+      }
+      d.profile.capturing = false;
+      d.graph_profile_spans[graph_index] = d.profile.used;
+      cudaGraph_t captured = nullptr;
+      CUDA_CHECK(cudaStreamEndCapture(d.s, &captured));
+      const auto status = cudaGraphInstantiate(&graph, captured, 0);
+      cudaGraphDestroy(captured);
+      CUDA_CHECK(status);
+    }
+    d.profile.used = d.graph_profile_spans[graph_index];
+    CUDA_CHECK(cudaGraphLaunch(graph, d.s));
+  } else {
+    launch(nullptr);
+    d.warmed = true;
+  }
+}
+
+bool DFlash2::supports_device_loop() const {
+  const auto& d = *impl_;
+  return d.tp_size == 1 && d.target_head.codes && d.device_position && !d.profile.enabled;
+}
+
+const int* DFlash2::tokens_device() const { return impl_->tokens; }
+
+void DFlash2::bind_round(const draft::RoundInputs& round) {
+  if (!supports_device_loop() || round.nwidths < 1 || round.nwidths > Block ||
+      !round.m || !round.accepted || !round.next_greedy)
+    throw std::invalid_argument("DFlash2 requires solo verify inputs to bind a device round");
+  for (int i = 0; i < round.nwidths; ++i)
+    if (!round.taps[i]) throw std::invalid_argument("DFlash2 device round is missing verify taps");
+  impl_->bind_round(round);
+}
+
+bool DFlash2::advance(int position, bool propose_next, float temperature, std::uint64_t seed) {
+  auto& d = *impl_;
+  if (!d.commit_graph || d.length != position)
+    throw std::logic_error("DFlash2 device round is unbound or out of sequence");
+  stage_commit<<<Block, Threads, 0, d.s>>>(d.round, d.commit_taps, position, d.device_position);
+  CUDA_CHECK(cudaGetLastError());
+  CUDA_CHECK(cudaGraphLaunch(d.commit_graph, d.s));
+  if (!propose_next) return false;
+
+  const int earliest = position + 1, latest = position + Block;
+  // A proposal crossing the short attention cutoff captures both paths.
+  // Their device guards select the legacy reduction order at the actual position.
+  const bool may_be_short = !Impl::attention_splits(earliest) && Impl::attention_splits(latest);
+  input_ids<<<1, Block, 0, d.s>>>(d.ids, d.anchor_dev, 0, d.device_position, position,
+                                 d.temperature, temperature, d.seed, seed, d.round.next_greedy, d.round.accepted);
+  launch_proposal(latest, may_be_short);
+  return true;
+}
+
+void DFlash2::advanced(int count) { impl_->length += count; }
+
+void DFlash2::trim_advance(const Bf* taps, int position, int kept, int committed) {
+  auto& d = *impl_;
+  // Restore the wrapped slots before replaying the shorter commit. Replaying
+  // also preserves the width-specific BF16 projection used by host verify.
+  if (position + committed > W) {
+    for (int i = 0; i < int(d.layers.size()); ++i) {
+      const auto& l = d.layers[i];
+      undo_commit<<<committed, Threads, 0, d.s>>>(l.keys, l.values, d.undo_keys(i), d.undo_values(i), position, d.kv_dim);
+    }
+    CUDA_CHECK(cudaGetLastError());
+  }
+  d.length = position;
+  d.commit(taps, kept, position, true);
 }
 
 void DFlash2::propose_sharded_head(const Bf* hidden, bool replicated) {
@@ -1561,7 +1790,7 @@ const Bf* DFlash2::forward_pair(DFlash2& rank0, DFlash2& rank1, const Bf* embedd
   if (d0.s != d1.s || d0.length != d1.length)
     throw std::invalid_argument("forward_pair requires matching stream and committed length");
   const cudaStream_t s = d0.s;
-  const int splits = d0.attention_splits();
+  const int splits = Impl::attention_splits(d0.length);
   CUDA_CHECK(cudaMemcpyAsync(d0.x, embeddings, Block * H * sizeof(Bf), cudaMemcpyDeviceToDevice, s));
   CUDA_CHECK(cudaMemcpyAsync(d1.x, embeddings, Block * H * sizeof(Bf), cudaMemcpyDeviceToDevice, s));
   for (int i = 0; i < int(d0.layers.size()); ++i) {

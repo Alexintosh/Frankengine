@@ -27,6 +27,7 @@ struct Sampling {
   // usual and then takes the forced token; speculative decoding accepts a draft iff it equals the forced token
   // and continues with the forced token after the accepted run. Fills GenerateStats::spec_trace.
   std::span<const int32_t> forced;
+  bool thinking_enabled = true;  // Auto LoopCD applies only when thinking is disabled
 };
 
 // The token whose embedding an image token replaces (<|unused_200054|>, the chat template's image placeholder).
@@ -133,7 +134,7 @@ inline void validate_kv_formats(bool fp8, bool q4, bool kv12) {
   if (fp8 && q4) throw std::invalid_argument("--kv-fp8 and --kv-q4 are mutually exclusive");
 }
 
-enum class LoopCdMode : int { Off = 0, Hidden = 1, Logits = 2, Adaptive = 3 };
+enum class LoopCdMode : int { Off = 0, Hidden = 1, Logits = 2, Adaptive = 3, Auto = 4 };
 
 struct RuntimeOptions {
   int max_batch = 1;
@@ -183,7 +184,8 @@ inline void set_loopcd_options(RuntimeOptions& options, std::string_view mode,
   else if (mode == "hidden") options.loopcd_mode = LoopCdMode::Hidden;
   else if (mode == "logits") options.loopcd_mode = LoopCdMode::Logits;
   else if (mode == "adaptive") options.loopcd_mode = LoopCdMode::Adaptive;
-  else throw std::invalid_argument("--loopcd must be off, hidden, logits or adaptive");
+  else if (mode == "auto") options.loopcd_mode = LoopCdMode::Auto;
+  else throw std::invalid_argument("--loopcd must be off, hidden, logits, adaptive or auto");
 
   const bool enabled = options.loopcd_mode != LoopCdMode::Off;
   if (omega && (!std::isfinite(*omega) || *omega < 0.0 || *omega > std::numeric_limits<float>::max()))
@@ -241,6 +243,9 @@ class Generator {
   virtual int batch_max_ctx() const { return max_model_len(); }
   virtual int batch_spec() const { return 0; }
   virtual int reusable_prefix(int, std::span<const int32_t>) const { return 0; }
+  virtual int reusable_prefix(int slot, std::span<const int32_t> prompt, bool /*thinking_enabled*/) const {
+    return reusable_prefix(slot, prompt);
+  }
   virtual PrefillChunkResult prefill_slot_chunk(int, std::span<const int32_t>, int, BatchSampling&, int /*stop_at*/ = 0) {
     throw std::logic_error("batch prefill unavailable");
   }
@@ -251,6 +256,9 @@ class Generator {
   }
   // Clone a batch slot KV/conv/drafter prefix state into dst_slot (shared-prefix forking).
   virtual bool clone_slot(int /*src_slot*/, int /*dst_slot*/) { return false; }
+  virtual bool clone_slot(int src_slot, int dst_slot, bool /*thinking_enabled*/) {
+    return clone_slot(src_slot, dst_slot);
+  }
   virtual std::vector<int32_t> decode_batch_step(std::span<const BatchSlotStep>) {
     throw std::logic_error("batch decode unavailable");
   }

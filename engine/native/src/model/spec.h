@@ -61,11 +61,19 @@ class SpecLoop {
                    const std::function<bool(std::span<const std::int32_t>)>& on_tokens,
                    GenerateStats& stats, std::vector<std::int32_t>& tokens_in_state);
 
+  void generate_dflash2_device(std::int32_t token, int max_new_tokens, const Sampling& sampling,
+                   kernels::head::SamplerRng& rng, std::span<const std::int32_t> stop_ids,
+                   const std::function<bool(std::span<const std::int32_t>)>& on_tokens,
+                   GenerateStats& stats, std::vector<std::int32_t>& tokens_in_state);
+  void prepare_dflash2_exact();
+  void accept_dflash2_exact(const float* logits, int width, const std::int32_t* drafts, const Sampling& sampling,
+                           kernels::head::SamplerRng& rng, kernels::draft::AcceptResult* result);
+
   Runtime& rt_;
   Drafter* drafter_;
   DFlash2* dflash2_;
   DFlash2Head* dflash2_head_;
-  bool host_verify_;
+  bool host_verify_, dflash2_device_;
   DeviceBuffer proposal_, host_accept_;
   DeviceBuffer target_tokens_;
   DeviceBuffer dflash2_accept_;  // lazily allocated target probabilities, residual, uniforms, and reduction workspace

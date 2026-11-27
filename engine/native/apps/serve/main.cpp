@@ -111,9 +111,9 @@ int main(int argc, char** argv) {
           &kv_fp8);
   ap.flag("--kv-q4", "Q4_G64 INT4 full-attention KV caches", &kv_q4);
   ap.flag("--kv-12", "Bit-exact KV12 full-attention KV caches", &kv_12);
-  ap.option("--loopcd", "{off,hidden,logits,adaptive}", "LoopCD contrastive decoding (default off)", &loopcd,
-            {"off", "hidden", "logits", "adaptive"});
-  ap.option("--loopcd-omega", "<float>", "LoopCD weight (default 0.3 for hidden/logits, 0.5 for adaptive)", &loopcd_omega);
+  ap.option("--loopcd", "{off,hidden,logits,adaptive,auto}", "LoopCD contrastive decoding (auto uses hidden when thinking is off, default off)", &loopcd,
+            {"off", "hidden", "logits", "adaptive", "auto"});
+  ap.option("--loopcd-omega", "<float>", "LoopCD weight (default 0.3 for hidden/logits/auto, 0.5 for adaptive)", &loopcd_omega);
   ap.option("--loopcd-ref", "<int>", "Reference loop pass (1 or 2, default 1)", &loopcd_ref);
   ap.option("--spec-widths", "{coarse,fine,fine2}", "verify widths: 2/4/8, 1..8 or 2..8", &spec_widths, {"coarse", "fine", "fine2"});
   ap.option("--draft-type", "", "Drafter implementation", &draft_type, {"dspark", "dflash2", "hybrid"});

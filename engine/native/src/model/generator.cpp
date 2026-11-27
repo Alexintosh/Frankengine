@@ -25,6 +25,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <chrono>
 #include <cstdio>
 #include <deque>
@@ -147,6 +148,7 @@ class EngineGenerator final : public Generator {
     }
     if (drafter_ || dflash2_ || options.batch_spec > 0)
       taps_ = DeviceBuffer(std::size_t(options.prefill_chunk) * NUM_TAPS * HIDDEN * 2);
+    if (rt_.state().loopcd.auto_mode()) batch_slot_loopcd_omega_.resize(options.max_batch);
     if (options.batch_spec > 0) {
       if (options.batch_spec > BatchDrafter::GAMMA)
         throw std::invalid_argument("batch_spec must be in 1..7");
@@ -294,19 +296,21 @@ class EngineGenerator final : public Generator {
     rng.seed = sampling.seed ? *sampling.seed : (std::uint64_t(std::random_device{}()) << 32) ^ std::random_device{}();
     std::lock_guard<std::mutex> lock(mutex_);
 
+    const float omega = rt_.state().loopcd.effective_omega(sampling.thinking_enabled);
     if (rt_.tp() && options_.tp.serve) rt_.tp()->full_logits = sampling.temperature > 0;
 
     bool flash = options_.draft_type == "dflash2";
     if (options_.draft_type == "hybrid") {
       if (n <= options_.dflash2_max_ctx && (sampling.temperature <= 0.f || allow_dflash2_sampled)) {
         const bool warm_flash = !options_.cold_prefill &&
-            (live_prefix(prompt, true) || checkpoint_prefix(prompt, true) || find_parked(prompt, 0, true));
+            (live_prefix(prompt, true, omega) || checkpoint_prefix(prompt, true, omega) ||
+             find_parked(prompt, 0, true, omega));
         // Favor a substantial warm DSpark prefix when DFlash2 would need a full prefill.
         constexpr std::size_t kMinHybridReuse = 512;
         const bool warm_dspark = !options_.cold_prefill &&
-            (live_prefix(prompt, false) >= kMinHybridReuse ||
-             checkpoint_prefix(prompt, false) >= kMinHybridReuse ||
-             find_parked(prompt, kMinHybridReuse - 1, false));
+            (live_prefix(prompt, false, omega) >= kMinHybridReuse ||
+             checkpoint_prefix(prompt, false, omega) >= kMinHybridReuse ||
+             find_parked(prompt, kMinHybridReuse - 1, false, omega));
         flash = warm_flash || !warm_dspark;
       }
       if (rt_.tp() && !rt_.tp()->agree(uint64_t(flash), rt_.stream())) flash = false;
@@ -337,6 +341,8 @@ class EngineGenerator final : public Generator {
         mix(sampling.forced);
         mix(stop_ids);
         request = (request ^ std::uint64_t(flash)) * 1099511628211ull;
+        if (rt_.state().loopcd.auto_mode())
+          request = (request ^ std::bit_cast<std::uint32_t>(omega)) * 1099511628211ull;
       }
       if (flash != previous_flash_) {
         if (!options_.cold_prefill) park_live();
@@ -344,9 +350,12 @@ class EngineGenerator final : public Generator {
         clear_checkpoint();
         if (!flash && dflash2_) dflash2_->reset();
       }
-      prefill(prompt, full_prompt.images, stop_ids, stats, request, flash, counter ? &on_tokens : nullptr);
+      if (options_.batch_spec == 0 && !batch_slot_loopcd_omega_.empty())
+        batch_slot_loopcd_omega_[0].reset();  // plain batch slot 0 shares the solo state
+      prefill(prompt, full_prompt.images, stop_ids, stats, request, flash, omega, counter ? &on_tokens : nullptr);
       previous_flash_ = flash;
       if (stats.interrupted_prefill_offset) return stats;
+      rt_.set_loopcd_omega(omega);
       stats.prompt_tokens = n;
       stats.image_tokens = image_tokens;
       if (spec) {
@@ -389,13 +398,19 @@ class EngineGenerator final : public Generator {
   int batch_spec() const override { return options_.batch_spec; }
 
   int reusable_prefix(int slot, std::span<const int32_t> prompt) const override {
+    return reusable_prefix(slot, prompt, true);
+  }
+
+  int reusable_prefix(int slot, std::span<const int32_t> prompt, bool thinking_enabled) const override {
     if (options_.cold_prefill) return 0;
+    const float omega = rt_.state().loopcd.effective_omega(thinking_enabled);
+    if (!batch_loopcd_matches(slot, omega)) return 0;
     auto match = [&](const std::vector<int32_t>& h) {
       return !h.empty() && h.size() < prompt.size() && std::equal(h.begin(), h.end(), prompt.begin()) ? int(h.size()) : 0;
     };
     if (options_.batch_spec > 0) {
       const int bm = match(batch_spec_histories_.at(std::size_t(slot)));
-      return slot == 0 ? std::max(bm, match(tokens_in_state_)) : bm;
+      return slot == 0 && batch_slot_loopcd_omega_.empty() ? std::max(bm, match(tokens_in_state_)) : bm;
     }
     // Precompute the final token's head even when a previous turn used a different head mode.
     return match(slot_history(slot));
@@ -421,6 +436,7 @@ class EngineGenerator final : public Generator {
     copy_same(src.conv_mlp, dst.conv_mlp);
     copy_full_prefix(src, dst, len, stream);
     batch_spec_histories_.at(std::size_t(slot)) = tokens_in_state_;
+    set_batch_loopcd_omega(slot, live_loopcd_omega_);
     reset_batch_spec_cost(slot);
     if (batch_drafter_) batch_drafter_->reset_slot(slot);
     if (batch_dflash2_) batch_dflash2_->reset_slot(slot);
@@ -435,9 +451,15 @@ class EngineGenerator final : public Generator {
   }
 
   bool clone_slot(int src_slot, int dst_slot) override {
+    return clone_slot(src_slot, dst_slot, true);
+  }
+
+  bool clone_slot(int src_slot, int dst_slot, bool thinking_enabled) override {
     if (options_.batch_spec == 0) return false;
     if (src_slot < 0 || src_slot >= options_.max_batch || dst_slot < 0 || dst_slot >= options_.max_batch)
       return false;
+    const float omega = rt_.state().loopcd.effective_omega(thinking_enabled);
+    if (!batch_loopcd_matches(src_slot, omega)) return false;
     if (src_slot == dst_slot) return true;
     const auto& src_hist = batch_spec_histories_.at(std::size_t(src_slot));
     const int len = int(src_hist.size());
@@ -457,11 +479,21 @@ class EngineGenerator final : public Generator {
     copy_same(src.conv_mlp, dst.conv_mlp);
     copy_full_prefix(src, dst, len, stream);
     batch_spec_histories_.at(std::size_t(dst_slot)) = src_hist;
+    set_batch_loopcd_omega(dst_slot, omega);
     // The cloned prefix has no pending proposal.
     reset_batch_spec_cost(dst_slot);
     if (batch_drafter_) batch_drafter_->clone_slot(src_slot, dst_slot, len);
     if (batch_dflash2_) batch_dflash2_->clone_slot(src_slot, dst_slot, len);
     return true;
+  }
+
+  void release_slot(int slot) override {
+    if (batch_slot_loopcd_omega_.empty()) return;
+    auto& omega = batch_slot_loopcd_omega_.at(slot);
+    if (!omega) return;
+    if (options_.batch_spec > 0) batch_spec_histories_.at(slot).clear();
+    else slot_history(slot).clear();
+    omega.reset();
   }
 
   PrefillChunkResult prefill_slot_chunk(int slot, std::span<const int32_t> prompt, int offset,
@@ -474,10 +506,16 @@ class EngineGenerator final : public Generator {
       throw std::invalid_argument("invalid batch prompt");
     const auto stream = rt_.stream();
     auto* tp = rt_.tp();
+    const float omega = rt_.state().loopcd.effective_omega(sampling.params.thinking_enabled);
+    if (offset > 0 && !batch_slot_loopcd_omega_.empty()) {
+      const auto& history = options_.batch_spec > 0 ? batch_spec_histories_.at(slot) : slot_history(slot);
+      if (int(history.size()) != offset || !batch_loopcd_matches(slot, omega))
+        throw std::invalid_argument("batch prefill offset or LoopCD weight does not match slot history");
+    }
     if (options_.batch_spec > 0) {
       State view = batch_state_.view(slot);
       auto& history = batch_spec_histories_.at(std::size_t(slot));
-      const int reused = offset == 0 ? prepare_batch_prefill(slot, prompt) : 0;
+      const int reused = offset == 0 ? prepare_batch_prefill(slot, prompt, omega) : 0;
       offset += reused;
       if (stop_at > 0 && offset == stop_at && stop_at < int(prompt.size())) {
         return PrefillChunkResult{offset, reused, std::nullopt};
@@ -495,7 +533,7 @@ class EngineGenerator final : public Generator {
       prefiller_.run(view, static_cast<const int32_t*>(chunk_tokens_.p), count, offset,
                      !tp || (sampled && options_.tp.rank == 0) ? static_cast<float*>(logits_.p) : nullptr,
                      need_batch_taps ? &taps : nullptr, {},
-                     tp && !sampled ? static_cast<int32_t*>(logits_.p) : nullptr, final);
+                     tp && !sampled ? static_cast<int32_t*>(logits_.p) : nullptr, final, omega);
       if (need_batch_taps) {
         const std::int32_t slot32 = slot, count32 = count;
         const std::int64_t start64 = offset;
@@ -529,7 +567,7 @@ class EngineGenerator final : public Generator {
     auto& history = slot_history(slot);
     int reused = 0;
     if (offset == 0) {
-      reused = reusable_prefix(slot, prompt);
+      reused = reusable_prefix(slot, prompt, sampling.params.thinking_enabled);
       if (tp && !tp->agree(reused, stream)) reused = 0;
       if (slot == 0) {
         park_live();
@@ -544,6 +582,8 @@ class EngineGenerator final : public Generator {
         history.clear();
       }
     }
+    set_batch_loopcd_omega(slot, omega);
+    if (slot == 0) live_loopcd_omega_ = omega;
     const int count = std::min({2048, options_.prefill_chunk, int(prompt.size()) - offset});
     const bool final = offset + count == int(prompt.size());
     const bool sampled = sampling.params.temperature > 0;
@@ -552,7 +592,7 @@ class EngineGenerator final : public Generator {
                                cudaMemcpyHostToDevice, stream));
     prefiller_.run(state, static_cast<const int32_t*>(chunk_tokens_.p), count, offset,
                    !tp || (sampled && options_.tp.rank == 0) ? static_cast<float*>(logits_.p) : nullptr,
-                   nullptr, {}, tp && !sampled ? static_cast<int32_t*>(logits_.p) : nullptr, final);
+                   nullptr, {}, tp && !sampled ? static_cast<int32_t*>(logits_.p) : nullptr, final, omega);
     if (tp) tp->wait(stream);
     else CUDA_CHECK(cudaStreamSynchronize(stream));
     history.insert(history.end(), prompt.begin() + offset, prompt.begin() + offset + count);
@@ -587,8 +627,10 @@ class EngineGenerator final : public Generator {
             return token < 0 || token >= UNPADDED_VOCAB;
           }))
         throw std::invalid_argument("invalid short batch prompt");
-      if (input.offset > 0 && batch_spec_histories_[input.slot].size() != std::size_t(input.offset))
-        throw std::invalid_argument("short batch prefill offset does not match slot history");
+      const float omega = rt_.state().loopcd.effective_omega(input.sampling->params.thinking_enabled);
+      if (input.offset > 0 && (batch_spec_histories_[input.slot].size() != std::size_t(input.offset) ||
+                               !batch_loopcd_matches(input.slot, omega)))
+        throw std::invalid_argument("short batch prefill does not match slot history");
       seen[input.slot] = true;
     }
     std::vector<PrefillChunkResult> results;
@@ -596,10 +638,11 @@ class EngineGenerator final : public Generator {
     std::vector<std::size_t> members;
     std::vector<std::int32_t> m, tok, slot_ids, off, finished_slots, anchors;
     std::vector<std::int64_t> pos, finished_pos;
-    std::vector<float> temp;
+    std::vector<float> temp, omegas;
     try {
       for (const auto& input : slots) {
-        const int reused = input.offset == 0 ? prepare_batch_prefill(input.slot, input.prompt) : 0;
+        const float omega = rt_.state().loopcd.effective_omega(input.sampling->params.thinking_enabled);
+        const int reused = input.offset == 0 ? prepare_batch_prefill(input.slot, input.prompt, omega) : 0;
         results.push_back({input.offset + reused, reused, std::nullopt});
       }
       for (int step = 0; max_steps == 0 || step < max_steps; ++step) {
@@ -610,6 +653,7 @@ class EngineGenerator final : public Generator {
         off.assign(1, 0);
         pos.clear();
         temp.clear();
+        omegas.clear();
         for (std::size_t j = 0; j < slots.size(); ++j) {
           const auto& input = slots[j];
           const int offset = results[j].offset;
@@ -622,10 +666,12 @@ class EngineGenerator final : public Generator {
           off.push_back(int(tok.size()));
           pos.push_back(offset);
           temp.push_back(input.sampling->params.temperature);
+          if (!batch_slot_loopcd_omega_.empty()) omegas.push_back(*batch_slot_loopcd_omega_[input.slot]);
         }
         if (members.empty()) break;
         const auto got = batch_dec_->step(int(members.size()), m.data(), tok.data(), slot_ids.data(), pos.data(),
-                                          temp.data(), batch_seed(++batch_draws_), nullptr);
+                                          temp.data(), batch_seed(++batch_draws_), nullptr,
+                                          omegas.empty() ? nullptr : omegas.data());
         // A multi-row step defers conv updates for every lane, including one-row lanes.
         batch_dec_->accept(m.data());
         commit_batch_taps(slot_ids, pos, m, off);
@@ -652,7 +698,10 @@ class EngineGenerator final : public Generator {
         CUDA_CHECK(cudaStreamSynchronize(rt_.stream()));
     } catch (...) {
       // A failed step may have written part of a slot's state. Force a cold restart on reuse.
-      for (const auto& input : slots) batch_spec_histories_[input.slot].clear();
+      for (const auto& input : slots) {
+        batch_spec_histories_[input.slot].clear();
+        if (!batch_slot_loopcd_omega_.empty()) batch_slot_loopcd_omega_[input.slot].reset();
+      }
       throw;
     }
     return results;
@@ -668,7 +717,8 @@ class EngineGenerator final : public Generator {
     const BatchSpecCost cost(batch_spec_config_, n, options_.max_batch, options_.batch_spec_threshold);
     std::vector<std::int32_t> m(ns), slot_ids(ns), tok;
     std::vector<std::int64_t> pos(ns);
-    std::vector<float> temp(ns);
+    std::vector<float> temp(ns), omegas;
+    if (!batch_slot_loopcd_omega_.empty()) omegas.reserve(ns);
     std::vector<BatchSpecCost::Slot> spec_slots(ns);
     for (std::size_t i = 0; i < ns; ++i) {
       const int s = slots[i].slot;
@@ -677,7 +727,12 @@ class EngineGenerator final : public Generator {
       const int k_max = std::min(batch_slot_draft_budget_[s], std::max(0, avail - 1));
       slot_ids[i] = s;
       pos[i] = p_cur;
-      temp[i] = slots[i].sampling->params.temperature;
+      const auto& params = slots[i].sampling->params;
+      temp[i] = params.temperature;
+      const float omega = rt_.state().loopcd.effective_omega(params.thinking_enabled);
+      if (!batch_loopcd_matches(s, omega))
+        throw std::invalid_argument("batch decode LoopCD weight does not match slot history");
+      if (!batch_slot_loopcd_omega_.empty()) omegas.push_back(omega);
       spec_slots[i] = {k_max, batch_conf_.data() + std::size_t(s) * G,
                       batch_slot_ema_p_[s], batch_slot_spec_steps_[s], temp[i],
                       batch_draft_support_.has_support(s, temp[i])};
@@ -693,7 +748,7 @@ class EngineGenerator final : public Generator {
     }
     const auto* reject = batch_draft_support_.verification_inputs(slot_ids, m, tok, temp);
     const auto got = batch_dec_->step(n, m.data(), tok.data(), slot_ids.data(), pos.data(), temp.data(),
-                                      batch_seed(++batch_draws_), reject);
+                                      batch_seed(++batch_draws_), reject, omegas.empty() ? nullptr : omegas.data());
     std::vector<std::int32_t> off(ns + 1, 0), keep(ns);
     for (int i = 0; i < n; ++i) off[std::size_t(i) + 1] = off[std::size_t(i)] + m[std::size_t(i)];
     std::vector<std::int32_t> d_slots, d_anchors;
@@ -732,12 +787,18 @@ class EngineGenerator final : public Generator {
     std::vector<Runtime::BatchInput> rows;
     bool sampled = false, greedy_only = true;
     for (const auto& slot : slots) {
+      const auto& params = slot.sampling->params;
+      const float omega = rt_.state().loopcd.effective_omega(params.thinking_enabled);
+      if (!batch_loopcd_matches(slot.slot, omega))
+        throw std::invalid_argument("batch decode LoopCD weight does not match slot history");
       rt_.state_slot(slot.slot).length = int(slot_history(slot.slot).size());
-      rows.push_back({slot.slot, slot.token});
-      sampled |= slot.sampling->params.temperature > 0;
-      greedy_only &= slot.sampling->params.temperature <= 0;
+      rows.push_back({slot.slot, slot.token, omega});
+      set_batch_loopcd_omega(slot.slot, omega);
+      sampled |= params.temperature > 0;
+      greedy_only &= params.temperature <= 0;
     }
     if (rows.size() == 1 && rows.front().slot == 0) {
+      rt_.set_loopcd_omega(rows.front().loopcd_omega);
       if (rt_.tp()) rt_.tp()->full_logits = sampled;
       const int32_t input = rows.front().token;
       rt_.set_inputs(std::span(&input, 1), int(tokens_in_state_.size()));
@@ -933,9 +994,10 @@ class EngineGenerator final : public Generator {
     }
   }
 
-  std::size_t live_prefix(std::span<const std::int32_t> ids, bool flash) const {
+  std::size_t live_prefix(std::span<const std::int32_t> ids, bool flash, float omega) const {
     const auto& prev = tokens_in_state_;
-    if (options_.cold_prefill || previous_flash_ != flash || prev.empty() || prev.size() >= ids.size())
+    if (options_.cold_prefill || previous_flash_ != flash || live_loopcd_omega_ != omega ||
+        prev.empty() || prev.size() >= ids.size())
       return 0;
     // Only ranks that own the active drafter have a local draft length to check.
     const int len = int(prev.size());
@@ -944,9 +1006,10 @@ class EngineGenerator final : public Generator {
     return std::equal(prev.begin(), prev.end(), ids.begin()) ? prev.size() : 0;
   }
 
-  std::size_t checkpoint_prefix(std::span<const std::int32_t> ids, bool flash) const {
+  std::size_t checkpoint_prefix(std::span<const std::int32_t> ids, bool flash, float omega) const {
     const auto& saved = checkpoint_ids_;
-    if (options_.cold_prefill || checkpoint_is_flash_ != flash || saved.empty() || saved.size() > ids.size())
+    if (options_.cold_prefill || checkpoint_is_flash_ != flash || checkpoint_loopcd_omega_ != omega ||
+        saved.empty() || saved.size() > ids.size())
       return 0;
     // Reusing the entire prompt also reuses its saved logits.
     const bool sampled_head = rt_.tp() && rt_.tp()->full_logits;
@@ -987,15 +1050,15 @@ class EngineGenerator final : public Generator {
   // (images inside the reused prefix are not encoded again), and the Prefiller writes its rows over the
   // embeddings of its tokens; an image may span chunks.
   void prefill(std::span<const std::int32_t> ids, std::span<const PromptImage> images,
-               std::span<const std::int32_t> stop_ids, GenerateStats& stats, std::uint64_t request, bool flash,
+               std::span<const std::int32_t> stop_ids, GenerateStats& stats, std::uint64_t request, bool flash, float omega,
                const std::function<bool(std::span<const int32_t>)>* proceed = nullptr) {
     const bool cold = options_.cold_prefill;
     const std::size_t n = ids.size();
     State& st = rt_.state();
     const cudaStream_t stream = rt_.stream();
-    const std::size_t extend = live_prefix(ids, flash);
-    const std::size_t checkpoint = extend ? 0 : checkpoint_prefix(ids, flash);
-    Parked* parked = cold ? nullptr : find_parked(ids, std::max(extend, checkpoint), flash);
+    const std::size_t extend = live_prefix(ids, flash, omega);
+    const std::size_t checkpoint = extend ? 0 : checkpoint_prefix(ids, flash, omega);
+    Parked* parked = cold ? nullptr : find_parked(ids, std::max(extend, checkpoint), flash, omega);
     std::size_t start = 0;
     if (parked) {
       // parking the live conversation may move the parked list (never evicting the one to restore)
@@ -1032,12 +1095,14 @@ class EngineGenerator final : public Generator {
       }
       rt_.tp()->verify_request((request ^ start) * 1099511628211ull, stream);
     }
+    live_loopcd_omega_ = omega;
     std::size_t boundary = find_anchor_boundary(ids, images, stop_ids);
     if (boundary <= start || park_layout(int(boundary), flash).bytes > park_budget_) boundary = 0;
     std::size_t anchor_at = boundary;
     if (anchor_at) {
       for (Parked& p : parked_) {
-        if (p.is_flash == flash && p.ids.size() == anchor_at && std::equal(p.ids.begin(), p.ids.end(), ids.begin())) {
+        if (p.is_flash == flash && p.loopcd_omega == omega && p.ids.size() == anchor_at &&
+            std::equal(p.ids.begin(), p.ids.end(), ids.begin())) {
           p.is_anchor = true;
           p.used = ++clock_;
           anchor_at = 0;
@@ -1097,7 +1162,7 @@ class EngineGenerator final : public Generator {
       prefiller_.run(st, static_cast<const int32_t*>(chunk_tokens_.p), T, int(s),
                      rt_.tp() && (!rt_.tp()->full_logits || options_.tp.rank != 0) ? nullptr : static_cast<float*>(logits_.p), (flash ? bool(dflash2_) : bool(drafter_)) ? &taps : nullptr, rows,
                      rt_.tp() && !rt_.tp()->full_logits ? static_cast<int32_t*>(logits_.p) : nullptr,
-                     (!at_anchor && !proceed && !rt_.tp()) || end == n);
+                     (!at_anchor && !proceed && !rt_.tp()) || end == n, omega);
       if (!flash && drafter_) {
         drafter_->note_tokens(ids.subspan(s, std::size_t(T)));  // the prompt's tokens join the drafter's shortlist
         drafter_->commit(taps, int(s));
@@ -1130,6 +1195,7 @@ class EngineGenerator final : public Generator {
   struct Parked {
     std::vector<std::int32_t> ids, context;
     DeviceBuffer data;
+    float loopcd_omega = 0.f;
     bool is_flash = false;
     bool is_anchor = false;
     bool has_logits = true;
@@ -1162,11 +1228,12 @@ class EngineGenerator final : public Generator {
   }
 
   // the parked conversation whose prompt is the longest prefix of `ids`, if longer than `live` (and kMinParked)
-  Parked* find_parked(std::span<const std::int32_t> ids, std::size_t live, bool flash) {
+  Parked* find_parked(std::span<const std::int32_t> ids, std::size_t live, bool flash, float omega) {
     Parked* best = nullptr;
     const bool sampled_head = rt_.tp() && rt_.tp()->full_logits;
     for (Parked& p : parked_)
-      if (p.is_flash == flash && p.ids.size() >= kMinParked && p.ids.size() > live && p.ids.size() <= ids.size() &&
+      if (p.is_flash == flash && p.loopcd_omega == omega &&
+          p.ids.size() >= kMinParked && p.ids.size() > live && p.ids.size() <= ids.size() &&
           (p.ids.size() < ids.size() || (p.has_logits && p.sampled_head == sampled_head)) &&
           (!best || p.ids.size() > best->ids.size()) && std::equal(p.ids.begin(), p.ids.end(), ids.begin()))
         best = &p;
@@ -1234,16 +1301,18 @@ class EngineGenerator final : public Generator {
     if (!checkpoint_has_logits_ || park_budget_ == 0 || n < kMinParked) return;
     const bool flash = checkpoint_is_flash_;
     for (Parked& p : parked_)
-      if (p.is_flash == flash && p.has_logits && p.ids == checkpoint_ids_ &&
+      if (p.is_flash == flash && p.loopcd_omega == checkpoint_loopcd_omega_ && p.has_logits &&
+          p.ids == checkpoint_ids_ &&
           p.sampled_head == checkpoint_sampled_head_) {
         p.used = ++clock_;
         return;
       }
     const ParkLayout l = park_layout(int(n), flash);
     if (l.bytes > park_budget_) return;
-    // A longer checkpoint supersedes ordinary prefixes of the same draft type.
+    // A longer checkpoint supersedes ordinary prefixes with the same draft type and LoopCD weight.
     std::erase_if(parked_, [&](const Parked& p) {
-      return p.data.p != keep && !p.is_anchor && p.is_flash == flash && p.ids.size() <= n &&
+      return p.data.p != keep && !p.is_anchor && p.is_flash == flash &&
+             p.loopcd_omega == checkpoint_loopcd_omega_ && p.ids.size() <= n &&
              std::equal(p.ids.begin(), p.ids.end(), checkpoint_ids_.begin());
     });
     Parked p;
@@ -1263,6 +1332,7 @@ class EngineGenerator final : public Generator {
     CUDA_CHECK(cudaMemcpyAsync(d + l.logits, c + checkpoint_logits_, logits_.bytes, cudaMemcpyDeviceToDevice, s));
     rt_.save_full_rows(d + l.rows, int(n));
     p.ids = checkpoint_ids_;
+    p.loopcd_omega = checkpoint_loopcd_omega_;
     p.is_flash = flash;
     p.sampled_head = checkpoint_sampled_head_;
     p.used = ++clock_;
@@ -1288,6 +1358,7 @@ class EngineGenerator final : public Generator {
     }
     rt_.save_full_rows(d + l.rows, n);
     p.ids.assign(ids.begin(), ids.end());
+    p.loopcd_omega = live_loopcd_omega_;
     p.is_flash = flash;
     p.is_anchor = true;
     p.has_logits = false;
@@ -1320,6 +1391,7 @@ class EngineGenerator final : public Generator {
       CUDA_CHECK(cudaMemcpyAsync(c + checkpoint_logits_, d + l.logits, logits_.bytes, cudaMemcpyDeviceToDevice, s));
     rt_.restore_full_rows(d + l.rows, n);
     checkpoint_ids_ = p.ids;
+    checkpoint_loopcd_omega_ = p.loopcd_omega;
     checkpoint_is_flash_ = p.is_flash;
     checkpoint_has_logits_ = p.has_logits;
     checkpoint_sampled_head_ = p.sampled_head;
@@ -1338,6 +1410,7 @@ class EngineGenerator final : public Generator {
     CUDA_CHECK(cudaMemcpyAsync(p + checkpoint_logits_, logits_.p, logits_.bytes, cudaMemcpyDeviceToDevice,
                                rt_.stream()));
     checkpoint_ids_ = tokens_in_state_;
+    checkpoint_loopcd_omega_ = live_loopcd_omega_;
     checkpoint_is_flash_ = flash;
     checkpoint_has_logits_ = true;
     checkpoint_sampled_head_ = rt_.tp() && rt_.tp()->full_logits;
@@ -1355,6 +1428,7 @@ class EngineGenerator final : public Generator {
       CUDA_CHECK(cudaMemcpyAsync(logits_.p, p + checkpoint_logits_, logits_.bytes, cudaMemcpyDeviceToDevice,
                                  rt_.stream()));
     tokens_in_state_ = checkpoint_ids_;
+    live_loopcd_omega_ = checkpoint_loopcd_omega_;
   }
 
   static std::size_t carved(std::size_t bytes) { return (bytes + 255) / 256 * 256; }
@@ -1394,11 +1468,24 @@ class EngineGenerator final : public Generator {
     return token;
   }
 
-  int prepare_batch_prefill(int slot, std::span<const int32_t> prompt) {
+  bool batch_loopcd_matches(int slot, float omega) const {
+    if (batch_slot_loopcd_omega_.empty()) return true;
+    const auto& saved = batch_slot_loopcd_omega_.at(slot);
+    if (!saved && slot == 0 && options_.batch_spec == 0)
+      return !tokens_in_state_.empty() && live_loopcd_omega_ == omega;
+    return saved == omega;
+  }
+
+  void set_batch_loopcd_omega(int slot, float omega) {
+    if (!batch_slot_loopcd_omega_.empty()) batch_slot_loopcd_omega_.at(slot) = omega;
+  }
+
+  int prepare_batch_prefill(int slot, std::span<const int32_t> prompt, float omega) {
     auto& history = batch_spec_histories_.at(std::size_t(slot));
     reset_batch_spec_cost(slot);
     int reused = 0;
-    if (!options_.cold_prefill && !history.empty() && history.size() < prompt.size() &&
+    if (!options_.cold_prefill && batch_loopcd_matches(slot, omega) &&
+        !history.empty() && history.size() < prompt.size() &&
         std::equal(history.begin(), history.end(), prompt.begin())) {
       reused = int(history.size());
     }
@@ -1410,6 +1497,7 @@ class EngineGenerator final : public Generator {
       if (batch_dflash2_) batch_dflash2_->reset_slot(slot);
       history.clear();
     }
+    set_batch_loopcd_omega(slot, omega);
     return reused;
   }
 
@@ -1548,6 +1636,7 @@ class EngineGenerator final : public Generator {
 
   std::array<std::vector<int32_t>, 7> batch_histories_;
   std::vector<std::vector<int32_t>> batch_spec_histories_;
+  std::vector<std::optional<float>> batch_slot_loopcd_omega_;
   std::vector<DeviceBuffer> batch_head_storage_;
   Dense batch_unembed_;
   BatchState batch_state_;
@@ -1587,6 +1676,7 @@ class EngineGenerator final : public Generator {
   std::size_t checkpoint_drafter_ = 0, checkpoint_logits_ = 0;  // byte offsets in checkpoint_
   std::vector<std::int32_t> checkpoint_ids_;
   std::vector<std::int32_t> tokens_in_state_;
+  float live_loopcd_omega_ = 0.f, checkpoint_loopcd_omega_ = 0.f;
   bool checkpoint_is_flash_ = false;
   bool checkpoint_has_logits_ = false;
   bool checkpoint_sampled_head_ = false;

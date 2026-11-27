@@ -24,6 +24,28 @@ __global__ void loopcd_hidden_kernel(const float* base, const float* write, cons
   depth[i] = extrapolate(depth[i], ref_depth[i], omega);
 }
 
+__global__ void set_loopcd_omega_kernel(float* dst, float omega) {
+  *dst = omega;
+}
+
+template <bool PerRow>
+__global__ void loopcd_hidden_device_kernel(const float* base, const float* write, const float* ref_stream,
+                                            float* out, float* depth, const float* ref_depth,
+                                            std::size_t width, const float* omegas) {
+  const std::size_t col = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (col >= width) return;
+  const std::size_t row = PerRow ? blockIdx.y : 0;
+  const std::size_t i = row * width + col;
+  const float omega = omegas[row];
+  const float value = write ? base[i] + write[i] : base[i];
+  if (omega == 0.f) {
+    out[i] = value;
+    return;
+  }
+  out[i] = extrapolate(value, ref_stream[i], omega);
+  depth[i] = extrapolate(depth[i], ref_depth[i], omega);
+}
+
 struct TopTwo {
   float first, second;
 
@@ -103,6 +125,28 @@ void loopcd_hidden(const float* base, const float* write, const float* ref_strea
                    float* depth, const float* ref_depth, std::size_t elements, float omega, cudaStream_t stream) {
   loopcd_hidden_kernel<<<(elements + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
       base, write, ref_stream, out, depth, ref_depth, elements, omega);
+  CUDA_CHECK(cudaGetLastError());
+}
+
+void set_loopcd_omega(float* omega_dev, float omega, cudaStream_t stream) {
+  set_loopcd_omega_kernel<<<1, 1, 0, stream>>>(omega_dev, omega);
+  CUDA_CHECK(cudaGetLastError());
+}
+
+void loopcd_hidden_device(const float* base, const float* write, const float* ref_stream, float* out,
+                          float* depth, const float* ref_depth, std::size_t elements,
+                          const float* omega_dev, cudaStream_t stream) {
+  loopcd_hidden_device_kernel<false><<<(elements + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
+      base, write, ref_stream, out, depth, ref_depth, elements, omega_dev);
+  CUDA_CHECK(cudaGetLastError());
+}
+
+void loopcd_hidden_rows(const float* base, const float* write, const float* ref_stream, float* out,
+                        float* depth, const float* ref_depth, int rows, int hidden,
+                        const float* row_omegas, cudaStream_t stream) {
+  const dim3 grid((hidden + kThreads - 1) / kThreads, rows);
+  loopcd_hidden_device_kernel<true><<<grid, kThreads, 0, stream>>>(
+      base, write, ref_stream, out, depth, ref_depth, hidden, row_omegas);
   CUDA_CHECK(cudaGetLastError());
 }
 
