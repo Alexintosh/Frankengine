@@ -28,6 +28,7 @@ namespace ingine::model {
 struct BatchState {
   int slots = 0, ctx = 0, ring_rows = 0;
   bool kv_fp8 = false, kv_q4 = false, kv_12 = false;
+  LoopCdConfig loopcd;
   int hkv_local = KV_HEADS, kv_dim_local = KV_DIM;
   Tensor k_ring, v_ring;       // bf16 [slots * 40, ring_rows, 8, 128]
   Tensor ring_pos;             // int64 [slots * 40, ring_rows], -1 = empty
@@ -38,12 +39,12 @@ struct BatchState {
   std::vector<DeviceBuffer> storage;
 
   // slot strides, in elements
-  std::int64_t ring_stride() const { return std::int64_t(NUM_SLIDING_VISITS) * ring_rows * kv_dim_local; }
-  std::int64_t kpos_stride() const { return std::int64_t(NUM_SLIDING_VISITS) * ring_rows; }
-  std::int64_t full_stride() const { return std::int64_t(NUM_FULL_VISITS) * ctx * hkv_local * k_full.ne[0]; }
-  std::int64_t full_scale_stride() const { return std::int64_t(NUM_FULL_VISITS) * ctx * hkv_local * k_full_scale.ne[0]; }
-  std::int64_t conv_kv_stride() const { return std::int64_t(NUM_VISITS) * (CONV_K - 1) * kv_dim_local; }
-  std::int64_t conv_h_stride() const { return std::int64_t(NUM_VISITS) * (CONV_K - 1) * HIDDEN; }
+  std::int64_t ring_stride() const { return std::int64_t(loopcd.ring_visits()) * ring_rows * kv_dim_local; }
+  std::int64_t kpos_stride() const { return std::int64_t(loopcd.ring_visits()) * ring_rows; }
+  std::int64_t full_stride() const { return std::int64_t(loopcd.full_visits()) * ctx * hkv_local * k_full.ne[0]; }
+  std::int64_t full_scale_stride() const { return std::int64_t(loopcd.full_visits()) * ctx * hkv_local * k_full_scale.ne[0]; }
+  std::int64_t conv_kv_stride() const { return std::int64_t(loopcd.visits()) * (CONV_K - 1) * kv_dim_local; }
+  std::int64_t conv_h_stride() const { return std::int64_t(loopcd.visits()) * (CONV_K - 1) * HIDDEN; }
   std::size_t device_bytes() const;
 
   // model.State over slot s's memory (the Prefiller runs on it); owns nothing
@@ -51,7 +52,7 @@ struct BatchState {
 };
 
 BatchState make_batch_state(int slots, int ctx, bool kv_fp8, const TpLayout& layout = TpLayout{}, bool kv_q4 = false,
-                            bool kv_12 = false);
+                            bool kv_12 = false, LoopCdConfig loopcd = {});
 // model.State.reset for one slot: ring positions -1, conv states 0. Stream-ordered.
 void reset_slot(BatchState& st, int s, cudaStream_t stream);
 
@@ -73,9 +74,8 @@ struct BatchRejectInputs {
 //
 // With max_m > 1 a step with more than one row for some sequence also keeps what speculative decoding needs: the
 // rows' DSpark taps (taps()) and the conv inputs; its convolutions leave the slots' conv states as they were, and
-// accept() writes them once each sequence's kept rows are known (engine._rollback). The caches need no rollback: a
-// slot's rings never wrap, and the rows written past a sequence's accepted length are never read before they are
-// written again.
+// accept() writes them once each sequence's kept rows are known (engine._rollback). Full cache rows past the
+// committed length are overwritten before being read. LoopCD also preserves live rows of wrapped sliding rings.
 class BatchDecoder {
  public:
   BatchDecoder(const Weights& w, const Ablation& abl, BatchState& st, int max_seqs, cudaStream_t stream,
@@ -121,16 +121,18 @@ class BatchDecoder {
   // With BF16 head rows the step picks its tokens in the head GEMM (kernels::batch::head_sample) and stores the
   // logits only after keep_logits(true) (allocates them: rows x kLogitsLd fp32); FP8 head rows always store them.
   void keep_logits(bool keep);
-  // the last step's logits (device fp32, row b at b * kLogitsLd; nullptr when not kept): head outputs l when
-  // logits_raw() (model.logits = 30 tanh(bf16(l) / 30)), else model.logits
+  // Last step's logits (device fp32, row b at b * kLogitsLd). Materialized automatically with a
+  // reference coda. If logits_raw(), apply the model softcap before consuming these rows.
   static constexpr int kLogitsLd = (UNPADDED_VOCAB + 7) / 8 * 8;
   const float* logits() const { return keep_logits_ || !logits_raw() ? logits_ : nullptr; }
-  bool logits_raw() const { return use_nvfp4_head_ || !(unembed_override_ ? unembed_override_->fp8() : w_.unembed.fp8()); }
+  bool logits_raw() const { return !st_.loopcd.uses_ref_coda() &&
+      (use_nvfp4_head_ || !(unembed_override_ ? unembed_override_->fp8() : w_.unembed.fp8())); }
 
  private:
   const float* const* block_table(const std::vector<const float*>& blocks);
   void run_body(int n, int T, int M, bool verify, std::uint64_t seed,
                 const kernels::batch::RejectSpec* reject);
+  void verify_rings(int n, const std::int32_t* commit);
   kernels::batch::ConvStates conv_states() const;  // slot 0's conv states and the slot strides
 
   const Weights& w_;
@@ -141,6 +143,7 @@ class BatchDecoder {
   BatchState& st_;
   int max_seqs_, max_m_;
   int last_n_ = 0;            // the last step's sequences (rollback)
+  bool last_ring_backup_ = false;
   bool last_verify_ = false;  // ... and whether it kept the conv history (some sequence had more than one row)
   cudaStream_t stream_;
   std::unique_ptr<kernels::batch::TunedGemm> gemm_;
@@ -158,6 +161,7 @@ class BatchDecoder {
   using GraphKey = std::tuple<int, int, int, bool, bool>;
   std::map<GraphKey, int> graph_seen_;
   std::map<GraphKey, DecodeGraphExecutable> graphs_;
+  MappedHostBuffer pin_ring_backup_;
   MappedHostBuffer pin_tokens_, pin_slots_, pin_pos_, pin_rows_, pin_temps_, pin_seed_, pin_sampled_;
   std::vector<std::int32_t> sampled_host_;
   std::vector<float> temps_host_;            // per row
@@ -186,6 +190,7 @@ class BatchDecoder {
   int4* tiles_;
   __nv_bfloat16 *act_, *down_, *moe_sum_;
   float* logits_ = nullptr;
+  float* ref_logits_ = nullptr;
   bool keep_logits_ = false;
   DeviceBuffer logits_buf_;  // logits_ when kept (BF16 head rows)
   int2* head_partials_ = nullptr;

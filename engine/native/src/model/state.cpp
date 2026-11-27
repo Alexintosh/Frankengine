@@ -38,33 +38,35 @@ Tensor State::v_full_at(int full) const { return full_at(v_full, full); }
 Tensor State::k_full_scale_at(int full) const { return full_at(k_full_scale, full); }
 Tensor State::v_full_scale_at(int full) const { return full_at(v_full_scale, full); }
 
-State make_state(int max_ctx, bool kv_fp8, const TpLayout& layout, bool kv_q4, bool kv_12) {
+State make_state(int max_ctx, bool kv_fp8, const TpLayout& layout, bool kv_q4, bool kv_12, LoopCdConfig loopcd) {
   validate_kv_formats(kv_fp8, kv_q4, kv_12);
   // the attention kernel keeps positions in int32 and caps full caches at 2^30 rows
   if (max_ctx < 1 || max_ctx > (1 << 30)) throw std::invalid_argument("max_ctx must be in 1..2^30");
+  validate_loopcd_tp(loopcd, layout.tp_size);
   State st;
+  st.loopcd = loopcd;
   st.max_ctx = max_ctx;
   st.kv_fp8 = kv_fp8;
   st.kv_q4 = kv_q4;
   st.kv_12 = kv_12;
   const DType full = (kv_q4 || kv_12) ? DType::U8 : kv_fp8 ? DType::FP8_E4M3FN : DType::BF16;
   const int full_dim = kv_12 ? int(sizeof(kernels::kv12::Head)) : kv_q4 ? HEAD_DIM / 2 : HEAD_DIM;
-  st.k_ring = zeros(st.storage, DType::BF16, {NUM_SLIDING_VISITS, WINDOW, layout.hkv_local, HEAD_DIM});
-  st.v_ring = zeros(st.storage, DType::BF16, {NUM_SLIDING_VISITS, WINDOW, layout.hkv_local, HEAD_DIM});
-  st.ring_pos = zeros(st.storage, DType::I64, {NUM_SLIDING_VISITS, WINDOW});
+  st.k_ring = zeros(st.storage, DType::BF16, {loopcd.ring_visits(), WINDOW, layout.hkv_local, HEAD_DIM});
+  st.v_ring = zeros(st.storage, DType::BF16, {loopcd.ring_visits(), WINDOW, layout.hkv_local, HEAD_DIM});
+  st.ring_pos = zeros(st.storage, DType::I64, {loopcd.ring_visits(), WINDOW});
   CUDA_CHECK(cudaMemset(st.ring_pos.data, 0xff, st.storage.back().bytes));  // -1
-  st.k_full = zeros(st.storage, full, {NUM_FULL_VISITS, max_ctx, layout.hkv_local, full_dim});
-  st.v_full = zeros(st.storage, full, {NUM_FULL_VISITS, max_ctx, layout.hkv_local, full_dim});
+  st.k_full = zeros(st.storage, full, {loopcd.full_visits(), max_ctx, layout.hkv_local, full_dim});
+  st.v_full = zeros(st.storage, full, {loopcd.full_visits(), max_ctx, layout.hkv_local, full_dim});
   if (kv_q4 || kv_12) {
     const DType side = kv_12 ? DType::U8 : DType::FP16;
     const int side_dim = kv_12 ? int(sizeof(kernels::kv12::Spill)) : 2;
-    st.k_full_scale = zeros(st.storage, side, {NUM_FULL_VISITS, max_ctx, layout.hkv_local, side_dim});
-    st.v_full_scale = zeros(st.storage, side, {NUM_FULL_VISITS, max_ctx, layout.hkv_local, side_dim});
+    st.k_full_scale = zeros(st.storage, side, {loopcd.full_visits(), max_ctx, layout.hkv_local, side_dim});
+    st.v_full_scale = zeros(st.storage, side, {loopcd.full_visits(), max_ctx, layout.hkv_local, side_dim});
   }
-  st.conv_k = zeros(st.storage, DType::FP32, {NUM_VISITS, CONV_K - 1, layout.kv_dim_local});
-  st.conv_v = zeros(st.storage, DType::FP32, {NUM_VISITS, CONV_K - 1, layout.kv_dim_local});
-  st.conv_attn = zeros(st.storage, DType::FP32, {NUM_VISITS, CONV_K - 1, HIDDEN});
-  st.conv_mlp = zeros(st.storage, DType::FP32, {NUM_VISITS, CONV_K - 1, HIDDEN});
+  st.conv_k = zeros(st.storage, DType::FP32, {loopcd.visits(), CONV_K - 1, layout.kv_dim_local});
+  st.conv_v = zeros(st.storage, DType::FP32, {loopcd.visits(), CONV_K - 1, layout.kv_dim_local});
+  st.conv_attn = zeros(st.storage, DType::FP32, {loopcd.visits(), CONV_K - 1, HIDDEN});
+  st.conv_mlp = zeros(st.storage, DType::FP32, {loopcd.visits(), CONV_K - 1, HIDDEN});
   st.length = 0;
   return st;
 }
@@ -76,7 +78,7 @@ void reset_state(State& st, cudaStream_t stream) {
   st.length = 0;
 }
 
-Buffers make_buffers(int m, const TpLayout& tp, bool full_logits, bool mixed, bool cert_head) {
+Buffers make_buffers(int m, const TpLayout& tp, bool full_logits, bool mixed, bool cert_head, bool uses_ref_coda) {
   if (m < 1 || m > 8) throw std::invalid_argument("call width must be in 1..8");
   Buffers b;
   b.m = m;
@@ -108,21 +110,23 @@ Buffers make_buffers(int m, const TpLayout& tp, bool full_logits, bool mixed, bo
   if (tp.tp_size == 1 || ((full_logits || mixed) && tp.tp_rank == 0))
     b.logits = zeros(s, DType::FP32, {m, UNPADDED_VOCAB});
   if (cert_head || (tp.tp_size > 1 && (!full_logits || mixed))) b.greedy = zeros(s, DType::I32, {m});
+  if (uses_ref_coda) b.ref_logits = zeros(s, DType::FP32, {m, UNPADDED_VOCAB});
+  const int visits = NUM_VISITS + (uses_ref_coda ? CODA_VISITS : 0);
   b.taps = zeros(s, DType::BF16, {m, NUM_TAPS, H});
-  b.hist_attn = zeros(s, DType::FP32, {NUM_VISITS, m, H});
-  b.hist_mlp = zeros(s, DType::FP32, {NUM_VISITS, m, H});
-  b.hist_k = zeros(s, DType::FP32, {NUM_VISITS, m, tp.kv_dim_local});
-  b.hist_v = zeros(s, DType::FP32, {NUM_VISITS, m, tp.kv_dim_local});
+  b.hist_attn = zeros(s, DType::FP32, {visits, m, H});
+  b.hist_mlp = zeros(s, DType::FP32, {visits, m, H});
+  b.hist_k = zeros(s, DType::FP32, {visits, m, tp.kv_dim_local});
+  b.hist_v = zeros(s, DType::FP32, {visits, m, tp.kv_dim_local});
   return b;
 }
 
-std::vector<const float*> Buffers::blocks(int l, int p) const {
+std::vector<const float*> Buffers::blocks(int l, int p, int coda_pass) const {
   auto f = [](const Tensor& t) { return static_cast<const float*>(t.data); };
   if (l < 1) return {};
   if (l < 7) return {f(B0)};
   if (l < 13) return {f(B0), f(B1)};
-  if (l < 19) return {f(B0), f(B1), f(B2[l < LOOP_END ? p : 2])};
-  return {f(B0), f(B1), f(B2[2]), f(E[2])};
+  if (l < 19) return {f(B0), f(B1), f(B2[l < LOOP_END ? p : coda_pass])};
+  return {f(B0), f(B1), f(B2[coda_pass]), f(E[coda_pass])};
 }
 
 }  // namespace ingine::model

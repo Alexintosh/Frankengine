@@ -145,7 +145,9 @@ int main(int argc, char** argv) {
   bool dense_fp8 = false, dense_pico12 = false, head_nvfp4 = false, cert_head = false;
   bool kv_fp8 = false, kv_q4 = false, kv_12 = false, spec = false;
   bool draft_nvfp4 = false;
-  std::string spec_widths = "coarse";
+  std::string spec_widths = "coarse", loopcd = "off";
+  double loopcd_omega = 0.0;
+  int loopcd_ref = 1;
   bool spec_timing = false;
   double hybrid_dflash2_threshold = 0.50;
   int dflash2_max_ctx = 1536;
@@ -177,6 +179,10 @@ int main(int argc, char** argv) {
   ap.flag("--kv-q4", "Q4_G64 INT4 full-attention KV caches", &kv_q4);
   ap.flag("--kv-12", "Bit-exact KV12 full-attention KV caches", &kv_12);
   ap.flag("--spec", "DSpark speculative decoding", &spec);
+  ap.option("--loopcd", "{off,hidden,logits,adaptive}", "LoopCD contrastive decoding (default off)", &loopcd,
+            {"off", "hidden", "logits", "adaptive"});
+  ap.option("--loopcd-omega", "<float>", "LoopCD weight (default 0.3 for hidden/logits, 0.5 for adaptive)", &loopcd_omega);
+  ap.option("--loopcd-ref", "<int>", "Reference loop pass (1 or 2, default 1)", &loopcd_ref);
   ap.option("--spec-widths", "{coarse,fine,fine2}", "verify widths: 2/4/8, 1..8 or 2..8", &spec_widths, {"coarse", "fine", "fine2"});
   ap.option("--draft-type", "", "Drafter implementation", &draft_type, {"dspark", "dflash2", "hybrid"});
   ap.flag("--dflash2-adaptive", "Choose verify width using DFlash2 selector confidence", &dflash2_adaptive);
@@ -201,12 +207,15 @@ int main(int argc, char** argv) {
   try {
     ingine::model::validate_dense_formats(dense_fp8, dense_pico12);
     ingine::model::validate_kv_formats(kv_fp8, kv_q4, kv_12);
+    ingine::model::RuntimeOptions options;
+    ingine::model::set_loopcd_options(options, loopcd,
+                                     ap.given("--loopcd-omega") ? std::optional(loopcd_omega) : std::nullopt,
+                                     loopcd_ref);
     using Clock = std::chrono::steady_clock;
     cudaFree(nullptr);  // create the context before measuring the model's memory
     size_t free0 = 0, total = 0;
     cudaMemGetInfo(&free0, &total);
     const auto t0 = Clock::now();
-    ingine::model::RuntimeOptions options;
     options.tp = ingine::model::tp_options(ap.given("--tp-size") ? std::optional<int>(tp_size) : std::nullopt,
                                            ap.given("--tp-rank") ? std::optional<int>(tp_rank) : std::nullopt, tp_wire);
     options.tp.profile = tp_profile;

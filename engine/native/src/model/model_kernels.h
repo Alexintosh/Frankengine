@@ -25,6 +25,7 @@ struct StatePtrs {
   __nv_bfloat16* v_ring;
   std::int64_t* ring_pos;
   int kv_dim = KV_DIM;
+  bool ref_coda = false;
 };
 inline constexpr int CONV_COLS[4] = {KV_DIM, KV_DIM, HIDDEN, HIDDEN};
 inline constexpr int CONV_ROW_FLOATS = 2 * KV_DIM + 2 * HIDDEN;  // one row of all four conv states per visit

@@ -2,9 +2,11 @@
 // scheduler, the HTTP layer and their tests build without the model; ingine_model implements make_generator.
 #pragma once
 
+#include <cmath>
 #include <cstdint>
 #include <filesystem>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <span>
@@ -131,6 +133,8 @@ inline void validate_kv_formats(bool fp8, bool q4, bool kv12) {
   if (fp8 && q4) throw std::invalid_argument("--kv-fp8 and --kv-q4 are mutually exclusive");
 }
 
+enum class LoopCdMode : int { Off = 0, Hidden = 1, Logits = 2, Adaptive = 3 };
+
 struct RuntimeOptions {
   int max_batch = 1;
   int batch_ctx = 32768;
@@ -167,8 +171,29 @@ struct RuntimeOptions {
   bool cold_prefill = false;  // benchmark without prompt reuse
   TpOptions tp;
   bool head_nvfp4 = false;  // packed NVFP4 unembedding, independent of projection precision
+  LoopCdMode loopcd_mode = LoopCdMode::Off;
+  float loopcd_omega = 0.0f;
+  int loopcd_ref = 1;  // 1-indexed loop pass
   bool cert_head = false;  // TP=1 exact greedy head; auto-enabled for PICO12; INGINE_CERT_HEAD overrides
 };
+
+inline void set_loopcd_options(RuntimeOptions& options, std::string_view mode,
+                               std::optional<double> omega, int ref) {
+  if (mode == "off") options.loopcd_mode = LoopCdMode::Off;
+  else if (mode == "hidden") options.loopcd_mode = LoopCdMode::Hidden;
+  else if (mode == "logits") options.loopcd_mode = LoopCdMode::Logits;
+  else if (mode == "adaptive") options.loopcd_mode = LoopCdMode::Adaptive;
+  else throw std::invalid_argument("--loopcd must be off, hidden, logits or adaptive");
+
+  const bool enabled = options.loopcd_mode != LoopCdMode::Off;
+  if (omega && (!std::isfinite(*omega) || *omega < 0.0 || *omega > std::numeric_limits<float>::max()))
+    throw std::invalid_argument("--loopcd-omega must be a finite nonnegative float");
+  if (enabled && (ref < 1 || ref > 2))
+    throw std::invalid_argument("--loopcd-ref must be 1 or 2 when LoopCD is enabled");
+  const float default_omega = options.loopcd_mode == LoopCdMode::Adaptive ? 0.5f : 0.3f;
+  options.loopcd_omega = enabled ? float(omega.value_or(default_omega)) : 0.0f;
+  options.loopcd_ref = ref;
+}
 
 struct BatchSampling {
   Sampling params;

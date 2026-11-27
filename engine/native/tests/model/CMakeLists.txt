@@ -35,3 +35,7 @@ if(TARGET ingine_serve AND TARGET ingine_kernels_vision)
   ingine_add_test(NAME model_vision SOURCES test_vision_generate.cpp LIBS ingine_model ingine_serve
                   LABELS vision GPU MODEL TIMEOUT 900)
 endif()
+
+ingine_add_test(NAME model_loopcd SOURCES test_loopcd.cpp LIBS ingine_model GPU ORACLE TIMEOUT 120)
+add_test(NAME model_loopcd_real COMMAND model_loopcd --real-model)
+set_tests_properties(model_loopcd_real PROPERTIES LABELS "gpu;model" RESOURCE_LOCK gpu SKIP_RETURN_CODE 77 TIMEOUT 900)

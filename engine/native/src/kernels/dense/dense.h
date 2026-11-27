@@ -10,13 +10,24 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
+#include <cstddef>
 #include <cstdint>
 
 namespace ingine::kernels::pico12 {
 struct Layout;
 }
 
+namespace ingine::model { enum class LoopCdMode : int; }
+
 namespace ingine::kernels::dense {
+
+// Extrapolate the final-pass stream (base plus an optional pending write) and its depth block.
+void loopcd_hidden(const float* base, const float* write, const float* ref_stream, float* out,
+                   float* depth, const float* ref_depth, std::size_t elements, float omega, cudaStream_t stream);
+// The combination consumes softcapped rows and leaves padding untouched.
+void loopcd_combine_logits(float* main, const float* ref, int rows, int ld, int vocab, model::LoopCdMode mode,
+                           float omega, cudaStream_t stream);
+void loopcd_softcap_logits(float* logits, int rows, int ld, int vocab, cudaStream_t stream);
 
 // A weight matrix [rows, K]: BF16, float8_e4m3fn with fp32 per-row scales, or a PICO12 device blob.
 struct Matrix {

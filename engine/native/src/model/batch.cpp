@@ -43,12 +43,12 @@ Tensor zeros(std::vector<DeviceBuffer>& storage, DType dt, std::initializer_list
 }
 
 // fast.Buffers.blocks (as prefill.cpp)
-std::vector<const float*> blocks_of(int l, int p, const float* B0, const float* B1, float* const* B2, float* const* E) {
+std::vector<const float*> blocks_of(int l, int p, const float* B0, const float* B1, float* const* B2, float* const* E, int coda_pass) {
   if (l < 1) return {};
   if (l < 7) return {B0};
   if (l < 13) return {B0, B1};
-  if (l < 19) return {B0, B1, B2[l < LOOP_END ? p : 2]};
-  return {B0, B1, B2[2], E[2]};
+  if (l < 19) return {B0, B1, B2[l < LOOP_END ? p : coda_pass]};
+  return {B0, B1, B2[coda_pass], E[coda_pass]};
 }
 
 }  // namespace
@@ -65,35 +65,38 @@ State BatchState::view(int s) const {
   if (s < 0 || s >= slots) throw std::out_of_range("BatchState::view: slot " + std::to_string(s));
   State v;
   v.max_ctx = ctx;
+  v.loopcd = loopcd;
   v.kv_fp8 = kv_fp8;
   v.ring_rows = ring_rows;
   v.kv_q4 = kv_q4;
   v.kv_12 = kv_12;
   const std::size_t es = dtype_size(k_full.dtype);
   auto at = [](const Tensor& t, std::size_t bytes) { return static_cast<char*>(t.data) + bytes; };
-  v.k_ring = rm(at(k_ring, std::size_t(s) * ring_stride() * 2), DType::BF16, {NUM_SLIDING_VISITS, ring_rows, hkv_local, HEAD_DIM});
-  v.v_ring = rm(at(v_ring, std::size_t(s) * ring_stride() * 2), DType::BF16, {NUM_SLIDING_VISITS, ring_rows, hkv_local, HEAD_DIM});
-  v.ring_pos = rm(at(ring_pos, std::size_t(s) * kpos_stride() * 8), DType::I64, {NUM_SLIDING_VISITS, ring_rows});
-  v.k_full = rm(at(k_full, std::size_t(s) * full_stride() * es), k_full.dtype, {NUM_FULL_VISITS, ctx, hkv_local, k_full.ne[0]});
-  v.v_full = rm(at(v_full, std::size_t(s) * full_stride() * es), v_full.dtype, {NUM_FULL_VISITS, ctx, hkv_local, k_full.ne[0]});
+  v.k_ring = rm(at(k_ring, std::size_t(s) * ring_stride() * 2), DType::BF16, {loopcd.ring_visits(), ring_rows, hkv_local, HEAD_DIM});
+  v.v_ring = rm(at(v_ring, std::size_t(s) * ring_stride() * 2), DType::BF16, {loopcd.ring_visits(), ring_rows, hkv_local, HEAD_DIM});
+  v.ring_pos = rm(at(ring_pos, std::size_t(s) * kpos_stride() * 8), DType::I64, {loopcd.ring_visits(), ring_rows});
+  v.k_full = rm(at(k_full, std::size_t(s) * full_stride() * es), k_full.dtype, {loopcd.full_visits(), ctx, hkv_local, k_full.ne[0]});
+  v.v_full = rm(at(v_full, std::size_t(s) * full_stride() * es), v_full.dtype, {loopcd.full_visits(), ctx, hkv_local, k_full.ne[0]});
   if (kv_q4 || kv_12) {
     const std::size_t bytes = std::size_t(s) * full_scale_stride() * dtype_size(k_full_scale.dtype);
-    v.k_full_scale = rm(at(k_full_scale, bytes), k_full_scale.dtype, {NUM_FULL_VISITS, ctx, hkv_local, k_full_scale.ne[0]});
-    v.v_full_scale = rm(at(v_full_scale, bytes), v_full_scale.dtype, {NUM_FULL_VISITS, ctx, hkv_local, v_full_scale.ne[0]});
+    v.k_full_scale = rm(at(k_full_scale, bytes), k_full_scale.dtype, {loopcd.full_visits(), ctx, hkv_local, k_full_scale.ne[0]});
+    v.v_full_scale = rm(at(v_full_scale, bytes), v_full_scale.dtype, {loopcd.full_visits(), ctx, hkv_local, v_full_scale.ne[0]});
   }
-  v.conv_k = rm(at(conv_k, std::size_t(s) * conv_kv_stride() * 4), DType::FP32, {NUM_VISITS, CONV_K - 1, kv_dim_local});
-  v.conv_v = rm(at(conv_v, std::size_t(s) * conv_kv_stride() * 4), DType::FP32, {NUM_VISITS, CONV_K - 1, kv_dim_local});
-  v.conv_attn = rm(at(conv_attn, std::size_t(s) * conv_h_stride() * 4), DType::FP32, {NUM_VISITS, CONV_K - 1, H});
-  v.conv_mlp = rm(at(conv_mlp, std::size_t(s) * conv_h_stride() * 4), DType::FP32, {NUM_VISITS, CONV_K - 1, H});
+  v.conv_k = rm(at(conv_k, std::size_t(s) * conv_kv_stride() * 4), DType::FP32, {loopcd.visits(), CONV_K - 1, kv_dim_local});
+  v.conv_v = rm(at(conv_v, std::size_t(s) * conv_kv_stride() * 4), DType::FP32, {loopcd.visits(), CONV_K - 1, kv_dim_local});
+  v.conv_attn = rm(at(conv_attn, std::size_t(s) * conv_h_stride() * 4), DType::FP32, {loopcd.visits(), CONV_K - 1, H});
+  v.conv_mlp = rm(at(conv_mlp, std::size_t(s) * conv_h_stride() * 4), DType::FP32, {loopcd.visits(), CONV_K - 1, H});
   v.length = 0;
   return v;
 }
 
-BatchState make_batch_state(int slots, int ctx, bool kv_fp8, const TpLayout& layout, bool kv_q4, bool kv_12) {
+BatchState make_batch_state(int slots, int ctx, bool kv_fp8, const TpLayout& layout, bool kv_q4, bool kv_12, LoopCdConfig loopcd) {
   validate_kv_formats(kv_fp8, kv_q4, kv_12);
   if (slots < 1 || slots > 4096) throw std::invalid_argument("slots must be in 1..4096");
   if (ctx < 2 || ctx > (1 << 20)) throw std::invalid_argument("slot context must be in 2..2^20");
+  validate_loopcd_tp(loopcd, layout.tp_size);
   BatchState b;
+  b.loopcd = loopcd;
   b.slots = slots;
   b.ctx = ctx;
   b.kv_fp8 = kv_fp8;
@@ -104,22 +107,22 @@ BatchState make_batch_state(int slots, int ctx, bool kv_fp8, const TpLayout& lay
   b.kv_dim_local = layout.kv_dim_local;
   const DType full = (kv_q4 || kv_12) ? DType::U8 : kv_fp8 ? DType::FP8_E4M3FN : DType::BF16;
   const int full_dim = kv_12 ? int(sizeof(kernels::kv12::Head)) : kv_q4 ? HEAD_DIM / 2 : HEAD_DIM;
-  b.k_ring = zeros(b.storage, DType::BF16, {slots * NUM_SLIDING_VISITS, b.ring_rows, b.hkv_local, HEAD_DIM});
-  b.v_ring = zeros(b.storage, DType::BF16, {slots * NUM_SLIDING_VISITS, b.ring_rows, b.hkv_local, HEAD_DIM});
-  b.ring_pos = zeros(b.storage, DType::I64, {slots * NUM_SLIDING_VISITS, b.ring_rows});
+  b.k_ring = zeros(b.storage, DType::BF16, {slots * loopcd.ring_visits(), b.ring_rows, b.hkv_local, HEAD_DIM});
+  b.v_ring = zeros(b.storage, DType::BF16, {slots * loopcd.ring_visits(), b.ring_rows, b.hkv_local, HEAD_DIM});
+  b.ring_pos = zeros(b.storage, DType::I64, {slots * loopcd.ring_visits(), b.ring_rows});
   CUDA_CHECK(cudaMemset(b.ring_pos.data, 0xff, b.storage.back().bytes));  // -1
-  b.k_full = zeros(b.storage, full, {slots * NUM_FULL_VISITS, ctx, b.hkv_local, full_dim});
-  b.v_full = zeros(b.storage, full, {slots * NUM_FULL_VISITS, ctx, b.hkv_local, full_dim});
+  b.k_full = zeros(b.storage, full, {slots * loopcd.full_visits(), ctx, b.hkv_local, full_dim});
+  b.v_full = zeros(b.storage, full, {slots * loopcd.full_visits(), ctx, b.hkv_local, full_dim});
   if (kv_q4 || kv_12) {
     const DType side = kv_12 ? DType::U8 : DType::FP16;
     const int side_dim = kv_12 ? int(sizeof(kernels::kv12::Spill)) : 2;
-    b.k_full_scale = zeros(b.storage, side, {slots * NUM_FULL_VISITS, ctx, b.hkv_local, side_dim});
-    b.v_full_scale = zeros(b.storage, side, {slots * NUM_FULL_VISITS, ctx, b.hkv_local, side_dim});
+    b.k_full_scale = zeros(b.storage, side, {slots * loopcd.full_visits(), ctx, b.hkv_local, side_dim});
+    b.v_full_scale = zeros(b.storage, side, {slots * loopcd.full_visits(), ctx, b.hkv_local, side_dim});
   }
-  b.conv_k = zeros(b.storage, DType::FP32, {slots * NUM_VISITS, CONV_K - 1, b.kv_dim_local});
-  b.conv_v = zeros(b.storage, DType::FP32, {slots * NUM_VISITS, CONV_K - 1, b.kv_dim_local});
-  b.conv_attn = zeros(b.storage, DType::FP32, {slots * NUM_VISITS, CONV_K - 1, H});
-  b.conv_mlp = zeros(b.storage, DType::FP32, {slots * NUM_VISITS, CONV_K - 1, H});
+  b.conv_k = zeros(b.storage, DType::FP32, {slots * loopcd.visits(), CONV_K - 1, b.kv_dim_local});
+  b.conv_v = zeros(b.storage, DType::FP32, {slots * loopcd.visits(), CONV_K - 1, b.kv_dim_local});
+  b.conv_attn = zeros(b.storage, DType::FP32, {slots * loopcd.visits(), CONV_K - 1, H});
+  b.conv_mlp = zeros(b.storage, DType::FP32, {slots * loopcd.visits(), CONV_K - 1, H});
   return b;
 }
 
@@ -138,6 +141,8 @@ BatchDecoder::BatchDecoder(const Weights& w, const Ablation& abl, BatchState& st
                            int max_m, TpRuntime* tp, const Dense* unembed_override)
     : w_(w), unembed_override_(unembed_override), tp_(tp), layout_(tp ? tp->layout : TpLayout{}), abl_(abl), st_(st), max_seqs_(max_seqs), max_m_(max_m), stream_(stream),
       gemm_(std::make_unique<kb::TunedGemm>()) {
+  validate_loopcd_tp(st.loopcd, layout_.tp_size);
+  const bool uses_ref_coda = st.loopcd.uses_ref_coda();
   if (max_seqs < 1 || max_seqs > st.slots) throw std::invalid_argument("BatchDecoder: max_seqs must be in 1..slots");
   if (max_m < 1 || max_m > 8) throw std::invalid_argument("BatchDecoder: max_m must be in 1..8");
   const char* fp8_env = std::getenv("INGINE_BATCH_FP8_DENSE");
@@ -202,9 +207,13 @@ BatchDecoder::BatchDecoder(const Weights& w, const Ablation& abl, BatchState& st
   } else {
     partials_count = kb::head_partials(int(N), layout_.v_end - layout_.v_begin);
   }
+  if (uses_ref_coda) {
+    if (!logits_) logits_ = f32(N * LD_V);
+    ref_logits_ = f32(N * LD_V);
+  }
   if (partials_count) head_partials_ = static_cast<int2*>(alloc(partials_count * sizeof(int2)));
   const char* reject_env = std::getenv("INGINE_BATCH_REJECTION_SAMPLE");
-  reject_enabled_ = max_m > 1 && partials_count > 0 &&
+  reject_enabled_ = !uses_ref_coda && max_m > 1 && partials_count > 0 &&
                     (!reject_env || !*reject_env || std::strtol(reject_env, nullptr, 10) != 0);
   if (tp_ && !tp_->agree(reject_enabled_, stream_))
     throw std::invalid_argument("BatchDecoder: TP ranks disagree on rejection sampling");
@@ -250,8 +259,9 @@ BatchDecoder::BatchDecoder(const Weights& w, const Ablation& abl, BatchState& st
                   : nullptr;
   if (max_m > 1) {
     taps_ = bf16(N * NUM_TAPS * H);
-    hist_k_ = bf16(NUM_VISITS * N * layout_.kv_dim_local), hist_v_ = bf16(NUM_VISITS * N * layout_.kv_dim_local);
-    hist_attn_ = bf16(NUM_VISITS * N * H), hist_mlp_ = bf16(NUM_VISITS * N * H);
+    const int visits = st.loopcd.visits();
+    hist_k_ = bf16(visits * N * layout_.kv_dim_local), hist_v_ = bf16(visits * N * layout_.kv_dim_local);
+    hist_attn_ = bf16(visits * N * H), hist_mlp_ = bf16(visits * N * H);
     commit_ = i32(S);
   }
   for (auto& b : storage_) b.fill(0);
@@ -315,14 +325,36 @@ kb::ConvStates BatchDecoder::conv_states() const {
           st_.conv_kv_stride(),                   st_.conv_h_stride()};
 }
 
+void BatchDecoder::verify_rings(int n, const std::int32_t* commit) {
+  const int rings = st_.loopcd.ring_visits();
+  const int rows_per_ring = max_seqs_ * (max_m_ - 2);
+  const std::size_t rows = std::size_t(rings) * rows_per_ring;
+  const std::size_t kv = rows * layout_.kv_dim_local;
+  // Mapped host memory keeps this optional rollback workspace out of the device allocation budget.
+  if (!pin_ring_backup_.data()) {
+    const std::size_t bytes = 2 * kv * sizeof(__nv_bfloat16) + rows * sizeof(std::int64_t);
+    pin_ring_backup_ = MappedHostBuffer(bytes);
+  }
+  auto* backup = static_cast<__nv_bfloat16*>(pin_ring_backup_.device_ptr());
+  const kb::RingRows cache{ptr<__nv_bfloat16>(st_.k_ring), ptr<__nv_bfloat16>(st_.v_ring),
+                           ptr<std::int64_t>(st_.ring_pos), st_.ring_rows};
+  const kb::RingRows saved{backup, backup + kv, reinterpret_cast<std::int64_t*>(backup + 2 * kv),
+                           rows_per_ring};
+  kb::verify_rings(cache, saved, rings, layout_.kv_dim_local, n, max_m_, slots_, pos_, rows_, commit, stream_);
+}
+
 void BatchDecoder::accept(const std::int32_t* kept) {
   if (!last_verify_) return;  // every sequence had one row: its states advanced in the step
-  for (int b = 0; b < last_n_; ++b)
+  bool restore_rings = false;
+  for (int b = 0; b < last_n_; ++b) {
     if (kept[b] < 1 || kept[b] > last_m_[std::size_t(b)])
       throw std::invalid_argument("BatchDecoder::accept: kept rows outside 1..m");
+    restore_rings |= last_ring_backup_ && kept[b] + 1 < last_m_[std::size_t(b)];
+  }
   CUDA_CHECK(cudaMemcpyAsync(commit_, kept, std::size_t(last_n_) * 4, cudaMemcpyHostToDevice, stream_));
   kb::conv_commit(conv_states(), last_n_, slots_, {hist_k_, hist_v_, hist_attn_, hist_mlp_},
-                  rows_host_[std::size_t(last_n_)], rows_, commit_, stream_, layout_.kv_dim_local);
+                  rows_host_[std::size_t(last_n_)], rows_, commit_, stream_, layout_.kv_dim_local, st_.loopcd.visits());
+  if (restore_rings) verify_rings(last_n_, commit_);
 }
 
 std::span<const std::int32_t> BatchDecoder::step(int n, const std::int32_t* m, const std::int32_t* tokens,
@@ -332,6 +364,8 @@ std::span<const std::int32_t> BatchDecoder::step(int n, const std::int32_t* m, c
   if (n < 1 || n > max_seqs_) throw std::invalid_argument("BatchDecoder::step: n outside 1..max_seqs");
   rows_host_.resize(std::size_t(n) + 1), last_m_.assign(m, m + n);
   rows_host_[0] = 0;
+  const bool may_wrap = (st_.loopcd.hidden() || st_.loopcd.uses_ref_coda()) && st_.ring_rows == WINDOW;
+  bool backup_rings = false;
   int M = 0;  // the most rows of a sequence
   for (int b = 0; b < n; ++b) {
     if (m[b] < 1 || m[b] > max_m_) throw std::invalid_argument("BatchDecoder::step: rows outside 1..max_m");
@@ -340,6 +374,7 @@ std::span<const std::int32_t> BatchDecoder::step(int n, const std::int32_t* m, c
       throw std::invalid_argument("BatchDecoder::step: positions outside the slot context");
     rows_host_[std::size_t(b) + 1] = rows_host_[std::size_t(b)] + m[b];
     M = std::max(M, m[b]);
+    backup_rings |= may_wrap && m[b] > 2 && pos[b] + m[b] > WINDOW;
   }
   const cudaStream_t s = stream_;
   const int T = rows_host_[std::size_t(n)];  // rows: m[b] per sequence
@@ -375,11 +410,13 @@ std::span<const std::int32_t> BatchDecoder::step(int n, const std::int32_t* m, c
     stage(reject_probs_, pin_reject_probs_, reject->probs, support_count * sizeof(float));
     stage(reject_picked_, pin_reject_picked_, reject->picked, std::size_t(T) * sizeof(std::int32_t));
   }
-  last_n_ = n, last_verify_ = verify;
+  last_n_ = n, last_verify_ = verify, last_ring_backup_ = backup_rings;
+  if (backup_rings) verify_rings(n, nullptr);
 
   const Dense& head_w_chk = unembed_override_ ? *unembed_override_ : w_.unembed;
-  const bool can_graph =
-      graph_enabled_ && (use_nvfp4_head_ || !head_w_chk.fp8()) && n <= graph_max_seqs_ && T <= graph_max_tokens_;
+  const bool can_graph = graph_enabled_ &&
+                         (st_.loopcd.uses_ref_coda() || use_nvfp4_head_ || !head_w_chk.fp8()) &&
+                         n <= graph_max_seqs_ && T <= graph_max_tokens_;
   // Collapse ragged M into attn_batch's 16-row tile boundaries (1, 5, max_m_) to avoid 7x graph key fragmentation.
   const int M_exec = !verify ? 1 : (M <= 5 ? std::min(5, max_m_) : max_m_);
   const GraphKey gkey{n, T, M_exec, keep_logits_, use_reject};
@@ -421,6 +458,8 @@ std::span<const std::int32_t> BatchDecoder::step(int n, const std::int32_t* m, c
 
 void BatchDecoder::run_body(int n, int T, int M, bool verify, std::uint64_t seed,
                             const kb::RejectSpec* reject) {
+  const auto& loopcd = st_.loopcd;
+  const bool uses_ref_coda = loopcd.uses_ref_coda();
   const Weights& w = w_;
   const cudaStream_t s = stream_;
   const std::size_t slab = std::size_t(T) * H;
@@ -490,28 +529,109 @@ void BatchDecoder::run_body(int n, int T, int M, bool verify, std::uint64_t seed
   dense::embed(ids_, T, bf16p(w.embed), f32p(w.embed_norm), B0_, false, s);
   int prev_v = -1, tap = 0;
 
-  for (int v = 0; v < NUM_VISITS; ++v) {
-    const int l = VISITS[v].layer, p = VISITS[v].pass;
+  const Dense& head_w = unembed_override_ ? *unembed_override_ : w.unembed;
+  auto finish = [&](bool reference) {
+    const int coda_pass = reference ? loopcd.ref_idx : PASSES - 1;
+    auto* xf = reference ? xm_ : xf_;
+    mix({B0_, B1_, B2_[coda_pass], E_[coda_pass]}, part_, y2_, mlp_dirs + std::size_t(prev_v) * H,
+        mlp_w + 4 * std::size_t(prev_v), nullptr, f32p(w.final_query), 1, f32p(w.final_norm), xf, nullptr);
+    if (!reference && max_m_ > 1)
+      CUDA_CHECK(cudaMemcpy2DAsync(taps_ + std::size_t(NUM_TAPS - 1) * H, std::size_t(NUM_TAPS) * H * 2, xf,
+                                  std::size_t(H) * 2, std::size_t(H) * 2, T, cudaMemcpyDeviceToDevice, s));
+    if (uses_ref_coda) {
+      auto* out = reference ? ref_logits_ : logits_;
+      if (use_nvfp4_head_) {
+        kb::head_sample_nvfp4(xf, H, w.unembed_nvfp4, T, temps_, seed, out, LD_V,
+                              head_partials_, sampled_, s, nullptr, d_seed_);
+      } else if (head_w.fp8()) {
+        for (int r = 0; r < T; ++r)
+          pk::head_logits(xf + std::size_t(r) * H, head_w.w.data, f32p(head_w.scale), UNPADDED_VOCAB,
+                          out + std::size_t(r) * LD_V, s);
+      } else {
+        kb::head_sample(xf, H, head_w.w.data, H, T, UNPADDED_VOCAB, H, temps_, seed, out, LD_V,
+                        head_partials_, sampled_, s, 0, nullptr, d_seed_, head_w.matrix().pico12);
+      }
+      if (use_nvfp4_head_ || !head_w.fp8()) dense::loopcd_softcap_logits(out, T, LD_V, UNPADDED_VOCAB, s);
+      return;
+    }
+    if (tp_ && reject) {
+      if (use_nvfp4_head_) {
+        kb::head_sample_nvfp4(xf, H, w.unembed_nvfp4, T, temps_, seed, nullptr, 0,
+                              head_partials_, nullptr, s, nullptr, d_seed_, reject, local_reject_);
+      } else {
+        const int n_local = layout_.v_end - layout_.v_begin;
+        kb::head_sample(xf, H, head_w.w.data, H, T, n_local, H, temps_, seed, nullptr, 0,
+                        head_partials_, nullptr, s, layout_.v_begin, nullptr, d_seed_, head_w.matrix().pico12,
+                        reject, local_reject_);
+      }
+      tp_->exchange_draft_head(local_reject_, std::size_t(T) * sizeof(kb::RejectShardPartial), gathered_reject_, s);
+      const int v_split = layout_.tp_rank == 0 ? layout_.v_end : layout_.v_begin;
+      kb::head_reject_merge_tp2(gathered_reject_, v_split, temps_, seed, d_seed_, *reject, T, sampled_, s);
+    } else if (use_nvfp4_head_) {
+      if (tp_) {
+        kb::head_sample_nvfp4(xf, H, w.unembed_nvfp4, T, temps_, seed, nullptr, 0,
+                              head_partials_, nullptr, s, local_cand_, d_seed_);
+        tp_->exchange_draft_head(local_cand_, std::size_t(T) * sizeof(kernels::head::Candidate), gathered_cand_, s);
+        tp_merge_candidates(gathered_cand_, sampled_, T, s);
+      } else {
+        kb::head_sample_nvfp4(xf, H, w.unembed_nvfp4, T, temps_, seed, keep_logits_ ? logits_ : nullptr,
+                              LD_V, head_partials_, sampled_, s, nullptr, d_seed_, reject);
+      }
+    } else if (head_w.fp8()) {
+      for (int b = 0; b < T; ++b)
+        pk::head_logits(xf + std::size_t(b) * H, head_w.w.data, f32p(head_w.scale), UNPADDED_VOCAB,
+                        logits_ + std::size_t(b) * LD_V, s);
+      kb::sample(logits_, LD_V, T, UNPADDED_VOCAB, false, temps_, seed, sampled_, s);
+    } else if (tp_) {
+      const int n_local = layout_.v_end - layout_.v_begin;
+      kb::head_sample(xf, H, head_w.w.data, H, T, n_local, H, temps_, seed, nullptr, 0,
+                      head_partials_, nullptr, s, layout_.v_begin, local_cand_, d_seed_, head_w.matrix().pico12);
+      tp_->exchange_draft_head(local_cand_, std::size_t(T) * sizeof(kernels::head::Candidate), gathered_cand_, s);
+      tp_merge_candidates(gathered_cand_, sampled_, T, s);
+    } else {
+      kb::head_sample(xf, H, head_w.w.data, H, T, UNPADDED_VOCAB, H, temps_, seed, keep_logits_ ? logits_ : nullptr,
+                      LD_V, head_partials_, sampled_, s, 0, nullptr, d_seed_, head_w.matrix().pico12, reject);
+    }
+  };
+
+  const int visits = loopcd.visits();
+  for (int v = 0; v < visits; ++v) {
+    if (v == NUM_VISITS) finish(false);
+    const bool reference = v >= NUM_VISITS;
+    const int coda_pass = reference ? loopcd.ref_idx : PASSES - 1;
+    const int wv = weight_visit(v);
+    const int l = VISITS[wv].layer, p = VISITS[wv].pass;
     const Layer& layer = w.layers[l];
     const bool msgs = is_loop_layer(l) && p > 0;
     const bool boundary = l % BLOCK == 0;
-    const std::vector<const float*> blocks = blocks_of(l, p, B0_, B1_, B2_, E_);
+    const std::vector<const float*> blocks = blocks_of(l, p, B0_, B1_, B2_, E_, coda_pass);
 
     // ---- hidden entering this visit (the previous MLP write applied), stored where it is a block
     float* hid;
     const float* base;
     const float* write;
-    if (v == 0) {
+    if (reference && l == LOOP_END) {
+      hid = E_[coda_pass], base = hid, write = nullptr;
+    } else if (v == 0) {
       hid = B0_, base = B0_, write = nullptr;
     } else if (l == LOOP_START && p > 0) {
       hid = B1_, base = B1_, write = nullptr;
     } else {
-      hid = l == 6 ? B1_ : l == 12 ? B2_[p] : l == 18 ? E_[2] : hid_;
+      hid = l == 6 ? B1_ : l == 12 ? B2_[p] : l == LOOP_END ? E_[coda_pass] : hid_;
       base = part_, write = y2_;
     }
     const int pv = prev_v >= 0 ? prev_v : 0;
     const float* r_prev = mlp_dirs + std::size_t(pv) * H;
     const float* w_prev = mlp_w + 4 * std::size_t(pv);
+    if (l == LOOP_END && loopcd.hidden()) {
+      if (abl_.active) {
+        mix({}, base, write, r_prev, w_prev, hid, nullptr, 1, nullptr, nullptr, nullptr);
+        base = hid, write = nullptr;
+      }
+      dense::loopcd_hidden(base, write, E_[loopcd.ref_idx], hid, B2_[PASSES - 1], B2_[loopcd.ref_idx],
+                           slab, loopcd.omega, s);
+      base = hid, write = nullptr;
+    }
     if (msgs) {
       const int i = l - LOOP_START;
       const float* src_base = i == 0 ? part_ : E_[p - 1];
@@ -623,7 +743,7 @@ void BatchDecoder::run_body(int n, int T, int M, bool verify, std::uint64_t seed
     a.slots = slots_;
     a.conv_stride = st_.conv_kv_stride();
     if (layer.full) {
-      const int fi = FULL_INDEX[v];
+      const int fi = full_cache_index(v);
       a.k_conv = f32p(layer.k_static);
       a.v_conv = f32p(layer.v_static);
       a.k_cache = s0.k_full_at(fi).data;
@@ -642,7 +762,7 @@ void BatchDecoder::run_body(int n, int T, int M, bool verify, std::uint64_t seed
       a.log_scaling = true;
       a.cache_stride = st_.full_stride();
     } else {
-      const int ri = RING_INDEX[v];
+      const int ri = ring_cache_index(v);
       a.k_conv = f32p(layer.k_conv);
       a.v_conv = f32p(layer.v_conv);
       a.k_cache = s0.k_ring_at(ri).data;
@@ -683,7 +803,7 @@ void BatchDecoder::run_body(int n, int T, int M, bool verify, std::uint64_t seed
     if (boundary) mlp_blocks.push_back(hid);
     const float* mbase = boundary ? nullptr : hid;
     if (msgs) {
-      mix(mlp_blocks, mbase, y_, attn_dirs + std::size_t(v) * H, attn_w + 4 * std::size_t(v), part_,
+      mix(mlp_blocks, mbase, y_, attn_dirs + std::size_t(wv) * H, attn_w + 4 * std::size_t(wv), part_,
           f32p(layer.mlp_query), 1, nullptr, mixm_bf16_, mixm_);
       if (batch_gate_fuse_) {
         pk::GateRowsBf16 rows;
@@ -696,7 +816,7 @@ void BatchDecoder::run_body(int n, int T, int M, bool verify, std::uint64_t seed
         gates(rows, 1, layer.mlp1_gate_down, fg_mlp_[l], f32p(layer.mlp_norm1), xm_);
       }
     } else {
-      mix(mlp_blocks, mbase, y_, attn_dirs + std::size_t(v) * H, attn_w + 4 * std::size_t(v), part_,
+      mix(mlp_blocks, mbase, y_, attn_dirs + std::size_t(wv) * H, attn_w + 4 * std::size_t(wv), part_,
           f32p(layer.mlp_query), 1, f32p(layer.mlp_norm1), xm_, nullptr);
     }
 
@@ -722,53 +842,15 @@ void BatchDecoder::run_body(int n, int T, int M, bool verify, std::uint64_t seed
     kb::conv(moe_dst, H, n, rows_, H, f32p(layer.mlp_conv), s0.conv_mlp_at(v), st_.conv_h_stride(), slots_, !verify,
              y2_,
              s);
-    prev_v = v;
+    prev_v = wv;
   }
 
-  // ---- final read, taps, the head of every row, one token per row
-  mix({B0_, B1_, B2_[2], E_[2]}, part_, y2_, mlp_dirs + std::size_t(prev_v) * H, mlp_w + 4 * std::size_t(prev_v), nullptr,
-      f32p(w.final_query), 1, f32p(w.final_norm), xf_, nullptr);
-  if (max_m_ > 1)
-    CUDA_CHECK(cudaMemcpy2DAsync(taps_ + std::size_t(NUM_TAPS - 1) * H, std::size_t(NUM_TAPS) * H * 2, xf_,
-                                 std::size_t(H) * 2, std::size_t(H) * 2, T, cudaMemcpyDeviceToDevice, s));
-  const Dense& head_w = unembed_override_ ? *unembed_override_ : w.unembed;
-  if (tp_ && reject) {
-    if (use_nvfp4_head_) {
-      kb::head_sample_nvfp4(xf_, H, w.unembed_nvfp4, T, temps_, seed, nullptr, 0,
-                            head_partials_, nullptr, s, nullptr, d_seed_, reject, local_reject_);
-    } else {
-      const int n_local = layout_.v_end - layout_.v_begin;
-      kb::head_sample(xf_, H, head_w.w.data, H, T, n_local, H, temps_, seed, nullptr, 0,
-                      head_partials_, nullptr, s, layout_.v_begin, nullptr, d_seed_, head_w.matrix().pico12,
-                      reject, local_reject_);
-    }
-    tp_->exchange_draft_head(local_reject_, std::size_t(T) * sizeof(kb::RejectShardPartial), gathered_reject_, s);
-    const int v_split = layout_.tp_rank == 0 ? layout_.v_end : layout_.v_begin;
-    kb::head_reject_merge_tp2(gathered_reject_, v_split, temps_, seed, d_seed_, *reject, T, sampled_, s);
-  } else if (use_nvfp4_head_) {
-    if (tp_) {
-      kb::head_sample_nvfp4(xf_, H, w.unembed_nvfp4, T, temps_, seed, nullptr, 0,
-                            head_partials_, nullptr, s, local_cand_, d_seed_);
-      tp_->exchange_draft_head(local_cand_, std::size_t(T) * sizeof(kernels::head::Candidate), gathered_cand_, s);
-      tp_merge_candidates(gathered_cand_, sampled_, T, s);
-    } else {
-      kb::head_sample_nvfp4(xf_, H, w.unembed_nvfp4, T, temps_, seed, keep_logits_ ? logits_ : nullptr,
-                            LD_V, head_partials_, sampled_, s, nullptr, d_seed_, reject);
-    }
-  } else if (head_w.fp8()) {
-    for (int b = 0; b < T; ++b)
-      pk::head_logits(xf_ + std::size_t(b) * H, head_w.w.data, f32p(head_w.scale), UNPADDED_VOCAB,
-                      logits_ + std::size_t(b) * LD_V, s);
-    kb::sample(logits_, LD_V, T, UNPADDED_VOCAB, false, temps_, seed, sampled_, s);
-  } else if (tp_) {
-    const int n_local = layout_.v_end - layout_.v_begin;
-    kb::head_sample(xf_, H, head_w.w.data, H, T, n_local, H, temps_, seed, nullptr, 0,
-                    head_partials_, nullptr, s, layout_.v_begin, local_cand_, d_seed_, head_w.matrix().pico12);
-    tp_->exchange_draft_head(local_cand_, std::size_t(T) * sizeof(kernels::head::Candidate), gathered_cand_, s);
-    tp_merge_candidates(gathered_cand_, sampled_, T, s);
+  if (uses_ref_coda) {
+    finish(true);
+    dense::loopcd_combine_logits(logits_, ref_logits_, T, LD_V, UNPADDED_VOCAB, loopcd.mode, loopcd.omega, s);
+    kb::sample(logits_, LD_V, T, UNPADDED_VOCAB, false, temps_, seed, sampled_, s, d_seed_);
   } else {
-    kb::head_sample(xf_, H, head_w.w.data, H, T, UNPADDED_VOCAB, H, temps_, seed, keep_logits_ ? logits_ : nullptr,
-                    LD_V, head_partials_, sampled_, s, 0, nullptr, d_seed_, head_w.matrix().pico12, reject);
+    finish(false);
   }
 }
 

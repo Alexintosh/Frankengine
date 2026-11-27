@@ -9,6 +9,7 @@
 
 #include "core/arena.h"
 #include "core/tensor.h"
+#include "ingine/generator.h"
 #include "model/tp_layout.h"
 #include "kernels/common/pico12.cuh"
 #include "kernels/dense/dense.h"
@@ -48,6 +49,39 @@ struct Visit {
 inline constexpr int NUM_VISITS = 48;
 inline constexpr int NUM_FULL_VISITS = 8;
 inline constexpr int NUM_SLIDING_VISITS = NUM_VISITS - NUM_FULL_VISITS;
+inline constexpr int CODA_VISITS = LAYERS - LOOP_END;
+inline constexpr int CODA_FIRST = NUM_VISITS - CODA_VISITS;
+inline constexpr int REF_FULL_VISITS = 1;  // layer 23
+inline constexpr int REF_RING_VISITS = CODA_VISITS - REF_FULL_VISITS;
+
+struct LoopCdConfig {
+  LoopCdMode mode = LoopCdMode::Off;
+  float omega = 0.f;
+  int ref_idx = 0;
+
+  bool hidden() const { return mode == LoopCdMode::Hidden && omega > 0.f; }
+  bool uses_ref_coda() const {
+    return (mode == LoopCdMode::Logits || mode == LoopCdMode::Adaptive) && omega > 0.f;
+  }
+  int visits() const { return NUM_VISITS + (uses_ref_coda() ? CODA_VISITS : 0); }
+  int full_visits() const { return NUM_FULL_VISITS + (uses_ref_coda() ? REF_FULL_VISITS : 0); }
+  int ring_visits() const { return NUM_SLIDING_VISITS + (uses_ref_coda() ? REF_RING_VISITS : 0); }
+};
+
+inline LoopCdConfig loopcd_config(const RuntimeOptions& options) {
+  if (options.loopcd_mode == LoopCdMode::Off) return {};
+  if (!std::isfinite(options.loopcd_omega) || options.loopcd_omega < 0.f)
+    throw std::invalid_argument("LoopCD omega must be finite and nonnegative");
+  if (options.loopcd_ref < 1 || options.loopcd_ref >= PASSES)
+    throw std::invalid_argument("LoopCD reference must be 1 or 2");
+  if (options.loopcd_omega == 0.f) return {};
+  return {options.loopcd_mode, options.loopcd_omega, options.loopcd_ref - 1};
+}
+
+inline void validate_loopcd_tp(const LoopCdConfig& config, int tp_size) {
+  if (config.uses_ref_coda() && tp_size != 1)
+    throw std::invalid_argument("LoopCD logits/adaptive currently requires TP=1");
+}
 
 // weights.visit_plan(): layers 0-5, layers 6-17 three times, layers 18-23
 inline constexpr std::array<Visit, NUM_VISITS> VISITS = [] {
@@ -73,6 +107,19 @@ inline constexpr std::array<int, NUM_VISITS> FULL_INDEX = [] {
   for (int v = 0; v < NUM_VISITS; ++v) r[v] = is_full_layer(VISITS[v].layer) ? n++ : -1;
   return r;
 }();
+
+// The reference coda uses the same layers/ablation weights and its own cache visits.
+inline constexpr int weight_visit(int cache_visit) {
+  return cache_visit < NUM_VISITS ? cache_visit : cache_visit - CODA_VISITS;
+}
+inline constexpr int full_cache_index(int v) {
+  const int index = FULL_INDEX[weight_visit(v)];
+  return v < NUM_VISITS || index < 0 ? index : index + REF_FULL_VISITS;
+}
+inline constexpr int ring_cache_index(int v) {
+  const int index = RING_INDEX[weight_visit(v)];
+  return v < NUM_VISITS || index < 0 ? index : index + REF_RING_VISITS;
+}
 
 // model.TAP_VISITS: DSpark features = the partial block entering these visits, then the final normed hidden
 inline constexpr std::array<int, 3> TAP_VISITS = {5, 23, 41};
@@ -235,6 +282,7 @@ struct Ablation {
 struct State {
   int max_ctx = 0;
   int ring_rows = WINDOW;
+  LoopCdConfig loopcd;
   bool kv_fp8 = false, kv_q4 = false, kv_12 = false;
   Tensor k_ring, v_ring;      // bf16 [40, 1024, local KV heads, 128] (sliding visits, RING_INDEX)
   Tensor ring_pos;            // int64 [40, 1024], absolute position per slot, -1 = empty
@@ -284,6 +332,7 @@ struct Buffers {
   Tensor xf;                        // bf16 [1, m, H]
   Tensor greedy;                    // exact greedy IDs (int32 [m])
   Tensor logits;                    // fp32 [m, UNPADDED_VOCAB]
+  Tensor ref_logits;                // fp32 [m, UNPADDED_VOCAB], only for reference coda
   Tensor taps;                      // bf16 [m, 4, H]: partial block entering TAP_VISITS + final normed hidden
   // convolution inputs of each row per visit, for rolling back rejected rows (history = true)
   Tensor hist_attn, hist_mlp;       // fp32 [48, m, H]
@@ -292,7 +341,7 @@ struct Buffers {
   std::vector<DeviceBuffer> storage;
 
   // fast.Buffers.blocks: completed blocks visible to layer l's attention read in pass p
-  std::vector<const float*> blocks(int l, int p) const;
+  std::vector<const float*> blocks(int l, int p, int coda_pass = PASSES - 1) const;
 };
 
 }  // namespace ingine::model

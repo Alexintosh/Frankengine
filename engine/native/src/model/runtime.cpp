@@ -18,7 +18,7 @@ namespace {
 constexpr int kMaxWidth = 8;
 
 bool enable_cert_head(const RuntimeOptions& options) {
-  if (options.tp.size != 1 || options.head_nvfp4 || options.dense_fp8) return false;
+  if (options.tp.size != 1 || options.head_nvfp4 || options.dense_fp8 || loopcd_config(options).uses_ref_coda()) return false;
   if (const char* value = std::getenv("INGINE_CERT_HEAD")) {
     if (std::string_view(value) == "0") return false;
     if (std::string_view(value) == "1") return true;
@@ -28,6 +28,7 @@ bool enable_cert_head(const RuntimeOptions& options) {
 }
 
 TpLayout runtime_layout(const RuntimeOptions& options) {
+  validate_loopcd_tp(loopcd_config(options), options.tp.size);
   validate_dense_formats(options.dense_fp8, options.dense_pico12);
   validate_kv_formats(options.kv_fp8, options.kv_q4, options.kv_12);
   if (options.tp.size != 1 && options.tp.size != 2)
@@ -65,13 +66,16 @@ struct Carve {
 };
 constexpr std::size_t carved(std::size_t bytes) { return (bytes + 255) / 256 * 256; }
 
-constexpr std::size_t kUndoBytes = carved(std::size_t(NUM_VISITS) * CONV_ROW_FLOATS * 4) +
-                                   2 * carved(std::size_t(NUM_SLIDING_VISITS) * KV_DIM * 2) +
-                                   carved(std::size_t(NUM_SLIDING_VISITS) * 8);
-constexpr std::size_t kBackupBytes = 2 * carved(std::size_t(NUM_VISITS) * 3 * KV_DIM * 4) +
-                                     2 * carved(std::size_t(NUM_VISITS) * 3 * HIDDEN * 4) +
-                                     2 * carved(std::size_t(NUM_SLIDING_VISITS) * kMaxWidth * KV_DIM * 2) +
-                                     carved(std::size_t(NUM_SLIDING_VISITS) * kMaxWidth * 8);
+std::size_t undo_bytes(int visits, int rings) {
+  return carved(std::size_t(visits) * CONV_ROW_FLOATS * 4) +
+         2 * carved(std::size_t(rings) * KV_DIM * 2) + carved(std::size_t(rings) * 8);
+}
+std::size_t backup_bytes(int visits, int rings) {
+  return 2 * carved(std::size_t(visits) * 3 * KV_DIM * 4) +
+         2 * carved(std::size_t(visits) * 3 * HIDDEN * 4) +
+         2 * carved(std::size_t(rings) * kMaxWidth * KV_DIM * 2) +
+         carved(std::size_t(rings) * kMaxWidth * 8);
+}
 
 }  // namespace
 
@@ -122,7 +126,10 @@ void Runtime::init() {
   if (options.batch_spec == 0 && options.max_batch > 1 && options.tp.size > 1 && (!options.tp.serve || options.tp.profile))
     throw std::invalid_argument("TP batch graphs require unprofiled serving mode");
   const auto layout = runtime_layout(options);
-  state_ = make_state(options.max_ctx, options.kv_fp8, layout, options.kv_q4, options.kv_12);
+  state_ = make_state(options.max_ctx, options.kv_fp8, layout, options.kv_q4, options.kv_12, loopcd_config(options));
+  const int visits = state_.loopcd.visits();
+  const int rings = state_.loopcd.ring_visits();
+  const bool ref_coda = state_.loopcd.uses_ref_coda();
   if (layout.tp_size > 1) tp_ = std::make_unique<TpRuntime>(options);
   decoder_ = std::make_unique<Decoder>(weights_, ablation_, state_, true, nullptr, tp_.get());
   pos_ = DeviceBuffer(sizeof(std::int64_t));
@@ -134,32 +141,32 @@ void Runtime::init() {
     for (cudaEvent_t& e : chain_done_) CUDA_CHECK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
     chain_host_ = MappedHostBuffer(2 * sizeof(std::int32_t));
     for (int i = 0; i < 2; ++i) {
-      undo_storage_[i] = DeviceBuffer(kUndoBytes);
+      undo_storage_[i] = DeviceBuffer(undo_bytes(visits, rings));
       Carve c{static_cast<char*>(undo_storage_[i].p)};
-      undo_[i].conv = c.take<float>(std::size_t(NUM_VISITS) * CONV_ROW_FLOATS);
-      undo_[i].k = c.take<__nv_bfloat16>(std::size_t(NUM_SLIDING_VISITS) * KV_DIM);
-      undo_[i].v = c.take<__nv_bfloat16>(std::size_t(NUM_SLIDING_VISITS) * KV_DIM);
-      undo_[i].pos = c.take<std::int64_t>(NUM_SLIDING_VISITS);
+      undo_[i].conv = c.take<float>(std::size_t(visits) * CONV_ROW_FLOATS);
+      undo_[i].k = c.take<__nv_bfloat16>(std::size_t(rings) * KV_DIM);
+      undo_[i].v = c.take<__nv_bfloat16>(std::size_t(rings) * KV_DIM);
+      undo_[i].pos = c.take<std::int64_t>(rings);
     }
   }
 
-  buffers_.emplace(1, make_buffers(1, layout, options.tp.full_logits, options.tp.serve, has_cert_head()));
+  buffers_.emplace(1, make_buffers(1, layout, options.tp.full_logits, options.tp.serve, has_cert_head(), ref_coda));
   history_[1] = false;
   if (options.spec) {
     for (int w : verify_width_grid(options.spec_widths)) {
       if (w > 1) {
-        buffers_.emplace(w, make_buffers(w, layout, options.tp.full_logits, options.tp.serve, has_cert_head()));
+        buffers_.emplace(w, make_buffers(w, layout, options.tp.full_logits, options.tp.serve, has_cert_head(), ref_coda));
         history_[w] = true;
       }
       verify_widths_.push_back(w);
     }
-    backup_storage_ = DeviceBuffer(kBackupBytes);
+    backup_storage_ = DeviceBuffer(backup_bytes(visits, rings));
     Carve c{static_cast<char*>(backup_storage_.p)};
     const int cols[] = {layout.kv_dim_local, layout.kv_dim_local, HIDDEN, HIDDEN};
-    for (int i = 0; i < 4; ++i) backup_.conv[i] = c.take<float>(std::size_t(NUM_VISITS) * 3 * cols[i]);
-    backup_.k = c.take<__nv_bfloat16>(std::size_t(NUM_SLIDING_VISITS) * kMaxWidth * layout.kv_dim_local);
-    backup_.v = c.take<__nv_bfloat16>(std::size_t(NUM_SLIDING_VISITS) * kMaxWidth * layout.kv_dim_local);
-    backup_.pos = c.take<std::int64_t>(std::size_t(NUM_SLIDING_VISITS) * kMaxWidth);
+    for (int i = 0; i < 4; ++i) backup_.conv[i] = c.take<float>(std::size_t(visits) * 3 * cols[i]);
+    backup_.k = c.take<__nv_bfloat16>(std::size_t(rings) * kMaxWidth * layout.kv_dim_local);
+    backup_.v = c.take<__nv_bfloat16>(std::size_t(rings) * kMaxWidth * layout.kv_dim_local);
+    backup_.pos = c.take<std::int64_t>(std::size_t(rings) * kMaxWidth);
   }
   // every width reads its tokens from the shared buffer (set_inputs, chain_advance and the verify selector
   // write one place)
@@ -182,6 +189,8 @@ State& Runtime::state_slot(int slot) {
 
 void Runtime::set_batch_inputs(std::span<const BatchInput> rows) {
   auto& table = *static_cast<BatchSlotTable*>(host_batch_table_.data());
+  const int visits = state_.loopcd.visits();
+  auto* ref = reinterpret_cast<BatchRefSlotTable*>(&table + 1);
   unsigned used = 0;
   for (std::size_t i = 0; i < rows.size(); ++i) {
     const auto [slot, token] = rows[i];
@@ -194,12 +203,14 @@ void Runtime::set_batch_inputs(std::span<const BatchInput> rows) {
     if (token < 0 || token >= UNPADDED_VOCAB)
       throw std::invalid_argument("batch token outside vocabulary");
     table.tokens[i] = token;
-    for (int v = 0; v < NUM_VISITS; ++v) {
-      auto& entry = table.attn[v][i];
+    for (int v = 0; v < visits; ++v) {
+      const bool reference = v >= NUM_VISITS;
+      const int r = v - NUM_VISITS;
+      auto& entry = reference ? ref->attn[r][i] : table.attn[v][i];
       entry.position = state.length;
       entry.conv_k_state = state.conv_k_at(v);
       entry.conv_v_state = state.conv_v_at(v);
-      if (const int full = FULL_INDEX[v]; full >= 0) {
+      if (const int full = full_cache_index(v); full >= 0) {
         entry.k_cache = state.k_full_at(full).data;
         entry.v_cache = state.v_full_at(full).data;
         if (state.kv_q4 || state.kv_12) {
@@ -208,32 +219,34 @@ void Runtime::set_batch_inputs(std::span<const BatchInput> rows) {
         }
         entry.kpos = nullptr;
       } else {
-        const int ring = RING_INDEX[v];
+        const int ring = ring_cache_index(v);
         entry.k_cache = state.k_ring_at(ring).data;
         entry.v_cache = state.v_ring_at(ring).data;
         entry.kpos = state.ring_pos_at(ring);
       }
-      table.attn_conv[v][i] = state.conv_attn_at(v);
-      table.mlp_conv[v][i] = state.conv_mlp_at(v);
+      (reference ? ref->attn_conv[r][i] : table.attn_conv[v][i]) = state.conv_attn_at(v);
+      (reference ? ref->mlp_conv[r][i] : table.mlp_conv[v][i]) = state.conv_mlp_at(v);
     }
   }
-  CUDA_CHECK(cudaMemcpyAsync(batch_table_.p, &table, sizeof(table), cudaMemcpyHostToDevice, stream_));
+  CUDA_CHECK(cudaMemcpyAsync(batch_table_.p, &table, batch_table_.bytes, cudaMemcpyHostToDevice, stream_));
 }
 
 void Runtime::init_batch(const TpLayout& layout) {
   decoder_->allocate_batch_workspace(options_.max_batch);
   for (int i = 1; i < options_.max_batch; ++i)
-    extra_slots_.push_back(make_state(options_.max_ctx, options_.kv_fp8, layout, options_.kv_q4, options_.kv_12));
-  batch_table_ = DeviceBuffer(sizeof(BatchSlotTable));
-  host_batch_table_ = MappedHostBuffer(sizeof(BatchSlotTable));
-  std::memset(host_batch_table_.data(), 0, sizeof(BatchSlotTable));
+    extra_slots_.push_back(make_state(options_.max_ctx, options_.kv_fp8, layout, options_.kv_q4, options_.kv_12, state_.loopcd));
+  const bool ref_coda = state_.loopcd.uses_ref_coda();
+  const std::size_t bytes = sizeof(BatchSlotTable) + (ref_coda ? sizeof(BatchRefSlotTable) : 0);
+  batch_table_ = DeviceBuffer(bytes);
+  host_batch_table_ = MappedHostBuffer(bytes);
+  std::memset(host_batch_table_.data(), 0, bytes);
   auto* table = static_cast<BatchSlotTable*>(batch_table_.p);
   std::array<BatchInput, kMaxWidth> inputs{};
   for (int i = 0; i < options_.max_batch; ++i) inputs[i] = {i, 0};
   set_batch_inputs(std::span(inputs).first(options_.max_batch));
   for (int width = 1; width <= options_.max_batch; ++width) {
     auto& entry = batch_widths_[width];
-    entry.buffers = make_buffers(width, layout, true, bool(tp_), has_cert_head());
+    entry.buffers = make_buffers(width, layout, true, bool(tp_), has_cert_head(), ref_coda);
     entry.buffers.token = rm(table->tokens, DType::I64, {width});
     auto capture = [&](bool full_logits) {
       if (tp_) tp_->full_logits = full_logits;
@@ -300,6 +313,7 @@ Buffers& Runtime::buffers(int m) {
 StatePtrs Runtime::state_ptrs() const {
   StatePtrs p;
   p.kv_dim = state_.conv_k.ne[0];
+  p.ref_coda = state_.loopcd.uses_ref_coda();
   p.conv[0] = ptr<float>(state_.conv_k);
   p.conv[1] = ptr<float>(state_.conv_v);
   p.conv[2] = ptr<float>(state_.conv_attn);
@@ -428,10 +442,10 @@ std::size_t Runtime::full_rows_bytes(int n) const {
     throw std::invalid_argument("full_rows_bytes: n = " + std::to_string(n) + " outside [0, max_ctx = " +
                                 std::to_string(options_.max_ctx) + "]");
   const std::size_t row = state_.k_full.nb[2] + (state_.k_full_scale.data ? state_.k_full_scale.nb[2] : 0);
-  return 2 * std::size_t(NUM_FULL_VISITS) * row * std::size_t(n);
+  return 2 * std::size_t(state_.loopcd.full_visits()) * row * std::size_t(n);
 }
 
-// one 2D copy per cache: NUM_FULL_VISITS rows of n positions, pitch max_ctx positions in the cache, packed in
+// One 2D copy per cache, with one row of n positions per full-attention visit, packed in
 // the parked copy (K visits, V visits, then K and V side data for Q4 or KV12).
 void Runtime::save_full_rows(void* dst, int n) {
   if (!full_rows_bytes(n)) return;
@@ -439,8 +453,8 @@ void Runtime::save_full_rows(void* dst, int n) {
   for (const Tensor* t : {&state_.k_full, &state_.v_full, &state_.k_full_scale, &state_.v_full_scale}) {
     if (!t->data) continue;
     const std::size_t width = std::size_t(n) * t->nb[2];
-    CUDA_CHECK(cudaMemcpy2DAsync(p, width, t->data, t->nb[3], width, NUM_FULL_VISITS, cudaMemcpyDefault, stream_));
-    p += width * NUM_FULL_VISITS;
+    CUDA_CHECK(cudaMemcpy2DAsync(p, width, t->data, t->nb[3], width, state_.loopcd.full_visits(), cudaMemcpyDefault, stream_));
+    p += width * state_.loopcd.full_visits();
   }
 }
 
@@ -450,8 +464,8 @@ void Runtime::restore_full_rows(const void* src, int n) {
   for (const Tensor* t : {&state_.k_full, &state_.v_full, &state_.k_full_scale, &state_.v_full_scale}) {
     if (!t->data) continue;
     const std::size_t width = std::size_t(n) * t->nb[2];
-    CUDA_CHECK(cudaMemcpy2DAsync(t->data, t->nb[3], p, width, width, NUM_FULL_VISITS, cudaMemcpyDefault, stream_));
-    p += width * NUM_FULL_VISITS;
+    CUDA_CHECK(cudaMemcpy2DAsync(t->data, t->nb[3], p, width, width, state_.loopcd.full_visits(), cudaMemcpyDefault, stream_));
+    p += width * state_.loopcd.full_visits();
   }
 }
 

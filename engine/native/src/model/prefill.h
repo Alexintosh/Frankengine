@@ -40,7 +40,8 @@ class TpRuntime;
 
 class Prefiller {
  public:
-  Prefiller(const Weights& w, const Ablation& abl, int max_chunk, cudaStream_t stream, TpRuntime* tp = nullptr);
+  Prefiller(const Weights& w, const Ablation& abl, int max_chunk, cudaStream_t stream, TpRuntime* tp = nullptr,
+            LoopCdConfig loopcd = {});
   ~Prefiller();
   Prefiller(const Prefiller&) = delete;
   Prefiller& operator=(const Prefiller&) = delete;
@@ -68,6 +69,7 @@ class Prefiller {
   // activations (rows = max_chunk), see prefill.cpp
   float *B0_, *B1_, *B2_[PASSES], *E_[PASSES], *hid_, *part_, *y_, *y2_;
   __nv_bfloat16 *xin_, *xm_, *xf_;
+  float* ref_logits_ = nullptr;
   float *mixf_, *msgs_, *mixm_;
   __nv_bfloat16 *proj_, *q_, *rel16_, *rel_, *krows_, *vrows_, *attn_out_, *wo_out_;
   int* kpos_;

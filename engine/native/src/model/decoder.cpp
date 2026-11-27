@@ -46,9 +46,10 @@ Decoder::Decoder(const Weights& w, const Ablation& abl, State& st, bool pdl, TpS
       pdl_(pdl && !simulation && (!tp || (tp->gb10_spec && !tp->profile))),
       simulation_(simulation), tp_(tp),
       down_workspace_(tp && tp->gb10_spec ? sizeof(float) * std::size_t(8) * TOP_K * HIDDEN : 0),
-      cert_head_ws_(!simulation && !tp && w.unembed_certified.bounds
+      cert_head_ws_(!simulation && !tp && !st.loopcd.uses_ref_coda() && w.unembed_certified.bounds
           ? kernels::head::cert_head_workspace(w.unembed.rows()) : 0),
       attn_ws_(simulation ? 0 : attn::workspace_bytes(8, tp ? tp->layout.hkv_local : KV_HEADS)) {
+  validate_loopcd_tp(st.loopcd, tp ? tp->layout.tp_size : simulation ? 2 : 1);
   if (simulation_) return;
   attn_ws_.fill(0);  // zeroed once; the kernel resets its counter itself
   const TpLayout layout = tp_ ? tp_->layout : TpLayout{};
@@ -90,7 +91,7 @@ void Decoder::decode_batch(Buffers& b, const BatchSlotTable* slots, cudaStream_t
 }
 
 void Decoder::decode_impl(Buffers& b, const std::int64_t* pos, bool history, cudaStream_t stream,
-                          TpReduction reduction, const BatchSlotTable* slots, bool greedy_only) {
+                          TpReduction reduction, const BatchSlotTable* slots, bool greedy_only, int loop_passes) {
   const bool profile = tp_ && tp_->profile;
   auto stage = [&](VerifyStage kind, int occurrence, bool end) {
     if (profile) tp_->mark_stage(kind, occurrence, end, stream);
@@ -103,6 +104,11 @@ void Decoder::decode_impl(Buffers& b, const std::int64_t* pos, bool history, cud
   const Weights& w = w_;
   const Ablation& abl = abl_;
   State& st = st_;
+  const auto& loopcd = st.loopcd;
+  const bool uses_ref_coda = loopcd.uses_ref_coda();
+  if (uses_ref_coda && !b.ref_logits.data)
+    throw std::invalid_argument("Decoder requires reference coda buffers for this state");
+  const auto* ref_slots = slots && uses_ref_coda ? reinterpret_cast<const BatchRefSlotTable*>(slots + 1) : nullptr;
   const std::size_t slab = std::size_t(m) * H;  // one [m, H] slab of a [G, m, H] buffer
 
   auto reduce_conv = [&](float* fp32, __nv_bfloat16* bf16, int visit, dense::ConvKind kind,
@@ -111,7 +117,11 @@ void Decoder::decode_impl(Buffers& b, const std::int64_t* pos, bool history, cud
     if (tp_) tp_->reduce(fp32, bf16, slab, TpSchedule::Decode, op, stream);
     stage(VerifyStage::Conv, op, false);
     if (slots) {
-      auto states = kind == dense::ConvKind::Mlp ? slots->mlp_conv[visit] : slots->attn_conv[visit];
+      const bool ref = visit >= NUM_VISITS;
+      const int r = visit - NUM_VISITS;
+      auto states = kind == dense::ConvKind::Mlp
+          ? (ref ? ref_slots->mlp_conv[r] : slots->mlp_conv[visit])
+          : (ref ? ref_slots->attn_conv[r] : slots->attn_conv[visit]);
       dense::conv_residual_epilogue_batch(fp32, bf16, m, kind, f32p(weights), states, out, pdl, stream);
     } else {
       dense::conv_residual_epilogue(fp32, bf16, m, kind, f32p(weights), state, out, hist, pdl, stream);
@@ -151,29 +161,75 @@ void Decoder::decode_impl(Buffers& b, const std::int64_t* pos, bool history, cud
   const float* mlp_w = f32p(abl.mlp_w);
   __nv_bfloat16* taps = bf16m(b.taps);
 
-  for (int v = 0; v < NUM_VISITS; ++v) {
-    const int l = VISITS[v].layer, p = VISITS[v].pass;
+  const int main_pass = loop_passes - 1;
+  auto finish = [&](bool reference) {
+    const int coda_pass = reference ? loopcd.ref_idx : main_pass;
+    const Tensor final_norm1 = rm(w.final_norm.data, DType::FP32, {1, H});
+    auto* xf = bf16m(reference ? b.xm : b.xf);
+    dense::MixParams fp = mix_params(b.blocks(LAYERS, 0, coda_pass), f32p(b.part), f32p(b.y2),
+                                    mlp_dirs + std::size_t(prev_v) * H, mlp_w + 4 * std::size_t(prev_v),
+                                    nullptr, &w.final_query, f32p(final_norm1), xf, nullptr);
+    if (!reference) {
+      fp.out_copy = taps + std::size_t(NUM_TAPS - 1) * H;
+      fp.out_copy_stride = std::int64_t(NUM_TAPS) * H;
+    }
+    dense::mix(fp, pdl, stream);
+    auto* logits = f32m(reference ? b.ref_logits : b.logits);
+    if (simulation_)
+      simulation_->head(b, stream);
+    else if (tp_)
+      tp_->head(w, xf, logits, ptr<int32_t>(b.greedy), m, TpSchedule::Decode, stream);
+    else if (!uses_ref_coda && greedy_only && w.unembed_certified.bounds)
+      kernels::head::cert_head(xf, m, w.unembed.matrix(), w.unembed_certified, logits,
+                               cert_head_ws_.p, ptr<int32_t>(b.greedy), stream);
+    else if (w.unembed_nvfp4.codes)
+      kernels::head::head_nvfp4(xf, m, w.unembed_nvfp4, logits, nullptr, nullptr, pdl, stream);
+    else
+      dense::head(xf, m, w.unembed.matrix(), logits, pdl, stream);
+  };
+
+  const int coda_before = LOOP_START + loop_passes * (LOOP_END - LOOP_START);
+  const int visits = loopcd.visits();
+  for (int v = 0; v < visits; ++v) {
+    if (loop_passes < PASSES && v == coda_before) v = CODA_FIRST;  // shortened forward used by the independent test oracle
+    if (v == NUM_VISITS) finish(false);
+    const bool reference = v >= NUM_VISITS;
+    const int coda_pass = reference ? loopcd.ref_idx : main_pass;
+    const int wv = weight_visit(v);
+    const int l = VISITS[wv].layer, p = VISITS[wv].pass;
     const Layer& layer = w.layers[l];
     const bool loop = is_loop_layer(l);
     const bool msgs = loop && p > 0;
     const bool boundary = l % BLOCK == 0;
-    const std::vector<const float*> blocks = b.blocks(l, p);
+    const std::vector<const float*> blocks = b.blocks(l, p, coda_pass);
 
     // ---- hidden entering this visit (the previous MLP write applied), stored where it is a block
     float* hid;
     const float* base;
     const float* write;
-    if (v == 0) {
+    if (reference && l == LOOP_END) {
+      // E[ref] already includes the last loop MLP write, completed at the next pass's layer 6.
+      hid = f32m(b.E[coda_pass]), base = hid, write = nullptr;
+    } else if (v == 0) {
       hid = f32m(b.B0), base = f32p(b.B0), write = nullptr;
     } else if (l == LOOP_START && p > 0) {
       hid = f32m(b.B1), base = f32p(b.B1), write = nullptr;
     } else {
-      hid = l == 6 ? f32m(b.B1) : l == 12 ? f32m(b.B2[p]) : l == 18 ? f32m(b.E[2]) : f32m(b.hid);
+      hid = l == 6 ? f32m(b.B1) : l == 12 ? f32m(b.B2[p]) : l == LOOP_END ? f32m(b.E[coda_pass]) : f32m(b.hid);
       base = f32p(b.part), write = f32p(b.y2);
     }
     const int pv = prev_v >= 0 ? prev_v : 0;
     const float* r_prev = mlp_dirs + std::size_t(pv) * H;
     const float* w_prev = mlp_w + 4 * std::size_t(pv);
+    if (l == LOOP_END && loopcd.hidden()) {
+      if (abl.active) {
+        dense::mix(mix_params({}, base, write, r_prev, w_prev, hid, nullptr, nullptr, nullptr, nullptr), pdl, stream);
+        base = hid, write = nullptr;
+      }
+      dense::loopcd_hidden(base, write, f32p(b.E[loopcd.ref_idx]), hid, f32m(b.B2[main_pass]),
+                           f32p(b.B2[loopcd.ref_idx]), slab, loopcd.omega, stream);
+      base = hid, write = nullptr;
+    }
     dense::MixParams msg_mix;  // message visits: launched together with the attention read (independent of it)
     if (msgs) {
       const int i = l - LOOP_START;
@@ -192,7 +248,7 @@ void Decoder::decode_impl(Buffers& b, const std::int64_t* pos, bool history, cud
         msgs ? mix_params(blocks, base, write, r_prev, w_prev, partial_out, queries, nullptr, nullptr, f32m(b.mixf))
              : mix_params(blocks, base, write, r_prev, w_prev, partial_out, l > 0 ? queries : nullptr,
                           f32p(layer.attn_norm_mix), bf16m(b.xin), nullptr);
-    if (tap < 3 && v == TAP_VISITS[tap]) {
+    if (tap < 3 && wv == TAP_VISITS[tap]) {
       ap.new_bf16 = taps + std::size_t(tap) * H;
       ap.new_bf16_stride = std::int64_t(NUM_TAPS) * H;
       ++tap;
@@ -237,7 +293,7 @@ void Decoder::decode_impl(Buffers& b, const std::int64_t* pos, bool history, cud
       a.workspace_size = workspace.bytes;
       a.out = bf16m(b.attn_out);
       if (layer.full) {
-        const int fi = FULL_INDEX[v];
+        const int fi = full_cache_index(v);
         a.k_conv = f32p(layer.k_static);
         a.v_conv = f32p(layer.v_static);
         a.k_cache = st.k_full_at(fi).data;
@@ -254,7 +310,7 @@ void Decoder::decode_impl(Buffers& b, const std::int64_t* pos, bool history, cud
         a.window = 0;
         a.log_scaling = true;
       } else {
-        const int ri = RING_INDEX[v];
+        const int ri = ring_cache_index(v);
         a.k_conv = f32p(layer.k_conv);
         a.v_conv = f32p(layer.v_conv);
         a.k_cache = st.k_ring_at(ri).data;
@@ -266,7 +322,8 @@ void Decoder::decode_impl(Buffers& b, const std::int64_t* pos, bool history, cud
         a.log_scaling = false;
       }
       stage(VerifyStage::Attention, v, false);
-      if (slots) attn::attn_decode_batch(a, slots->attn[v], m, stream);
+      if (slots)
+        attn::attn_decode_batch(a, reference ? ref_slots->attn[v - NUM_VISITS] : slots->attn[v], m, stream);
       else attn::attn_decode(a, stream);
       stage(VerifyStage::Attention, v, true);
       float* hist = history ? f32m(b.hist_attn) + std::size_t(v) * slab : nullptr;
@@ -288,9 +345,9 @@ void Decoder::decode_impl(Buffers& b, const std::int64_t* pos, bool history, cud
     if (boundary) mlp_blocks.push_back(hid);
     const float* mbase = boundary ? nullptr : hid;
     dense::MixParams mp =
-        msgs ? mix_params(mlp_blocks, mbase, f32p(b.y), attn_dirs + std::size_t(v) * H, attn_w + 4 * std::size_t(v), f32m(b.part),
+        msgs ? mix_params(mlp_blocks, mbase, f32p(b.y), attn_dirs + std::size_t(wv) * H, attn_w + 4 * std::size_t(wv), f32m(b.part),
                           &layer.mlp_query, nullptr, nullptr, f32m(b.mixm))
-             : mix_params(mlp_blocks, mbase, f32p(b.y), attn_dirs + std::size_t(v) * H, attn_w + 4 * std::size_t(v), f32m(b.part),
+             : mix_params(mlp_blocks, mbase, f32p(b.y), attn_dirs + std::size_t(wv) * H, attn_w + 4 * std::size_t(wv), f32m(b.part),
                           &layer.mlp_query, f32p(layer.mlp_norm1), bf16m(b.xm), nullptr);
     if (history && !simulation_) {  // b.hist_k/hist_v[v] = proj_out[:, K/V segment]
       int c = 0;
@@ -340,27 +397,15 @@ void Decoder::decode_impl(Buffers& b, const std::int64_t* pos, bool history, cud
                       f32p(ex.w2_factor), fmt, f32p(layer.mlp_conv), st.conv_mlp_at(v), f32m(b.y2), hist, pdl, stream);
       }
     }
-    prev_v = v;
+    prev_v = wv;
   }
-  // ---- final read; the same launch writes b.taps[:, 3] = b.xf
-  const Tensor final_norm1 = rm(w.final_norm.data, DType::FP32, {1, H});
-  dense::MixParams fp = mix_params({f32p(b.B0), f32p(b.B1), f32p(b.B2[2]), f32p(b.E[2])}, f32p(b.part), f32p(b.y2),
-                                   mlp_dirs + std::size_t(prev_v) * H, mlp_w + 4 * std::size_t(prev_v), nullptr, &w.final_query,
-                                   f32p(final_norm1), bf16m(b.xf), nullptr);
-  fp.out_copy = taps + std::size_t(tap) * H;
-  fp.out_copy_stride = std::int64_t(NUM_TAPS) * H;
-  dense::mix(fp, pdl, stream);
-  if (simulation_)
-    simulation_->head(b, stream);
-  else if (tp_)
-    tp_->head(w, bf16m(b.xf), f32m(b.logits), ptr<int32_t>(b.greedy), m, TpSchedule::Decode, stream);
-  else if (greedy_only && w.unembed_certified.bounds)
-    kernels::head::cert_head(bf16m(b.xf), m, w.unembed.matrix(), w.unembed_certified, f32m(b.logits),
-                             cert_head_ws_.p, ptr<int32_t>(b.greedy), stream);
-  else if (w.unembed_nvfp4.codes)
-    kernels::head::head_nvfp4(bf16m(b.xf), m, w.unembed_nvfp4, f32m(b.logits), nullptr, nullptr, pdl, stream);
-  else
-    dense::head(bf16m(b.xf), m, w.unembed.matrix(), f32m(b.logits), pdl, stream);
+  if (uses_ref_coda) {
+    finish(true);
+    dense::loopcd_combine_logits(f32m(b.logits), f32p(b.ref_logits), m, UNPADDED_VOCAB,
+                                UNPADDED_VOCAB, loopcd.mode, loopcd.omega, stream);
+  } else {
+    finish(false);
+  }
 }
 
 }  // namespace ingine::model

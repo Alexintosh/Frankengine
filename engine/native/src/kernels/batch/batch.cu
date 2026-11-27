@@ -46,9 +46,11 @@ __device__ __forceinline__ bool better(float a, int av, float b, int bv) { retur
 
 constexpr int SAMPLE_T = 1024;
 
+template <bool DeviceSeed = false>
 __global__ void __launch_bounds__(SAMPLE_T) sample_kernel(const float* __restrict__ logits, int ld, int V, int raw,
                                                           const float* __restrict__ temps, float temperature,
-                                                          std::uint64_t seed, std::int32_t* __restrict__ out) {
+                                                          std::uint64_t seed, std::int32_t* __restrict__ out, const std::uint64_t* d_seed) {
+  if constexpr (DeviceSeed) seed = *d_seed;
   const int row = blockIdx.x;
   const float* const l = logits + std::size_t(row) * ld;
   const std::uint64_t row_key = mix64(seed ^ (std::uint64_t(row) * 0xD1B54A32D192ED03ull));
@@ -100,13 +102,14 @@ __global__ void keep_kv_kernel(const Vec* __restrict__ proj, int ldv, int kv, in
 
 // The four conv states of a slot in float4 units: per kind (k, v: 256 per row; attn, mlp: 576 per row) 48 visits x
 // R rows. Item q -> kind, visit, row, column.
-constexpr int KV4 = 1024 / 4, H4 = 2304 / 4, VISITS = 48;
+constexpr int KV4 = 1024 / 4, H4 = 2304 / 4;
 struct ConvVec {
   int kind, v, row, c4, C4;
 };
+template <int Visits>
 __device__ __forceinline__ ConvVec conv_vec(int q, int R, int kv4) {
   ConvVec a;
-  const int kv = VISITS * R * kv4, h = VISITS * R * H4;
+  const int kv = Visits * R * kv4, h = Visits * R * H4;
   if (q < kv) a.kind = 0, a.C4 = kv4;
   else if ((q -= kv) < kv) a.kind = 1, a.C4 = kv4;
   else if ((q -= kv) < h) a.kind = 2, a.C4 = H4;
@@ -116,7 +119,8 @@ __device__ __forceinline__ ConvVec conv_vec(int q, int R, int kv4) {
   a.v = vr / R, a.row = vr % R;
   return a;
 }
-__host__ __device__ constexpr int conv_vecs(int R, int kv4 = KV4) { return VISITS * R * (2 * kv4 + 2 * H4); }
+template <int Visits>
+__host__ __device__ constexpr int conv_vecs(int R, int kv4 = KV4) { return Visits * R * (2 * kv4 + 2 * H4); }
 __device__ __forceinline__ float* state_of(const ConvStates& st, int kind, long long slot) {
   return kind == 0 ? st.k + slot * st.kv_stride
        : kind == 1 ? st.v + slot * st.kv_stride
@@ -125,11 +129,12 @@ __device__ __forceinline__ float* state_of(const ConvStates& st, int kind, long 
 }
 
 // one thread per (sequence, conv, visit, 4 columns): reads the old rows it keeps, then writes the new ones
+template <int Visits>
 __global__ void conv_commit_kernel(ConvStates st, const std::int32_t* __restrict__ slots, ConvHistory hist, int T,
                                    const std::int32_t* __restrict__ rows, const std::int32_t* __restrict__ commit, int kv4) {
   const int b = blockIdx.y, q = blockIdx.x * blockDim.x + threadIdx.x;
-  if (q >= conv_vecs(1, kv4)) return;
-  const ConvVec a = conv_vec(q, 1, kv4);
+  if (q >= conv_vecs<Visits>(1, kv4)) return;
+  const ConvVec a = conv_vec<Visits>(q, 1, kv4);
   const int c = commit[b], r0 = rows[b], C = 4 * a.C4;
   float* const s = state_of(st, a.kind, slots[b]) + std::size_t(a.v) * 3 * C + 4 * a.c4;
   const __nv_bfloat16* h = a.kind == 0 ? hist.k : a.kind == 1 ? hist.v : a.kind == 2 ? hist.attn : hist.mlp;
@@ -146,6 +151,44 @@ __global__ void conv_commit_kernel(ConvStates st, const std::int32_t* __restrict
     }
   }
   for (int j = 0; j < 3; ++j) *reinterpret_cast<float4*>(s + j * C) = row[j];
+}
+
+template <bool Restore>
+__global__ void verify_rings_kernel(RingRows cache, RingRows backup, int rings, int kv_dim, int max_m,
+                                    const int* slots, const std::int64_t* pos, const int* rows,
+                                    const int* commit) {
+  // Row 0 is always accepted. The old cache row under row 1 is already out of window
+  // when verification accepts only the anchor and the next forward processes row 1.
+  const int b = blockIdx.x / (max_m - 2);
+  const int r = 2 + blockIdx.x % (max_m - 2);
+  const int ring = blockIdx.y;
+  const std::int64_t absolute = pos[b] + r;
+  if (r >= rows[b + 1] - rows[b] || absolute < cache.rows_per_ring) return;
+  if constexpr (Restore) {
+    if (r <= commit[b]) return;
+  }
+  const std::size_t from = (std::size_t(slots[b]) * rings + ring) * cache.rows_per_ring +
+                           absolute % cache.rows_per_ring;
+  const std::size_t saved = std::size_t(ring) * backup.rows_per_ring + std::size_t(b) * (max_m - 2) + r - 2;
+  const int vectors = kv_dim / 8;
+  const int c = threadIdx.x;
+  if (c < vectors) {
+    auto* k = reinterpret_cast<uint4*>(cache.k) + from * vectors + c;
+    auto* v = reinterpret_cast<uint4*>(cache.v) + from * vectors + c;
+    auto* k_saved = reinterpret_cast<uint4*>(backup.k) + saved * vectors + c;
+    auto* v_saved = reinterpret_cast<uint4*>(backup.v) + saved * vectors + c;
+    if constexpr (Restore) {
+      *k = *k_saved;
+      *v = *v_saved;
+    } else {
+      *k_saved = *k;
+      *v_saved = *v;
+    }
+  }
+  if (c == 0) {
+    if constexpr (Restore) cache.pos[from] = backup.pos[saved];
+    else backup.pos[saved] = cache.pos[from];
+  }
 }
 
 __global__ void gather_rows_kernel(const uint4* __restrict__ src, int row8, const std::int32_t* __restrict__ rows,
@@ -167,19 +210,39 @@ void conv(const __nv_bfloat16* x, int ld, int n, const std::int32_t* rows, int C
 }
 
 void conv_commit(const ConvStates& st, int n, const std::int32_t* slots, const ConvHistory& hist, int T,
-                 const std::int32_t* rows, const std::int32_t* commit, cudaStream_t stream, int kv_dim) {
+                 const std::int32_t* rows, const std::int32_t* commit, cudaStream_t stream, int kv_dim, int visits) {
   if (n <= 0) return;
   const int kv4 = kv_dim / 4;
-  const dim3 grid((conv_vecs(1, kv4) + 255) / 256, n);
-  conv_commit_kernel<<<grid, 256, 0, stream>>>(st, slots, hist, T, rows, commit, kv4);
+  auto launch = [&]<int Visits>() {
+    const dim3 grid((conv_vecs<Visits>(1, kv4) + 255) / 256, n);
+    conv_commit_kernel<Visits><<<grid, 256, 0, stream>>>(st, slots, hist, T, rows, commit, kv4);
+  };
+  if (visits == 48) launch.template operator()<48>();
+  else if (visits == 54) launch.template operator()<54>();
+  else throw std::invalid_argument("batch::conv_commit: unsupported visit count");
+  CUDA_CHECK(cudaGetLastError());
+}
+
+void verify_rings(const RingRows& cache, const RingRows& backup, int rings, int kv_dim, int sequences, int max_m,
+                  const std::int32_t* slots, const std::int64_t* pos, const std::int32_t* rows,
+                  const std::int32_t* commit, cudaStream_t stream) {
+  const dim3 grid(sequences * (max_m - 2), rings);
+  const int threads = kv_dim / 8;
+  if (commit)
+    verify_rings_kernel<true><<<grid, threads, 0, stream>>>(cache, backup, rings, kv_dim, max_m, slots, pos, rows, commit);
+  else
+    verify_rings_kernel<false><<<grid, threads, 0, stream>>>(cache, backup, rings, kv_dim, max_m, slots, pos, rows, nullptr);
   CUDA_CHECK(cudaGetLastError());
 }
 
 void sample(const float* logits, int ld, int n, int V, bool raw, const float* temps, std::uint64_t seed,
-            std::int32_t* out, cudaStream_t stream) {
+            std::int32_t* out, cudaStream_t stream, const std::uint64_t* d_seed) {
   if (n <= 0) return;
   if (V <= 0 || V > ld) throw std::invalid_argument("batch::sample: V outside 1..ld");
-  sample_kernel<<<n, SAMPLE_T, 0, stream>>>(logits, ld, V, raw ? 1 : 0, temps, 0.f, seed, out);
+  if (d_seed)
+    sample_kernel<true><<<n, SAMPLE_T, 0, stream>>>(logits, ld, V, raw ? 1 : 0, temps, 0.f, seed, out, d_seed);
+  else
+    sample_kernel<false><<<n, SAMPLE_T, 0, stream>>>(logits, ld, V, raw ? 1 : 0, temps, 0.f, seed, out, nullptr);
   CUDA_CHECK(cudaGetLastError());
 }
 
@@ -187,7 +250,7 @@ void sample(const float* logits, int ld, int n, int V, bool raw, float temperatu
             std::int32_t* out, cudaStream_t stream) {
   if (n <= 0) return;
   if (V <= 0 || V > ld) throw std::invalid_argument("batch::sample: V outside 1..ld");
-  sample_kernel<<<n, SAMPLE_T, 0, stream>>>(logits, ld, V, raw ? 1 : 0, nullptr, temperature, seed, out);
+  sample_kernel<false><<<n, SAMPLE_T, 0, stream>>>(logits, ld, V, raw ? 1 : 0, nullptr, temperature, seed, out, nullptr);
   CUDA_CHECK(cudaGetLastError());
 }
 

@@ -54,7 +54,7 @@ void copy_full_prefix(const State& src, const State& dst, int len, cudaStream_t 
   if (len == 0) return;
   auto copy = [&](const Tensor& from, const Tensor& to) {
     const std::size_t bytes = std::size_t(len) * from.nb[2];
-    for (int visit = 0; visit < NUM_FULL_VISITS; ++visit) {
+    for (int visit = 0; visit < src.loopcd.full_visits(); ++visit) {
       const auto* src_rows = ptr<const char>(from) + std::size_t(visit) * from.nb[3];
       auto* dst_rows = ptr<char>(to) + std::size_t(visit) * to.nb[3];
       CUDA_CHECK(cudaMemcpyAsync(dst_rows, src_rows, bytes, cudaMemcpyDeviceToDevice, stream));
@@ -89,7 +89,7 @@ class EngineGenerator final : public Generator {
       : options_(options),
         runtime_(std::move(runtime)),
         rt_(*runtime_),
-        prefiller_(rt_.weights(), rt_.ablation(), options.prefill_chunk, rt_.stream(), rt_.tp()),
+        prefiller_(rt_.weights(), rt_.ablation(), options.prefill_chunk, rt_.stream(), rt_.tp(), rt_.state().loopcd),
         chunk_tokens_(std::size_t(options.prefill_chunk) * sizeof(std::int32_t)),
         logits_(rt_.tp() && !options.tp.serve ? sizeof(int32_t) : std::size_t(UNPADDED_VOCAB) * sizeof(float)),
         token_(sizeof(std::int32_t)),
@@ -159,7 +159,8 @@ class EngineGenerator final : public Generator {
         batch_unembed_ = load_head(options.model_dir, /*dense_fp8=*/false, /*head_nvfp4=*/false, stream,
                                    batch_head_storage_, layout).dense;
       }
-      batch_state_ = make_batch_state(options.max_batch, options.batch_ctx, options.kv_fp8, layout, options.kv_q4, options.kv_12);
+      batch_state_ = make_batch_state(options.max_batch, options.batch_ctx, options.kv_fp8, layout,
+                                     options.kv_q4, options.kv_12, rt_.state().loopcd);
       batch_dec_ = std::make_unique<BatchDecoder>(rt_.weights(), rt_.ablation(), batch_state_, options.max_batch,
                                                   stream, 8, rt_.tp(),
                                                   batch_unembed_.w.data ? &batch_unembed_ : nullptr);

@@ -22,7 +22,7 @@ void conv(const __nv_bfloat16* x, int ld, int n, const std::int32_t* rows, int C
 // temps[r] (device fp32 [n]) or `temperature`: <= 0 is the argmax of s (lowest v on ties), else a sample of
 // softmax(s / T) by the Gumbel-max trick, the noise a function of (seed, row, v). out int32 [n].
 void sample(const float* logits, int ld, int n, int V, bool raw, const float* temps, std::uint64_t seed,
-            std::int32_t* out, cudaStream_t stream);
+            std::int32_t* out, cudaStream_t stream, const std::uint64_t* d_seed = nullptr);
 void sample(const float* logits, int ld, int n, int V, bool raw, float temperature, std::uint64_t seed,
             std::int32_t* out, cudaStream_t stream);
 
@@ -45,7 +45,16 @@ void keep_kv(const __nv_bfloat16* proj, int ld, int rows, int k_off, int v_off, 
 // sequence b keeps commit[b] of its rows, and slot slots[b]'s states become rows commit[b] .. commit[b] + 2 of [its
 // rows 0..2 before the step, its inputs (the history)]. rows, commit: device int32 [n + 1], [n].
 void conv_commit(const ConvStates& st, int n, const std::int32_t* slots, const ConvHistory& hist, int T,
-                 const std::int32_t* rows, const std::int32_t* commit, cudaStream_t stream, int kv_dim = 1024);
+                 const std::int32_t* rows, const std::int32_t* commit, cudaStream_t stream, int kv_dim = 1024, int visits = 48);
+// Save overwritten positions of a wrapped sliding ring, or restore the rejected rows after verification.
+struct RingRows {
+  __nv_bfloat16 *k, *v;
+  std::int64_t* pos;
+  int rows_per_ring;
+};
+void verify_rings(const RingRows& cache, const RingRows& backup, int rings, int kv_dim, int sequences, int max_m,
+                  const std::int32_t* slots, const std::int64_t* pos, const std::int32_t* rows,
+                  const std::int32_t* commit, cudaStream_t stream);
 // dst row i = src row rows[i], rows of row_elems bf16 (a multiple of 8); rows: device int32 [count].
 void gather_rows(const __nv_bfloat16* src, int row_elems, const std::int32_t* rows, int count, __nv_bfloat16* dst,
                  cudaStream_t stream);

@@ -33,18 +33,19 @@ const __nv_bfloat16* bf16p(const Tensor& t) { return static_cast<const __nv_bflo
 const __nv_bfloat16* bf16p(const void* p) { return static_cast<const __nv_bfloat16*>(p); }
 
 // fast.Buffers.blocks
-std::vector<const float*> blocks_of(int l, int p, const float* B0, const float* B1, float* const* B2, float* const* E) {
+std::vector<const float*> blocks_of(int l, int p, const float* B0, const float* B1, float* const* B2, float* const* E, int coda_pass) {
   if (l < 1) return {};
   if (l < 7) return {B0};
   if (l < 13) return {B0, B1};
-  if (l < 19) return {B0, B1, B2[l < LOOP_END ? p : 2]};
-  return {B0, B1, B2[2], E[2]};
+  if (l < 19) return {B0, B1, B2[l < LOOP_END ? p : coda_pass]};
+  return {B0, B1, B2[coda_pass], E[coda_pass]};
 }
 
 }  // namespace
 
-Prefiller::Prefiller(const Weights& w, const Ablation& abl, int max_chunk, cudaStream_t stream, TpRuntime* tp)
+Prefiller::Prefiller(const Weights& w, const Ablation& abl, int max_chunk, cudaStream_t stream, TpRuntime* tp, LoopCdConfig loopcd)
     : w_(w), abl_(abl), tp_(tp), layout_(tp ? tp->layout : TpLayout{}), max_chunk_(max_chunk), stream_(stream), gemm_(std::make_unique<pk::Gemm>()) {
+  validate_loopcd_tp(loopcd, layout_.tp_size);
   if (max_chunk < 1) throw std::invalid_argument("Prefiller: max_chunk must be positive");
   const int L = WINDOW + max_chunk;
   kpos_rows_ = (L + pk::kAttnKeyTile - 1) / pk::kAttnKeyTile * pk::kAttnKeyTile;
@@ -103,6 +104,7 @@ Prefiller::Prefiller(const Weights& w, const Ablation& abl, int max_chunk, cudaS
     xq_ = static_cast<std::uint8_t*>(alloc(std::max(3 * C * H, C * layout_.q_dim_local)));
     x_scale_ = f32(3 * C);
   }
+  if (loopcd.uses_ref_coda()) ref_logits_ = f32(UNPADDED_VOCAB);
   ids_ = static_cast<std::int64_t*>(alloc(C * 8));
   for (auto& b : storage_) b.fill(0);  // e.g. gathered sliding rows past ring + chunk: never keys, kept finite
 }
@@ -131,6 +133,10 @@ void Prefiller::run(State& st, const std::int32_t* tokens, int T, int pos0, floa
   if (pos0 < 0 || pos0 + T > st.max_ctx)
     throw std::invalid_argument("context " + std::to_string(pos0 + T) + " exceeds max_ctx " +
                                 std::to_string(st.max_ctx));
+  const auto& loopcd = st.loopcd;
+  const bool uses_ref_coda = loopcd.uses_ref_coda();
+  if (uses_ref_coda && !ref_logits_)
+    throw std::invalid_argument("Prefiller requires reference coda workspace for this state");
   const Weights& w = w_;
   const int kv = layout_.kv_dim_local, q = layout_.q_dim_local;
   static const bool optimize = [] {
@@ -249,28 +255,69 @@ void Prefiller::run(State& st, const std::int32_t* tokens, int T, int pos0, floa
   int prev_v = -1;
   int tap = 0;
 
-  for (int v = 0; v < NUM_VISITS; ++v) {
-    const int l = VISITS[v].layer, p = VISITS[v].pass;
+  auto finish = [&](bool reference) {
+    if (!emit_head && (!tap_out || reference)) return;
+    const int coda_pass = reference ? loopcd.ref_idx : PASSES - 1;
+    auto* xf = reference ? xm_ : xf_;  // the reference can reuse its last layer's MLP input
+    dense::mix(mix_params({B0_, B1_, B2_[coda_pass], E_[coda_pass]}, part_, y2_,
+                          mlp_dirs + std::size_t(prev_v) * H, mlp_w + 4 * std::size_t(prev_v), nullptr,
+                          f32p(w.final_query), 1, f32p(w.final_norm), xf, nullptr), false, s);
+    if (!reference && tap_out)
+      CUDA_CHECK(cudaMemcpy2DAsync(tap_out + std::size_t(NUM_TAPS - 1) * H,
+                                  std::size_t(NUM_TAPS) * H * 2, xf, std::size_t(H) * 2, std::size_t(H) * 2,
+                                  T, cudaMemcpyDeviceToDevice, s));
+    if (emit_head) {
+      const auto* final_x = xf + std::size_t(T - 1) * H;
+      auto* out = reference ? ref_logits_ : logits;
+      if (tp_)
+        tp_->head(w, final_x, out, greedy, 1, TpSchedule::Prefill, s);
+      else if (w.unembed_nvfp4.codes)
+        kernels::head::head_nvfp4(final_x, 1, w.unembed_nvfp4, out, nullptr, nullptr, false, s);
+      else
+        pk::head_logits(final_x, w.unembed.w.data, f32p(w.unembed.scale), UNPADDED_VOCAB, out, s,
+                        w.unembed.matrix().pico12);
+    }
+    CUDA_CHECK(cudaGetLastError());
+  };
+
+  const int visits = loopcd.visits();
+  for (int v = 0; v < visits; ++v) {
+    if (v == NUM_VISITS) finish(false);
+    const bool reference = v >= NUM_VISITS;
+    const int coda_pass = reference ? loopcd.ref_idx : PASSES - 1;
+    const int wv = weight_visit(v);
+    const int l = VISITS[wv].layer, p = VISITS[wv].pass;
     const Layer& layer = w.layers[l];
     const bool msgs = is_loop_layer(l) && p > 0;
     const bool boundary = l % BLOCK == 0;
-    const std::vector<const float*> blocks = blocks_of(l, p, B0_, B1_, B2_, E_);
+    const std::vector<const float*> blocks = blocks_of(l, p, B0_, B1_, B2_, E_, coda_pass);
 
     // ---- hidden entering this visit (the previous MLP write applied), stored where it is a block
     float* hid;
     const float* base;
     const float* write;
-    if (v == 0) {
+    if (reference && l == LOOP_END) {
+      hid = E_[coda_pass], base = hid, write = nullptr;
+    } else if (v == 0) {
       hid = B0_, base = B0_, write = nullptr;
     } else if (l == LOOP_START && p > 0) {
       hid = B1_, base = B1_, write = nullptr;
     } else {
-      hid = l == 6 ? B1_ : l == 12 ? B2_[p] : l == 18 ? E_[2] : hid_;
+      hid = l == 6 ? B1_ : l == 12 ? B2_[p] : l == LOOP_END ? E_[coda_pass] : hid_;
       base = part_, write = y2_;
     }
     const int pv = prev_v >= 0 ? prev_v : 0;
     const float* r_prev = mlp_dirs + std::size_t(pv) * H;
     const float* w_prev = mlp_w + 4 * std::size_t(pv);
+    if (l == LOOP_END && loopcd.hidden()) {
+      if (abl_.active) {
+        dense::mix(mix_params({}, base, write, r_prev, w_prev, hid, nullptr, 1, nullptr, nullptr, nullptr), false, s);
+        base = hid, write = nullptr;
+      }
+      dense::loopcd_hidden(base, write, E_[loopcd.ref_idx], hid, B2_[PASSES - 1], B2_[loopcd.ref_idx],
+                           slab, loopcd.omega, s);
+      base = hid, write = nullptr;
+    }
     dense::MixParams msg_mix;
     if (msgs) {
       const int i = l - LOOP_START;
@@ -381,7 +428,7 @@ void Prefiller::run(State& st, const std::int32_t* tokens, int T, int pos0, floa
     at.q = q_, at.T = T, at.pos0 = pos0, at.rel = rel_, at.proj = proj_, at.ld = R, at.out = attn_out_;
     at.hkv = layout_.hkv_local;
     if (layer.full) {
-      const int fi = FULL_INDEX[v];
+      const int fi = full_cache_index(v);
       const Tensor k = st.k_full_at(fi), value = st.v_full_at(fi);
       const std::size_t off = std::size_t(pos0) * k.nb[2];
       void* kc = k.data;
@@ -401,7 +448,7 @@ void Prefiller::run(State& st, const std::int32_t* tokens, int T, int pos0, floa
       at.k = kc, at.v = vc, at.kv_fp8 = st.kv_fp8, at.kpos = nullptr, at.bounds = nullptr, at.L = pos0 + T;
       at.window = 0;
     } else {
-      const int ri = RING_INDEX[v];
+      const int ri = ring_cache_index(v);
       auto* k_ring = static_cast<__nv_bfloat16*>(st.k_ring_at(ri).data);
       auto* v_ring = static_cast<__nv_bfloat16*>(st.v_ring_at(ri).data);
       std::int64_t* ring_pos = st.ring_pos_at(ri);
@@ -453,14 +500,14 @@ void Prefiller::run(State& st, const std::int32_t* tokens, int T, int pos0, floa
     const float* mbase = boundary ? nullptr : hid;
     if (msgs) {
       if (use_gate_fuse) {
-        dense::mix(mix_params(mlp_blocks, mbase, y_, attn_dirs + std::size_t(v) * H, attn_w + 4 * std::size_t(v), part_,
+        dense::mix(mix_params(mlp_blocks, mbase, y_, attn_dirs + std::size_t(wv) * H, attn_w + 4 * std::size_t(wv), part_,
                               f32p(layer.mlp_query), 1, nullptr, mixm_bf16, nullptr), false, s);
         pk::GateRowsBf16 rows;
         rows.h[0] = mixm_bf16, rows.msg[0] = msgs_bf16 + 3 * slab;
         gates_bf16(rows, 1, layer.mlp1_gate_down, layer.mlp1_gate_forget16, layer.mlp1_gate_gain16,
                    f32p(layer.mlp_norm1), xm_);
       } else {
-        dense::mix(mix_params(mlp_blocks, mbase, y_, attn_dirs + std::size_t(v) * H, attn_w + 4 * std::size_t(v), part_,
+        dense::mix(mix_params(mlp_blocks, mbase, y_, attn_dirs + std::size_t(wv) * H, attn_w + 4 * std::size_t(wv), part_,
                               f32p(layer.mlp_query), 1, nullptr, nullptr, mixm_), false, s);
         pk::GateRows rows;
         rows.h[0] = mixm_, rows.msg[0] = msgs_ + 3 * slab;
@@ -468,7 +515,7 @@ void Prefiller::run(State& st, const std::int32_t* tokens, int T, int pos0, floa
               xm_);
       }
     } else {
-      dense::mix(mix_params(mlp_blocks, mbase, y_, attn_dirs + std::size_t(v) * H, attn_w + 4 * std::size_t(v), part_,
+      dense::mix(mix_params(mlp_blocks, mbase, y_, attn_dirs + std::size_t(wv) * H, attn_w + 4 * std::size_t(wv), part_,
                             f32p(layer.mlp_query), 1, f32p(layer.mlp_norm1), xm_, nullptr), false, s);
     }
 
@@ -493,31 +540,20 @@ void Prefiller::run(State& st, const std::int32_t* tokens, int T, int pos0, floa
       pk::moe_combine(down_, wts_, T, moe_sum_, s);
     }
     post_conv(moe_sum_, layer.mlp_conv, st.conv_mlp_at(v), y2_);
-    prev_v = v;
+    prev_v = wv;
   }
 
-  // ---- final read, taps, head of the last row
   st.length = pos0 + T;
-  if (!emit_head && !tap_out) return;
-  dense::mix(mix_params({B0_, B1_, B2_[2], E_[2]}, part_, y2_, mlp_dirs + std::size_t(prev_v) * H,
-                        mlp_w + 4 * std::size_t(prev_v), nullptr, f32p(w.final_query), 1, f32p(w.final_norm), xf_, nullptr),
-             false, s);
-  if (tap_out)
-    CUDA_CHECK(cudaMemcpy2DAsync(tap_out + std::size_t(NUM_TAPS - 1) * H, std::size_t(NUM_TAPS) * H * 2, xf_,
-                                 std::size_t(H) * 2, std::size_t(H) * 2, T, cudaMemcpyDeviceToDevice, s));
-  const auto* final_x = xf_ + std::size_t(T - 1) * H;
-  if (!emit_head) {
+  if (uses_ref_coda) {
+    if (emit_head) {
+      finish(true);
+      dense::loopcd_combine_logits(logits, ref_logits_, 1, UNPADDED_VOCAB, UNPADDED_VOCAB,
+                                  loopcd.mode, loopcd.omega, s);
+    }
     CUDA_CHECK(cudaGetLastError());
-    return;
+  } else {
+    finish(false);
   }
-  if (tp_)
-    tp_->head(w, final_x, logits, greedy, 1, TpSchedule::Prefill, s);
-  else if (w.unembed_nvfp4.codes)
-    kernels::head::head_nvfp4(final_x, 1, w.unembed_nvfp4, logits, nullptr, nullptr, false, s);
-  else
-    pk::head_logits(final_x, w.unembed.w.data, f32p(w.unembed.scale), UNPADDED_VOCAB, logits, s,
-                    w.unembed.matrix().pico12);
-  CUDA_CHECK(cudaGetLastError());
 }
 
 }  // namespace ingine::model

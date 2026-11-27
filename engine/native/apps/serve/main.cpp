@@ -81,7 +81,9 @@ int main(int argc, char** argv) {
   bool tp_profile = false;
   int tp_size = -1, tp_rank = -1;
   std::string tp_wire;
-  std::string spec_widths = "coarse";
+  std::string spec_widths = "coarse", loopcd = "off";
+  double loopcd_omega = 0.0;
+  int loopcd_ref = 1;
   double hybrid_dflash2_threshold = 0.50;
   int dflash2_max_ctx = 1536;
   bool dflash2_adaptive = false;
@@ -109,6 +111,10 @@ int main(int argc, char** argv) {
           &kv_fp8);
   ap.flag("--kv-q4", "Q4_G64 INT4 full-attention KV caches", &kv_q4);
   ap.flag("--kv-12", "Bit-exact KV12 full-attention KV caches", &kv_12);
+  ap.option("--loopcd", "{off,hidden,logits,adaptive}", "LoopCD contrastive decoding (default off)", &loopcd,
+            {"off", "hidden", "logits", "adaptive"});
+  ap.option("--loopcd-omega", "<float>", "LoopCD weight (default 0.3 for hidden/logits, 0.5 for adaptive)", &loopcd_omega);
+  ap.option("--loopcd-ref", "<int>", "Reference loop pass (1 or 2, default 1)", &loopcd_ref);
   ap.option("--spec-widths", "{coarse,fine,fine2}", "verify widths: 2/4/8, 1..8 or 2..8", &spec_widths, {"coarse", "fine", "fine2"});
   ap.option("--draft-type", "", "Drafter implementation", &draft_type, {"dspark", "dflash2", "hybrid"});
   ap.flag("--dflash2-adaptive", "Choose verify width using DFlash2 selector confidence", &dflash2_adaptive);
@@ -187,6 +193,10 @@ int main(int argc, char** argv) {
   try {
     ingine::model::validate_dense_formats(dense_fp8, dense_pico12);
     ingine::model::validate_kv_formats(kv_fp8, kv_q4, kv_12);
+    ingine::model::RuntimeOptions options;
+    ingine::model::set_loopcd_options(options, loopcd,
+                                     ap.given("--loopcd-omega") ? std::optional(loopcd_omega) : std::nullopt,
+                                     loopcd_ref);
     std::unique_ptr<ingine::model::Generator> generator;
     std::optional<ingine::text::ChatFormat> format;
     if (fake) {
@@ -196,7 +206,6 @@ int main(int argc, char** argv) {
           fake_delay);
     } else {
 #ifdef INGINE_WITH_MODEL
-      ingine::model::RuntimeOptions options;
       options.model_dir = model_dir;
       options.ablation = ablation;
       options.max_ctx = max_ctx;

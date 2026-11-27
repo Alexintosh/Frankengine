@@ -51,9 +51,9 @@ HeadWeights load_head(const std::filesystem::path& model_dir, bool dense_fp8, bo
                       std::vector<DeviceBuffer>& storage, const TpLayout& tp = TpLayout{}, bool dense_pico12 = false);
 
 State make_state(int max_ctx, bool kv_fp8, const TpLayout& layout = TpLayout{}, bool kv_q4 = false,
-                 bool kv_12 = false);
+                 bool kv_12 = false, LoopCdConfig loopcd = {});
 Buffers make_buffers(int m, const TpLayout& tp = TpLayout{}, bool full_logits = false, bool mixed = false,
-                     bool cert_head = false);
+                     bool cert_head = false, bool uses_ref_coda = false);
 
 // model.State.reset: ring_pos = -1, conv states = 0, length = 0 (caches keep their contents).
 void reset_state(State& state, cudaStream_t stream);
@@ -65,6 +65,13 @@ struct BatchSlotTable {
   kernels::attn::BatchAttnSlot attn[NUM_VISITS][8];
   float* attn_conv[NUM_VISITS][8];
   float* mlp_conv[NUM_VISITS][8];
+};
+
+// Appended to BatchSlotTable only when the reference coda runs.
+struct BatchRefSlotTable {
+  kernels::attn::BatchAttnSlot attn[CODA_VISITS][8];
+  float* attn_conv[CODA_VISITS][8];
+  float* mlp_conv[CODA_VISITS][8];
 };
 
 // ---- fast.FastDecoder
@@ -86,8 +93,10 @@ class Decoder {
   void allocate_batch_workspace(int max_batch);
 
  private:
+  friend struct LoopCdTestAccess;
   void decode_impl(Buffers& b, const std::int64_t* pos, bool history, cudaStream_t stream,
-                   TpReduction reduction, const BatchSlotTable* slots, bool greedy_only);
+                   TpReduction reduction, const BatchSlotTable* slots, bool greedy_only,
+                   int loop_passes = PASSES);
   const std::int64_t* block_table(const std::vector<const float*>& blocks);
 
   const Weights& w_;
@@ -161,7 +170,7 @@ class Runtime {
   void set_inputs(std::span<const std::int32_t> tokens, int position);
   // A certified TP=1 greedy-only step writes buffers(m).greedy and returns nullptr.
   // TP=2 selects logits or IDs through its existing rank configuration.
-  bool has_cert_head() const { return weights_.unembed_certified.bounds != nullptr; }
+  bool has_cert_head() const { return !state_.loopcd.uses_ref_coda() && weights_.unembed_certified.bounds != nullptr; }
   const float* run_step(int m, bool greedy_only = false);
   // set_inputs + run_step for one token (engine._decode_logits).
   const float* decode_logits(std::int32_t token, int position);
