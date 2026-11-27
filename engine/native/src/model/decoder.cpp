@@ -25,6 +25,7 @@ bool fuse_mlp_prologue_enabled() {
     if (std::strcmp(flag, "0") == 0) return false;
     if (std::strcmp(flag, "1") == 0) return true;
   }
+  if (const char* rma = std::getenv("INGINE_ROUTER_MMA"); rma && rma[0] == '0') return false;
   return dense::mlp_prologue_default_enabled();
 }
 
@@ -366,14 +367,7 @@ void Decoder::decode_impl(Buffers& b, const std::int64_t* pos, bool history, cud
     std::vector<const float*> mlp_blocks = blocks;
     if (boundary) mlp_blocks.push_back(hid);
     const float* mbase = boundary ? nullptr : hid;
-    const bool fuse_mlp = [&] {
-      const char* e = std::getenv("INGINE_DECODER_FUSE_MLP_PROLOGUE");
-      if (e && e[0] == '0' && e[1] == '\0') return false;
-      if (e && e[0] == '1' && e[1] == '\0') return true;
-      return dense::mlp_prologue_default_enabled();
-    }();
-    const bool fuse_visit = fuse_mlp && !simulation_ && !profile && !msgs && m >= 2 &&
-        layer.mlp_query.ne[1] == 1 && mlp_blocks.size() <= 5;
+    const bool fuse_visit = fuse_mlp && !msgs && layer.mlp_query.ne[1] == 1 && mlp_blocks.size() <= 5;
     dense::MixParams mp =
         msgs ? mix_params(mlp_blocks, mbase, f32p(b.y), attn_dirs + std::size_t(wv) * H, attn_w + 4 * std::size_t(wv), f32m(b.part),
                           &layer.mlp_query, nullptr, nullptr, f32m(b.mixm))

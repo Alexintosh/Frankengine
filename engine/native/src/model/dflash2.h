@@ -17,7 +17,7 @@ namespace ingine::model {
 // In-order committed context. Proposal KV is held separately from the ring.
 bool dflash2_full_head();
 bool dflash2_shard_backbone();
-bool dflash2_gqa();
+bool dflash2_gqa(int tp_size = 1);
 bool dflash2_shard_fp32();
 
 class DFlash2Head;

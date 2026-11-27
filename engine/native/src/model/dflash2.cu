@@ -1147,7 +1147,7 @@ struct DFlash2::Impl {
     const bool fused_proj = enabled_by_default("INGINE_DFLASH2_FUSED_PROJ");
     if (dump_dir.empty())
       device_position = allocate<int>(1);
-    gqa = dflash2_gqa();
+    gqa = dflash2_gqa(tp_size);
     SafetensorsModel model(path);
     auto upload = [&](const std::string& name, std::vector<std::int64_t> shape, DeviceBuffer& buffer) {
       const auto tensor = model.at(name);
@@ -2028,7 +2028,7 @@ void DFlash2::launch_proposal(int max_position, bool may_be_short) {
     d.profile.used = d.graph_profile_spans[graph_index];
     CUDA_CHECK(cudaGraphLaunch(graph, d.s));
   } else {
-    launch(nullptr);
+    launch(d.device_position);
     d.warmed = true;
   }
 }
@@ -2136,9 +2136,12 @@ bool dflash2_shard_backbone() {
   return !value || std::string_view(value) != "0";
 }
 
-bool dflash2_gqa() {
+bool dflash2_gqa(int tp_size) {
   const char* value = std::getenv("INKLING_DFLASH2_GQA");
   if (value) return std::string_view(value) != "0";
+  // Auto-enable on high-SM single-GPU hosts (TP=1); keep TP>1 explicit so heterogeneous
+  // ranks never compute mismatched rendezvous schedules from local SM counts.
+  if (tp_size > 1) return false;
   int device = 0, sms = 0;
   if (cudaGetDevice(&device) != cudaSuccess ||
       cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device) != cudaSuccess) {

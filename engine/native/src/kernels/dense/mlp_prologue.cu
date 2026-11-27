@@ -2,7 +2,10 @@
 // mix.cu and router.cu. Each owning CTA writes its normalized BF16 token to L2 (a.out_bf16),
 // synchronizes across the cluster, triggers PDL for moe_up right before routing, and runs
 // BF16 Tensor Core router MMA with DSMEM logit gather.
+#include <array>
+#include <atomic>
 #include <cooperative_groups.h>
+#include <mutex>
 
 #include "kernels/common/l2.cuh"
 #include "kernels/common/nvfp4.cuh"
@@ -59,7 +62,7 @@ __device__ __forceinline__ void sum_part(float (&v)[N], float* scratch, int u) {
 template <int N>
 __device__ __forceinline__ float sum_lane(const float* scratch) {
   constexpr int S = block_sum_slots<N>();
-  asm volatile("bar.sync 1, 192;" ::: "memory");  // Only the first six warps run mix.
+  asm volatile("barrier.cta.sync 1, 192;" ::: "memory");  // Only the first six warps run mix (non-aligned partial CTA barrier).
   const int lane = threadIdx.x & 31;
   float s = 0.f;
   if (lane < N) {
@@ -298,7 +301,7 @@ __device__ __forceinline__ void mix_one_token(const MixParams& a, const MixWeigh
   float4 nw[MixWeights::QUADS];
   mix_residual(a, w, m, scratch, nw);
   // The first warp prefetched the pointer table before PDL. Publish it to the other mix warps.
-  if (a.nblocks) asm volatile("bar.sync 1, 192;" ::: "memory");
+  if (a.nblocks) asm volatile("barrier.cta.sync 1, 192;" ::: "memory");
   switch (a.nblocks) {
     case 0: mix_row<1, STAGE_MIX>(a, w, m, scratch, nw, staged); break;
     case 1: mix_row<2, STAGE_MIX>(a, w, m, scratch, nw, staged); break;
@@ -317,8 +320,8 @@ struct SelectionScratch {
 };
 
 template <int NT, int KPARTS>
-__device__ __forceinline__ void select_top8(int m, const float* logits, float b, int* idx, float* wts,
-                                                SelectionScratch& scratch) {
+__device__ __forceinline__ void select_top8(int m, const float (&logits)[KPARTS][EXPERTS], float b, int* idx, float* wts,
+                                            SelectionScratch& scratch) {
   // selection: unique 39-bit keys (order-preserving bits of v, then 127 - e: ties go to the lower expert),
   // rank = number of greater keys. Count the greater keys in NT / 128 partitions of the key range.
   const int t = threadIdx.x;
@@ -326,8 +329,8 @@ __device__ __forceinline__ void select_top8(int m, const float* logits, float b,
   auto& [keys, cnt, sel_s, sel_e] = scratch;
   float s = 0.f;
   if (t < EXPERTS) {
-    float logit = logits[t];
-    if constexpr (KPARTS == 2) logit += logits[EXPERTS + t];
+    float logit = logits[0][t];
+    if constexpr (KPARTS == 2) logit += logits[1][t];
     s = 1.f / (1.f + expf(-logit));
     const uint32_t u = __float_as_uint(s + b + 0.f);  // + 0: -0 -> +0, which compares equal
     const uint32_t o = (u & 0x80000000u) ? ~u : (u | 0x80000000u);
@@ -473,7 +476,7 @@ __device__ __forceinline__ void route(const RouterArgs& a, int rank, int M,
   }
   if (rank < M) {
     mb_wait(mb_l);
-    select_top8<R::NT, R::KPARTS>(rank, &s.logits[0][0], bias_e, a.idx, a.wts, s.selection);
+    select_top8<R::NT, R::KPARTS>(rank, s.logits, bias_e, a.idx, a.wts, s.selection);
   }
 }
 
@@ -522,41 +525,46 @@ __global__ void __launch_bounds__(RouterCfg<CL>::NT) mix_router_kernel(MixParams
   route<CL>(router, rank, a.M, rw, bias_e, xs, route_s, mb_l);
 }
 
-// Check 16-CTA cluster launchability once per device. GB10 uses the 8-CTA kernel when forced on.
+// Cache the per-device 16-CTA occupancy check once across host threads; launch_ex still sets
+// per-kernel launch attributes (including non-portable cluster / dynamic SMEM opt-ins).
 int prologue_cluster_size() {
-  struct Selection {
-    int device = -1;
-    int cl = 8;
-  };
-  static thread_local Selection selected;
-  int device;
+  static constexpr int kMaxCachedDevices = 64;
+  static std::array<std::atomic<int>, kMaxCachedDevices> cache{};
+  static std::mutex mu;
+  int device = 0;
   CUDA_CHECK(cudaGetDevice(&device));
-  if (device != selected.device) {
-    int sms;
-    CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device));
-    int active = 0;
-    if (sms >= 96) {
-      auto kernel = mix_router_kernel<16>;
-      constexpr int SMEM = sizeof(RouterCfg<16>::X);
-      cudaLaunchAttribute attr{};
-      attr.id = cudaLaunchAttributeClusterDimension;
-      attr.val.clusterDim = {16, 1, 1};
-      cudaLaunchConfig_t cfg{};
-      cfg.gridDim = dim3(16);
-      cfg.blockDim = dim3(RouterCfg<16>::NT);
-      cfg.dynamicSmemBytes = SMEM;
-      cfg.attrs = &attr;
-      cfg.numAttrs = 1;
-      if (cudaFuncSetAttribute(kernel, cudaFuncAttributeNonPortableClusterSizeAllowed, 1) != cudaSuccess ||
-          cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM) != cudaSuccess ||
-          cudaOccupancyMaxActiveClusters(&active, kernel, &cfg) != cudaSuccess) {
-        (void)cudaGetLastError();
-        active = 0;
-      }
-    }
-    selected = {device, active > 0 ? 16 : 8};
+  if (device >= 0 && device < kMaxCachedDevices) {
+    if (const int cached = cache[device].load(std::memory_order_acquire)) return cached;
   }
-  return selected.cl;
+  std::lock_guard<std::mutex> lock(mu);
+  if (device >= 0 && device < kMaxCachedDevices) {
+    if (const int cached = cache[device].load(std::memory_order_relaxed)) return cached;
+  }
+  int sms = 0;
+  CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device));
+  int active = 0;
+  if (sms >= 96) {
+    auto kernel = mix_router_kernel<16>;
+    constexpr int SMEM = sizeof(RouterCfg<16>::X);
+    cudaLaunchAttribute attr{};
+    attr.id = cudaLaunchAttributeClusterDimension;
+    attr.val.clusterDim = {16, 1, 1};
+    cudaLaunchConfig_t cfg{};
+    cfg.gridDim = dim3(16);
+    cfg.blockDim = dim3(RouterCfg<16>::NT);
+    cfg.dynamicSmemBytes = SMEM;
+    cfg.attrs = &attr;
+    cfg.numAttrs = 1;
+    if (cudaFuncSetAttribute(kernel, cudaFuncAttributeNonPortableClusterSizeAllowed, 1) != cudaSuccess ||
+        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM) != cudaSuccess ||
+        cudaOccupancyMaxActiveClusters(&active, kernel, &cfg) != cudaSuccess) {
+      (void)cudaGetLastError();
+      active = 0;
+    }
+  }
+  const int cl = active > 0 ? 16 : 8;
+  if (device >= 0 && device < kMaxCachedDevices) cache[device].store(cl, std::memory_order_release);
+  return cl;
 }
 
 void validate_mix(const MixParams& mp) {

@@ -351,6 +351,95 @@ void device_loop_parity(const std::filesystem::path& checkpoint) {
 }
 }  // namespace
 
+void fast_kernels_crossing_parity(const std::filesystem::path& checkpoint, const Inputs& in, cudaStream_t stream) {
+  INGINE_CHECK(setenv("INKLING_DFLASH2_PRECISION", "fp8", 1) == 0);
+  INGINE_CHECK(setenv("INGINE_DFLASH2_FUSED_PROJ", "1", 1) == 0);
+  INGINE_CHECK(setenv("INGINE_DFLASH2_FUSED_HEAD", "0", 1) == 0);
+  INGINE_CHECK(setenv("INGINE_DFLASH2_GEMV_TOPK", "0", 1) == 0);
+  const auto* taps = static_cast<const Bf*>(in.taps.p);
+  const auto* embeddings = static_cast<const Bf*>(in.embeddings.p);
+  auto bf16_to_f32 = [](std::uint16_t bits) {
+    std::uint32_t u = std::uint32_t(bits) << 16;
+    float f;
+    std::memcpy(&f, &u, sizeof(f));
+    return f;
+  };
+  auto run_pos = [&](bool fast, int pos) {
+    INGINE_CHECK(setenv("INGINE_DFLASH2_FAST_KERNELS", fast ? "1" : "0", 1) == 0);
+    DFlash2 draft(checkpoint, stream, false, nullptr, 1, 0);
+    draft.bind_head(in.head, static_cast<const Bf*>(in.embed.p), static_cast<const float*>(in.norms.p));
+    draft.commit(taps, pos, 0);
+    const auto* hidden = draft.forward(embeddings);
+    auto h = copy_device<std::uint16_t>(hidden, G * H, stream);
+    auto tok = copy_device<int>(draft.propose(1), G, stream);
+    return std::pair(std::move(h), std::move(tok));
+  };
+  // Check both sides of the short_attention cutoff (120+8 == 128 vs 121+8 == 129).
+  for (int pos : {120, 121}) {
+    const auto [h0, t0] = run_pos(false, pos);
+    const auto [h1, t1] = run_pos(true, pos);
+    double sum_sq_err = 0.0, sum_sq_ref = 0.0;
+    float max_diff = 0.f, worst_ref = 0.f;
+    int max_ulp = 0;
+    for (std::size_t i = 0; i < h0.size(); ++i) {
+      const float a = bf16_to_f32(h0[i]), b = bf16_to_f32(h1[i]);
+      const float d = std::fabs(a - b);
+      if (d > max_diff) {
+        max_diff = d;
+        worst_ref = a;
+      }
+      sum_sq_err += double(d) * d;
+      sum_sq_ref += double(a) * a;
+      if ((h0[i] ^ h1[i]) < 0x8000u)
+        max_ulp = std::max(max_ulp, std::abs(int(h0[i]) - int(h1[i])));
+    }
+    const double rel_rms = std::sqrt(sum_sq_err / std::max(sum_sq_ref, 1e-12));
+    std::printf("DFlash2 fast vs legacy pos=%d rel_rms=%.6f max_abs=%.6f (at ref=%.4f) max_ulp=%d tok_match=%d\n",
+                pos, rel_rms, max_diff, worst_ref, max_ulp, int(t0 == t1));
+    INGINE_CHECK(rel_rms < 0.03);
+    INGINE_CHECK(t0 == t1);
+  }
+  // Check crossing graph replay landing on short (118+2 == 120) and long (118+4 == 122) sides,
+  // including first-call advance() before any propose() warmup.
+  INGINE_CHECK(setenv("INGINE_DFLASH2_FAST_KERNELS", "1", 1) == 0);
+  DFlash2 draft(checkpoint, stream, false, nullptr, 1, 0);
+  draft.bind_head(in.head, static_cast<const Bf*>(in.embed.p), static_cast<const float*>(in.norms.p));
+  constexpr int Start = 118, Next = 2;
+  DeviceBuffer control(3 * sizeof(int)), prefix(draft.checkpoint_bytes());
+  const auto* args = static_cast<const int*>(control.p);
+  kd::RoundInputs round;
+  round.nwidths = 2;
+  round.widths[0] = 2;
+  round.widths[1] = 4;
+  round.taps[0] = taps + std::size_t(Start) * 4 * H;
+  round.taps[1] = taps + std::size_t(Start) * 4 * H;
+  round.m = args;
+  round.accepted = args + 1;
+  round.next_greedy = args + 2;
+  draft.bind_round(round);
+  draft.commit(taps, Start, 0);
+  draft.save_checkpoint(prefix.p);
+  for (int pass = 0; pass < 2; ++pass) {
+    for (int accepted : {1, 3}) {
+      const int inputs[] = {accepted + 1, accepted, Next};
+      draft.restore_checkpoint(prefix.p, Start);
+      control.copy_from_host(inputs, sizeof(inputs));
+      INGINE_CHECK(draft.advance(Start, true, 0.f, 0));
+      draft.advanced(accepted + 1);
+      const auto graph_tok = copy_device<int>(draft.tokens_device(), G, stream);
+      const auto graph_conf = copy_device<float>(draft.confidence(), G, stream);
+      draft.restore_checkpoint(prefix.p, Start);
+      draft.commit(round.taps[0], accepted + 1, Start, true);
+      const auto eager_tok = copy_device<int>(draft.propose(Next), G, stream);
+      const auto eager_conf = copy_device<float>(draft.confidence(), G, stream);
+      INGINE_CHECK(graph_tok == eager_tok);
+      INGINE_CHECK(graph_conf == eager_conf);
+    }
+  }
+  unsetenv("INGINE_DFLASH2_FAST_KERNELS");
+  std::puts("PASS DFlash2 fast vs legacy crossing cutoff (pos=120/121 & crossing graph)");
+}
+
 int main() {
   if (skip_without_gpu()) return kSkip;
   const char* dir = std::getenv("INKLING_DFLASH2_DIR");
@@ -369,6 +458,7 @@ int main() {
   {
     const Inputs inputs(stream);
     sharded_head_offset(inputs, stream);
+    fast_kernels_crossing_parity(checkpoint, inputs, stream);
     for (const char* precision : {"fp8", "hybrid", "nvfp4", "bf16"}) {
       const bool nvfp4 = std::string_view(precision) == "nvfp4";
       if (nvfp4) unsetenv("INKLING_DFLASH2_PRECISION");

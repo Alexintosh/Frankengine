@@ -110,7 +110,7 @@ comm::CommPlan make_plan(const RuntimeOptions& options) {
           schedule | (std::uint64_t(dflash2_active &&
                     options.head_nvfp4 && !dflash2_full_head()) << 49) | (std::uint64_t(options.tp.serve) << 48) |
                     (std::uint64_t(options.spec_widths) << 46) | (std::uint64_t(shard_dflash2) << 45) |
-                    (std::uint64_t(shard_dflash2 && dflash2_gqa()) << 44) |
+                    (std::uint64_t(shard_dflash2 && dflash2_gqa(options.tp.size)) << 44) |
                     (std::uint64_t(shard_dflash2 && dflash2_shard_fp32()) << 43)};
 }
 
