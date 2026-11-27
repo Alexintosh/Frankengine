@@ -575,6 +575,131 @@ bool test_fp8_rows(Rng& rng) {
   return ok;
 }
 
+template <class T>
+bool same_bits(const DeviceArray<T>& ref, const DeviceArray<T>& got) {
+  const auto a = ref.download(), b = got.download();
+  return std::memcmp(a.data(), b.data(), a.size() * sizeof(T)) == 0;
+}
+
+bool test_mlp_prologue(Rng& rng, int M, int NS, int ablation, bool ties, bool pdl) {
+  const size_t n = size_t(M) * H;
+  std::vector<DeviceArray<float>> blocks;
+  std::vector<const float*> ptrs;
+  for (int i = 1; i < NS; ++i) {
+    blocks.emplace_back(randn(rng, n, 0.5 + 0.5 * i));
+    ptrs.push_back(blocks.back().get());
+  }
+  DeviceArray<const float*> table(ptrs);
+  DeviceArray<float> source(randn(rng, n, 0.7)), input(n), base(randn(rng, n, 1.0)), query(randn(rng, H, 0.8));
+  DeviceArray<float> direction(randn(rng, H, 0.02)), detector(randn(rng, H, 0.03));
+  const std::vector<float> params = {0.8f, ablation == 1 ? 0.f : 0.04f,
+                                    ablation == 1 ? std::numeric_limits<float>::lowest() : 0.f, -0.1f};
+  auto norm = randn(rng, H, 0.1);
+  for (float& v : norm) v += 1.f;
+  DeviceArray<float> abl(params), norm_w(norm);
+
+  auto router_w = randn_bf16(rng, 128 * H, 0.02);
+  auto router_b = randn(rng, 128, 0.1);
+  if (ties) {
+    // Equal scores across expert tiles with the top-8 boundary inside a tied group.
+    for (int e : {0, 3, 22, 40, 65, 81, 96, 116, 127}) {
+      if (e != 0) std::copy_n(router_w.data(), H, router_w.data() + e * H);
+      router_b[e] = 2.f;
+    }
+  }
+  DeviceArray<__nv_bfloat16> rw(to_bf16(router_w));
+  DeviceArray<float> rb(router_b);
+
+  // Alternate history widths to cover both TP layouts and preserve padding in the destination.
+  const int cols = ties ? 512 : 1024, src_stride = 2 * cols + 32, dst_stride = cols + 4;
+  DeviceArray<float> proj(randn(rng, size_t(M) * src_stride, 1.0));
+  struct Outputs {
+    Outputs(size_t n, int M, int stride)
+        : part(n), history(size_t(2 * M) * stride), wts(size_t(M) * 8), xm(n), idx(size_t(M) * 8) {}
+    DeviceArray<float> part, history, wts;
+    DeviceArray<__nv_bfloat16> xm;
+    DeviceArray<int> idx;
+  } ref(n, M, dst_stride), got(n, M, dst_stride);
+
+  const auto run = [&](Outputs& out, bool fused) {
+    dense::MixParams mp;
+    mp.M = M;
+    mp.nblocks = NS - 1;
+    mp.blocks = mp.nblocks ? table.get() : nullptr;
+    mp.base = NS % 2 == 0 ? nullptr : base.get();
+    mp.write = fused ? input.get() : source.get();
+    mp.queries = mp.nblocks ? query.get() : nullptr;
+    mp.abl_r = ablation ? direction.get() : nullptr;
+    mp.abl_d = ablation == 2 ? detector.get() : nullptr;
+    mp.abl_w = abl.get();
+    mp.partial_out = out.part.get();
+    mp.norm_w = norm_w.get();
+    mp.out_bf16 = out.xm.get();
+    for (int c = 0; c < 2; ++c)
+      mp.copies[c] = {proj.get() + 16 + c * cols, src_stride,
+                      out.history.get() + size_t(c * M) * dst_stride, dst_stride, cols};
+
+    if (!fused) {
+      dense::mix(mp, pdl, g_stream);
+      dense::router(out.xm.get(), M, rw.get(), false, rb.get(), out.idx.get(), out.wts.get(), pdl, g_stream);
+      return;
+    }
+
+    // Publish a real activation from a predecessor kernel in eager and graph launches.
+    dense::MixParams producer;
+    producer.M = M;
+    producer.base = source.get();
+    producer.partial_out = input.get();
+    dense::mix(producer, pdl, g_stream);
+    dense::mix_router(mp, rw.get(), rb.get(), out.idx.get(), out.wts.get(), pdl, g_stream);
+  };
+
+  const auto check = [&](const char* mode) {
+    sync();
+    const bool part = same_bits(ref.part, got.part), history = same_bits(ref.history, got.history);
+    const bool xm = same_bits(ref.xm, got.xm), idx = same_bits(ref.idx, got.idx);
+    const bool wts = same_bits(ref.wts, got.wts);
+    const bool ok = part && history && xm && idx && wts;
+    if (!ok)
+      std::printf("FAIL mix_router M=%d NS=%d ablation=%d ties=%d PDL=%d %s: part=%d history=%d BF16=%d idx=%d wts=%d\n",
+                  M, NS, ablation, ties, pdl, mode, part, history, xm, idx, wts);
+    return ok;
+  };
+  run(ref, false);
+  run(got, true);
+  bool ok = check("eager");
+
+  cudaGraph_t graph;
+  cudaGraphExec_t exec;
+  INGINE_TEST_CUDA(cudaStreamBeginCapture(g_stream, cudaStreamCaptureModeThreadLocal));
+  run(got, true);
+  INGINE_TEST_CUDA(cudaStreamEndCapture(g_stream, &graph));
+  INGINE_TEST_CUDA(cudaGraphInstantiate(&exec, graph, 0));
+  for (int replay = 0; replay < 2; ++replay) {
+    // Both replays must read the current activations and copy the current history rows.
+    source.upload(randn(rng, n, 0.7));
+    proj.upload(randn(rng, size_t(M) * src_stride, 1.0));
+    run(ref, false);
+    INGINE_TEST_CUDA(cudaGraphLaunch(exec, g_stream));
+    ok &= check("graph");
+  }
+  INGINE_TEST_CUDA(cudaGraphExecDestroy(exec));
+  INGINE_TEST_CUDA(cudaGraphDestroy(graph));
+  return ok;
+}
+
+bool test_mlp_prologues() {
+  const ScopedEnv router("INGINE_ROUTER_MMA", "1");
+  Rng rng(20261127);
+  bool ok = true;
+  for (int M : {2, 3, 4, 8}) {
+    for (int NS = 1; NS <= 6; ++NS)
+      ok &= test_mlp_prologue(rng, M, NS, (M + NS) % 3, NS % 2 == 0, M != 4);
+  }
+  std::printf("%s MLP prologue (mix_router): bit-exact eager and graph parity\n", ok ? "PASS" : "FAIL");
+  return ok;
+}
+
 // ---- Bitwise lock. mix and the scalar message_gates and router paths are exact: on fixed inputs they must keep giving the bits
 // recorded in kLock (taken from kernels checked byte for byte against the implementation they were ported
 // from). A changed hash means the arithmetic changed (order of a sum, an FMA contraction the compiler chose
@@ -811,6 +936,7 @@ int main() {
     for (int M : {2, 4, 8})
       for (bool shared : {false, true}) ok &= test_gates_mma(rng, G, M, shared);
   ok &= test_gates_mma(rng, 3, 3, true);  // partial final input staging group
+  ok &= test_mlp_prologues();
   ok &= test_bit_lock();
   INGINE_TEST_CUDA(cudaStreamDestroy(g_stream));
   std::printf("%s\n", ok ? "ALL PASS" : "SOME FAILED");

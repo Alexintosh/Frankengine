@@ -9,6 +9,8 @@
 #include "kernels/moe/moe.h"
 
 #include <algorithm>
+#include <cstdlib>
+#include <cstring>
 #include <stdexcept>
 
 namespace ingine::model {
@@ -17,6 +19,14 @@ namespace moe = kernels::moe;
 namespace attn = kernels::attn;
 
 namespace {
+
+bool fuse_mlp_prologue_enabled() {
+  if (const char* flag = std::getenv("INGINE_DECODER_FUSE_MLP_PROLOGUE")) {
+    if (std::strcmp(flag, "0") == 0) return false;
+    if (std::strcmp(flag, "1") == 0) return true;
+  }
+  return dense::mlp_prologue_default_enabled();
+}
 
 const float* f32p(const Tensor& t) { return static_cast<const float*>(t.data); }
 float* f32m(const Tensor& t) { return static_cast<float*>(t.data); }
@@ -104,6 +114,7 @@ void Decoder::decode_impl(Buffers& b, const std::int64_t* pos, bool history, cud
   const int m = b.m;
   const int H = HIDDEN;
   const bool pdl = pdl_;
+  const bool fuse_mlp = !simulation_ && !profile && m >= 2 && m <= 8 && fuse_mlp_prologue_enabled();
   const Weights& w = w_;
   const Ablation& abl = abl_;
   State& st = st_;
@@ -355,6 +366,14 @@ void Decoder::decode_impl(Buffers& b, const std::int64_t* pos, bool history, cud
     std::vector<const float*> mlp_blocks = blocks;
     if (boundary) mlp_blocks.push_back(hid);
     const float* mbase = boundary ? nullptr : hid;
+    const bool fuse_mlp = [&] {
+      const char* e = std::getenv("INGINE_DECODER_FUSE_MLP_PROLOGUE");
+      if (e && e[0] == '0' && e[1] == '\0') return false;
+      if (e && e[0] == '1' && e[1] == '\0') return true;
+      return dense::mlp_prologue_default_enabled();
+    }();
+    const bool fuse_visit = fuse_mlp && !simulation_ && !profile && !msgs && m >= 2 &&
+        layer.mlp_query.ne[1] == 1 && mlp_blocks.size() <= 5;
     dense::MixParams mp =
         msgs ? mix_params(mlp_blocks, mbase, f32p(b.y), attn_dirs + std::size_t(wv) * H, attn_w + 4 * std::size_t(wv), f32m(b.part),
                           &layer.mlp_query, nullptr, nullptr, f32m(b.mixm))
@@ -367,21 +386,26 @@ void Decoder::decode_impl(Buffers& b, const std::int64_t* pos, bool history, cud
                                            f32m(*dst) + std::size_t(v) * m * layout.kv_dim_local,
                                            layout.kv_dim_local, layout.kv_dim_local};
     }
-    stage(VerifyStage::Mix, 2 * v + 1, false);
-    dense::mix(mp, pdl, stream);
-    stage(VerifyStage::Mix, 2 * v + 1, true);
-    if (msgs) {
-      stage(VerifyStage::MessageGates, 2 * v + 1, false);
-      dense::message_gates(f32p(b.mixm), false, f32p(b.msgs) + 3 * slab, 1, m,
-                           static_cast<const __nv_bfloat16*>(layer.mlp1_gate_down.data), layer.mlp1_gate_forget16.data,
-                           layer.mlp1_gate_gain16.data, false, f32p(layer.mlp_norm1), bf16m(b.xm), nullptr, pdl,
-                           stream);
-      stage(VerifyStage::MessageGates, 2 * v + 1, true);
+    if (fuse_visit) {
+      dense::mix_router(mp, static_cast<const __nv_bfloat16*>(layer.router_bf16.data), f32p(layer.router_bias),
+                        static_cast<int*>(b.idx.data), f32m(b.wts), pdl, stream);
+    } else {
+      stage(VerifyStage::Mix, 2 * v + 1, false);
+      dense::mix(mp, pdl, stream);
+      stage(VerifyStage::Mix, 2 * v + 1, true);
+      if (msgs) {
+        stage(VerifyStage::MessageGates, 2 * v + 1, false);
+        dense::message_gates(f32p(b.mixm), false, f32p(b.msgs) + 3 * slab, 1, m,
+                             static_cast<const __nv_bfloat16*>(layer.mlp1_gate_down.data), layer.mlp1_gate_forget16.data,
+                             layer.mlp1_gate_gain16.data, false, f32p(layer.mlp_norm1), bf16m(b.xm), nullptr, pdl,
+                             stream);
+        stage(VerifyStage::MessageGates, 2 * v + 1, true);
+      }
+      stage(VerifyStage::Router, v, false);
+      dense::router(bf16m(b.xm), m, layer.router_bf16.data, false, f32p(layer.router_bias),
+                    static_cast<int*>(b.idx.data), f32m(b.wts), pdl, stream);
+      stage(VerifyStage::Router, v, true);
     }
-    stage(VerifyStage::Router, v, false);
-    dense::router(bf16m(b.xm), m, layer.router_bf16.data, false, f32p(layer.router_bias),
-                  static_cast<int*>(b.idx.data), f32m(b.wts), pdl, stream);
-    stage(VerifyStage::Router, v, true);
     if (simulation_) {
       simulation_->mlp(layer, b, v, history, reduction, stream);
     } else {

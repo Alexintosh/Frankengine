@@ -156,6 +156,13 @@ void message_gates(const float* h, bool h_shared, const float* msg, int G, int M
                    const void* w_forget, const void* w_gain, bool fg_fp32, const float* norm_w,
                    __nv_bfloat16* out_bf16, float* out_f32, bool pdl, cudaStream_t stream);
 
+// Fused decoder MLP prologue (`mix_router`) for 2..8 tokens and one query (non-gated visits).
+// Writes mp.out_bf16 using mp.norm_w and runs the BF16 MMA router in a single cluster launch.
+// Default-enabled on devices supporting the 16-CTA cluster (SM >= 96). Does not take out_f32, out_copy or new_bf16.
+bool mlp_prologue_default_enabled();
+void mix_router(const MixParams& mp, const __nv_bfloat16* router_w, const float* router_bias, int* idx, float* wts,
+                bool pdl, cudaStream_t stream);
+
 // embed: out[m] = float(bf16(rms_norm(float(table[token[m]])) * norm_w)), bit-exact with model.Model.embed.
 // token int64 [M] (device), table bf16 [V, H], norm_w fp32 [H], out fp32 [M, H].
 void embed(const std::int64_t* token, int M, const __nv_bfloat16* table, const float* norm_w, float* out,
