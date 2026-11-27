@@ -41,16 +41,17 @@ BatchSpecConfig batch_spec_config(TpRuntime* tp, cudaStream_t stream);
 // until the current verification has been assembled.
 class BatchDraftSupport {
  public:
-  explicit BatchDraftSupport(int slots = 0);
+  explicit BatchDraftSupport(int slots = 0, TpRuntime* tp = nullptr);
   void reset(int slot);
   void set_temperature(int slot, float temperature);
   void clear_support(int slot);
   bool has_support(int slot, float temperature) const;
   std::vector<float> proposal_temperatures(std::span<const std::int32_t> slots) const;
 
-  // Enqueue this alongside the draft tokens and confidences. Store the results after the stream has synchronized.
+  // With TP, both ranks enqueue the broadcast and download. Store after the stream has synchronized.
   void download(const BatchDFlash2::Drafts& drafts, std::size_t sequences, cudaStream_t stream);
   void store(std::span<const std::int32_t> slots);
+  std::size_t device_bytes() const { return broadcast_.bytes; }
 
   const BatchRejectInputs* verification_inputs(std::span<const std::int32_t> slots,
                                                std::span<const std::int32_t> widths,
@@ -68,6 +69,8 @@ class BatchDraftSupport {
   std::vector<std::int32_t> row_ids_, row_picked_;
   std::vector<float> row_probs_;
   BatchRejectInputs inputs_;
+  TpRuntime* tp_;
+  DeviceBuffer broadcast_;
 };
 
 class BatchSpecCost {

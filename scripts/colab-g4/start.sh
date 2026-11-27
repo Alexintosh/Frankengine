@@ -157,7 +157,9 @@ create_g4_session() {
   while true; do
     local out rc=0
     # Never pass --high-mem for G4; G4 already provisions 176 GiB RAM / 48 vCPU / 96 GB VRAM.
-    out="$(COLAB_CLI_ASSIGN_RETRIES=0 "$COLAB_BIN" new -s "$SESSION" --gpu G4 2>&1)" || rc=$?
+    # Disable Rich/ANSI tracebacks so surrounding source context (e.g. `except TooManyAssignmentsError:`)
+    # cannot trigger false hard-stop matches on transient 503 Service Unavailable errors.
+    out="$(COLAB_CLI_ASSIGN_RETRIES=0 TYPER_STANDARD_TRACEBACK=1 NO_COLOR=1 FORCE_COLOR= PY_COLORS= "$COLAB_BIN" new -s "$SESSION" --gpu G4 2>&1)" || rc=$?
 
     if [ "$rc" -eq 0 ] && ! grep -qiE "Error:|Traceback|Service Unavailable|Allocation refused|Backend rejected" <<<"$out"; then
       printf '  %s✓%s Colab G4 session %s%s%s allocated (attempt #%s)\n' \
@@ -166,9 +168,9 @@ create_g4_session() {
     fi
 
     local clean_err
-    clean_err="$(printf '%s\n' "$out" | sed -E '/^[╭│╰]/d' | tr '\n' ' ' | tr -s ' ')"
+    clean_err="$(printf '%s\n' "$out" | sed -E $'s/\x1b\\[[0-9;]*[[:alpha:]]//g' | sed -E '/^[[:space:]]*[╭│╰]/d; /^[[:space:]]*(File "|except )/d' | tr '\n' ' ' | tr -s ' ')"
 
-    if grep -qiE "Allocation refused|precondition failed|Backend rejected|TooManyAssignmentsError|Too Many Requests|Unauthorized|Forbidden|not entitled|no quota|insufficient|invalid_grant|token.*expired|HTTP[^0-9]*(401|403|429)" <<<"$clean_err"; then
+    if grep -qiE "Allocation refused|precondition failed|Backend rejected|(^|[^A-Za-z_])TooManyAssignmentsError:|Too Many Requests|Unauthorized|Forbidden|not entitled|no quota|insufficient|invalid_grant|token.*expired|HTTP[^0-9]*(401|403|429)" <<<"$clean_err"; then
       printf '\n  %s✗%s Colab rejected allocation (hard stop, not retrying):\n%s\n' "$C_YELLOW" "$C_RESET" "$out" >&2
       return 1
     fi

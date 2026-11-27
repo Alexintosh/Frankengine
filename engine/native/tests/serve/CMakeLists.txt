@@ -3,3 +3,5 @@
 # INGINE_MODEL_DIR, skipped otherwise).
 ingine_add_test(NAME serve_scheduler SOURCES test_scheduler.cpp LIBS ingine_engine LABELS serve TIMEOUT 60)
 ingine_add_test(NAME serve_server SOURCES test_server.cpp LIBS ingine_serve LABELS serve TIMEOUT 300)
+ingine_add_test(NAME serve_tp_control SOURCES test_tp_control.cpp
+  LIBS nlohmann_json::nlohmann_json Threads::Threads LABELS serve TIMEOUT 60)

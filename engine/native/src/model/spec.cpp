@@ -1,13 +1,16 @@
 #include "model/spec.h"
 
 #include "core/device.h"
+#include "kernels/draft/dflash2_selector.h"
 #include "kernels/draft/draft.h"
 #include "model/dflash2.h"
 #include "model/model_kernels.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
+#include <string_view>
 
 namespace ingine::model {
 
@@ -22,6 +25,33 @@ std::uint64_t splitmix64(std::uint64_t x) {
   x = (x ^ (x >> 27)) * 0x94D049BB133111EBull;
   return x ^ (x >> 31);
 }
+
+bool enabled_by_default(const char* name) {
+  const char* value = std::getenv(name);
+  return !value || std::string_view(value) != "0";
+}
+
+struct DFlash2VerifyEma {
+  static constexpr int warmup = 3;
+  float accepted = 3.0f;
+  int rounds = 0;
+
+  void observe(int count, int eligible) {
+    if (eligible == 0) return;
+    ++rounds;
+    // A full match at a narrow width is right-censored; bias it upward so high-acceptance
+    // streams (code/math) ramp promptly back up to BLOCK=8.
+    const float observation = count == eligible ? std::min(float(kd::GAMMA), float(count) + 1.5f) : float(count);
+    accepted += 0.30f * (observation - accepted);
+  }
+
+  // Unbiased verify width (depends strictly on prior rounds) for exact rejection sampling:
+  // keeps prose at M=3..4 (avoiding MoE E_uniq explosion) while scaling code/math up to M=8.
+  int sampled_width() const {
+    if (rounds < warmup) return 5;
+    return std::clamp(int(accepted + 2.25f), 3, kd::BLOCK);
+  }
+};
 
 static_assert(sizeof(VerifyRecord::drafts) / sizeof(std::int32_t) == kd::GAMMA);
 
@@ -283,6 +313,10 @@ void SpecLoop::generate_host_verified(std::int32_t token, int max_new_tokens, co
   if (fixed_width && !forced && rt_.options().draft_type != "dflash2") throw std::invalid_argument("fixed verify widths require forced replay");
   const bool trace = (forced && drafter_) || dflash2_ || (drafter_ && rt_.options().spec_trace);
   const bool sampled = sampling.temperature > 0.f && !forced;
+  const bool flash_root = dflash2_ && (!tp || tp->layout.tp_rank == 0);
+  const bool exact_reject = flash_root && sampled && enabled_by_default("INGINE_DFLASH2_EXACT_REJECT");
+  const bool adaptive_ema = exact_reject && !fixed_width && enabled_by_default("INGINE_DFLASH2_ADAPTIVE_EMA");
+  DFlash2VerifyEma ema;
   if (sampled && drafter_) drafter_->set_seed(splitmix64(rng.seed ^ splitmix64(rng.counter++)));
   int position = int(tokens_in_state.size());
   if (drafter_ && drafter_->length() != position)
@@ -316,12 +350,20 @@ void SpecLoop::generate_host_verified(std::int32_t token, int max_new_tokens, co
     if (drafter_)
       verify_proposal(draft_.conf, draft_.tokens, rt_.options().spec_threshold, widths, stop ? -1 : fixed_width,
                       proposal, stream);
-    if (dflash2_ && (!tp || tp->layout.tp_rank == 0)) {
+    if (flash_root) {
       const bool hybrid = rt_.options().draft_type == "hybrid";
       const bool adaptive = hybrid || rt_.options().dflash2_adaptive;
       const float threshold = hybrid ? rt_.options().hybrid_dflash2_threshold : rt_.options().spec_threshold;
+      int width = fixed_width ? fixed_width : (adaptive ? 0 : kd::BLOCK);
+      if (!fixed_width && exact_reject) {
+        // The sampled width depends only on past rounds. Gating on the realized
+        // draft token's probability would condition q and bias exact rejection.
+        const int desired = adaptive_ema ? ema.sampled_width() : kd::BLOCK;
+        const auto* chosen = std::lower_bound(widths.w, widths.w + widths.n, desired);
+        width = chosen < widths.w + widths.n ? *chosen : widths.w[widths.n - 1];
+      }
       verify_proposal(dflash2_->confidence(), draft_.tokens, threshold, widths,
-                      stop ? -1 : (fixed_width ? fixed_width : adaptive ? 0 : 8), proposal, stream);
+                      stop ? -1 : width, proposal, stream);
     }
     if (tp) tp->broadcast_proposal(proposal, sizeof(VerifyProposal), stream);
     CUDA_CHECK(cudaMemcpyAsync(proposal_host_.data(), proposal, sizeof(VerifyProposal), cudaMemcpyDeviceToHost,
@@ -381,7 +423,9 @@ void SpecLoop::generate_host_verified(std::int32_t token, int max_new_tokens, co
     const int offset = stats.generated_tokens;
     const int32_t anchor = out.back();
     if (propose_flash) {
-      draft_.tokens = dflash2_->propose(anchor);
+      draft_.tokens = exact_reject
+          ? dflash2_->propose(anchor, sampling.temperature, splitmix64(rng.seed ^ splitmix64(rng.counter++)))
+          : dflash2_->propose(anchor);
       event(1);
     } else if (dflash2_head_) {
       dflash2_head_->run();
@@ -427,12 +471,29 @@ void SpecLoop::generate_host_verified(std::int32_t token, int max_new_tokens, co
                              draft_.qstats, scratch.uniforms, scratch.ws, scratch.resid, result, stream);
           kh::sample_from_probs(scratch.resid, 1, V, V, rng, &result->next, stream);
         }
-      } else if (dflash2_ && (!tp || tp->layout.tp_rank == 0)) {
-        // Exact lossless target sampling (temperature / top_p / top_k) verified against DFlash2 drafts.
+      } else if (flash_root) {
+        constexpr int V = UNPADDED_VOCAB;
         const kh::SamplingParams params{sampling.temperature, sampling.top_k, sampling.top_p};
-        auto* ids = static_cast<std::int32_t*>(target_tokens_.p);
-        kh::sample(logits, m, UNPADDED_VOCAB, UNPADDED_VOCAB, params, rng, ids, stream);
-        kd::greedy_accept(ids, proposal->drafts, eligible, result, stream);
+        if (exact_reject && eligible > 0) {
+          if (!dflash2_accept_.p) {
+            const auto floats = (kd::BLOCK + 1) * V + kd::GAMMA + kd::dflash2_accept_workspace_floats(V);
+            dflash2_accept_ = DeviceBuffer(floats * sizeof(float));
+          }
+          auto* probs = static_cast<float*>(dflash2_accept_.p);
+          auto* resid = probs + kd::BLOCK * V;
+          auto* uniforms = resid + V;
+          auto* ws = uniforms + kd::GAMMA;
+          kh::uniform(kd::GAMMA, rng, uniforms, stream);
+          kh::sampling_probs(logits, m, V, V, params, probs, stream);
+          kd::dflash2_exact_accept(probs, V, proposal->drafts, eligible, dflash2_->support_ids(),
+                                   dflash2_->support_probs(), dflash2_->support_picked(), uniforms,
+                                   ws, resid, result, stream);
+          kh::sample_from_probs(resid, 1, V, V, rng, &result->next, stream);
+        } else {
+          auto* ids = static_cast<std::int32_t*>(target_tokens_.p);
+          kh::sample(logits, m, V, V, params, rng, ids, stream);
+          kd::greedy_accept(ids, proposal->drafts, eligible, result, stream);
+        }
       }
       if (tp) tp->broadcast_proposal(result, sizeof(*result), stream);
     } else {
@@ -461,6 +522,7 @@ void SpecLoop::generate_host_verified(std::int32_t token, int max_new_tokens, co
       }
     }
     const VerifyRecord r = *record_host;
+    if (adaptive_ema) ema.observe(r.accepted, eligible);
     const int commit = r.accepted + 1;
     if (trace) {
       int all = 0;

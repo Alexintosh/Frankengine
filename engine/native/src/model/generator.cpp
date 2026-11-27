@@ -218,8 +218,8 @@ class EngineGenerator final : public Generator {
               head_ovr, batch_dflash2_head_.get());
         }
       }
-      if (batch_dflash2_ && batch_dec_->reject_enabled())
-        batch_draft_support_ = BatchDraftSupport(options.max_batch);
+      if (use_batch_dflash2 && batch_dec_->reject_enabled())
+        batch_draft_support_ = BatchDraftSupport(options.max_batch, rt_.tp());
       constexpr int G = BatchDrafter::GAMMA;
       constexpr int TAP_ROW = NUM_TAPS * HIDDEN;
       batch_gathered_ = DeviceBuffer(std::size_t(options.max_batch) * 8 * TAP_ROW * 2);
@@ -456,6 +456,7 @@ class EngineGenerator final : public Generator {
     copy_same(src.conv_mlp, dst.conv_mlp);
     copy_full_prefix(src, dst, len, stream);
     batch_spec_histories_.at(std::size_t(dst_slot)) = src_hist;
+    // The cloned prefix has no pending proposal.
     reset_batch_spec_cost(dst_slot);
     if (batch_drafter_) batch_drafter_->clone_slot(src_slot, dst_slot, len);
     if (batch_dflash2_) batch_dflash2_->clone_slot(src_slot, dst_slot, len);
@@ -506,11 +507,15 @@ class EngineGenerator final : public Generator {
       history.insert(history.end(), prompt.begin() + offset, prompt.begin() + offset + count);
       PrefillChunkResult result{offset + count, reused, std::nullopt};
       if (final) {
-        std::int32_t first_tok = 0;
-        if (options_.tp.rank == 0) {
-          first_tok = batch_token(logits_.p, tp && !sampled, sampling);
-          result.token = first_tok;
+        std::int32_t first_tok;
+        if (tp && sampled) {
+          head::SamplerRng rng{sampling.seed, sampling.counter};
+          first_tok = sample_tp(logits_.p, sampling.params, rng);
+          sampling.counter = rng.counter;
+        } else {
+          first_tok = batch_token(logits_.p, tp != nullptr, sampling);
         }
+        if (options_.tp.rank == 0) result.token = first_tok;
         const std::int32_t slot32 = slot;
         const std::int64_t pos64 = std::int64_t(prompt.size());
         batch_draft_support_.set_temperature(slot, sampling.params.temperature);
@@ -558,9 +563,12 @@ class EngineGenerator final : public Generator {
   }
 
   bool supports_batch_short_prefill() const override {
+    if (options_.batch_spec <= 0 || !batch_dec_) return false;
     const char* enabled = std::getenv("INGINE_BATCH_SHORT_PREFILL");
-    return options_.batch_spec > 0 && batch_dec_ && !rt_.tp() &&
-           (!enabled || std::string_view(enabled) != "0");
+    // Default ON for TP=1; opt-in (=1) for TP=2 because 8-tok BatchDecoder steps multiply 96 RoCE
+    // AllReduces per step and raise c=24 TTFT (+0.29..0.55 s vs chunked Prefiller).
+    if (rt_.tp()) return enabled && std::string_view(enabled) == "1";
+    return !enabled || std::string_view(enabled) != "0";
   }
 
   std::vector<PrefillChunkResult> prefill_batch_short(std::span<const BatchPrefillSlot> slots,
@@ -635,8 +643,12 @@ class EngineGenerator final : public Generator {
           }
         }
       }
-      if (finished_slots.empty()) CUDA_CHECK(cudaStreamSynchronize(rt_.stream()));
-      else batch_draft_slots(int(finished_slots.size()), finished_slots.data(), anchors.data(), finished_pos.data());
+      if (!finished_slots.empty())
+        batch_draft_slots(int(finished_slots.size()), finished_slots.data(), anchors.data(), finished_pos.data());
+      else if (rt_.tp())
+        rt_.tp()->wait(rt_.stream());
+      else
+        CUDA_CHECK(cudaStreamSynchronize(rt_.stream()));
     } catch (...) {
       // A failed step may have written part of a slot's state. Force a cold restart on reuse.
       for (const auto& input : slots) batch_spec_histories_[input.slot].clear();
@@ -1494,22 +1506,23 @@ class EngineGenerator final : public Generator {
           total_rows += budget;
         }
       }
+      std::vector<std::int32_t> sl, an;
+      std::vector<std::int64_t> np;
+      gather_sub(df_idx, sl, an, np);
+      const auto temps = batch_draft_support_.proposal_temperatures(sl);
+      const bool sampled = !temps.empty();
+      const auto seed = sampled ? batch_seed(++batch_draws_) : 0;
+      BatchDFlash2::Drafts d{};
       if (batch_dflash2_) {
-        std::vector<std::int32_t> sl, an;
-        std::vector<std::int64_t> np;
-        gather_sub(df_idx, sl, an, np);
-        const auto temps = batch_draft_support_.proposal_temperatures(sl);
-        const bool sampled = !temps.empty();
-        const BatchDFlash2::Drafts d = batch_dflash2_->propose(
-            ndf, sl.data(), an.data(), np.data(), df_max_drafts.empty() ? nullptr : df_max_drafts.data(),
-            sampled ? temps.data() : nullptr, sampled ? batch_seed(++batch_draws_) : 0);
-        if (sampled) batch_draft_support_.download(d, sl.size(), stream);
-        scatter_sync(df_idx, d.tokens, d.conf);
-        if (sampled) batch_draft_support_.store(sl);
-      } else if (rt_.tp()) {
-        if (batch_dflash2_head_) batch_dflash2_head_->run_rows(total_rows);
-        scatter_sync(df_idx, nullptr, nullptr);
+        d = batch_dflash2_->propose(ndf, sl.data(), an.data(), np.data(),
+                                    df_max_drafts.empty() ? nullptr : df_max_drafts.data(),
+                                    sampled ? temps.data() : nullptr, seed);
+      } else if (batch_dflash2_head_) {
+        batch_dflash2_head_->run_rows(total_rows);
       }
+      if (sampled) batch_draft_support_.download(d, sl.size(), stream);
+      scatter_sync(df_idx, d.tokens, d.conf);
+      if (sampled) batch_draft_support_.store(sl);
     }
     if (!ds_idx.empty()) {
       const int nds = int(ds_idx.size());

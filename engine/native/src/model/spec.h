@@ -68,6 +68,7 @@ class SpecLoop {
   bool host_verify_;
   DeviceBuffer proposal_, host_accept_;
   DeviceBuffer target_tokens_;
+  DeviceBuffer dflash2_accept_;  // lazily allocated target probabilities, residual, uniforms, and reduction workspace
   PinnedHostBuffer proposal_host_{sizeof(VerifyProposal)};
   Drafter::Draft draft_{};             // the drafter's fixed output buffers
   DeviceBuffer width_;                 // int32: the verify width chosen on the device

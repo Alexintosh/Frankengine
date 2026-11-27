@@ -6,6 +6,7 @@
 #include "kernels/head/nvfp4_head.h"
 
 #include <cstddef>
+#include <cstdint>
 #include <filesystem>
 #include <memory>
 
@@ -39,7 +40,12 @@ class DFlash2 {
   int tp_rank() const;
   void warmup();
   const int* propose(int anchor);
+  const int* propose(int anchor, float temperature, std::uint64_t seed);
   const float* confidence() const;
+  // Device support of the last sampled proposal, owned by rank 0.
+  const std::int32_t* support_ids() const;
+  const float* support_probs() const;
+  const std::int32_t* support_picked() const;
   void reset();
   int length() const;
   // The caller supplies a device buffer of checkpoint_bytes() on this rank.
@@ -60,7 +66,7 @@ class DFlash2 {
                                  bool fp32_reduce = false);
 
  private:
-  const int* propose(int anchor, bool warming_up);
+  const int* propose(int anchor, float temperature, std::uint64_t seed, bool warming_up);
   void propose_sharded_head(const __nv_bfloat16* hidden, bool replicated);
   struct Impl;
   std::unique_ptr<Impl> impl_;

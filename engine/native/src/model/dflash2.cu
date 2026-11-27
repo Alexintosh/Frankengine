@@ -4,6 +4,7 @@
 #include "core/arena.h"
 #include "core/device.h"
 #include "core/safetensors.h"
+#include "kernels/batch/dense.h"
 #include "kernels/dense/dense.h"
 #include "kernels/draft/dflash2_selector.h"
 #include "kernels/draft/gemm.h"
@@ -19,6 +20,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <initializer_list>
 #include <stdexcept>
 #include <string_view>
 #include <vector>
@@ -27,6 +29,8 @@ namespace ingine::model {
 namespace {
 using Bf = __nv_bfloat16;
 namespace head = kernels::head;
+namespace batch = kernels::batch;
+namespace draft = kernels::draft;
 constexpr int H = 2304, I = 6912, Q = 4096, KV = 1024, W = 2048;
 constexpr int D = 128, QHeads = Q / D, KVHeads = KV / D;
 constexpr int Group = 16, Groups = H / Group, Coefficients = 4 * Groups;
@@ -34,16 +38,14 @@ constexpr int CommitBatch = 128, Threads = 128;
 constexpr int Block = DFlash2::block, Proposals = Block - 1;
 constexpr int Rank = 256, Vocabulary = 201024;
 
-__global__ void normalize(const Bf* x, const Bf* weight, int width, int heads,
-                          int position, Bf* out, int ring, const int* device_position = nullptr) {
-  if (device_position) position = *device_position;
-  __shared__ float sums[Threads];
-  const int row = blockIdx.x / heads;
-  const int head_idx = blockIdx.x % heads;
+bool enabled_by_default(const char* name) {
+  const char* value = std::getenv(name);
+  return !value || std::string_view(value) != "0";
+}
+
+__device__ __forceinline__ void normalize_row(const Bf* x, const Bf* weight, int width, int position,
+                                               Bf* out, float* sums) {
   const int lane = threadIdx.x;
-  x += blockIdx.x * width;
-  const int slot = ring ? (position + row) % ring : row;
-  out += (slot * heads + head_idx) * width;
   float sum = 0;
   for (int i = lane; i < width; i += Threads) {
     const float value = __bfloat162float(x[i]);
@@ -66,8 +68,37 @@ __global__ void normalize(const Bf* x, const Bf* weight, int width, int heads,
     const float pair = __bfloat162float(__float2bfloat16(__bfloat162float(x[other]) * scale *
                                                        __bfloat162float(weight[other])));
     float sine, cosine;
-    sincosf((position + row) * powf(10000.f, -2.f * (lane % (D / 2)) / D), &sine, &cosine);
+    sincosf(position * powf(10000.f, -2.f * (lane % (D / 2)) / D), &sine, &cosine);
     out[lane] = __float2bfloat16(value * cosine + (lane < D / 2 ? -pair : pair) * sine);
+  }
+}
+
+__global__ void normalize(const Bf* x, const Bf* weight, int width, int heads,
+                          int position, Bf* out, int ring, const int* device_position = nullptr) {
+  __shared__ float sums[Threads];
+  if (device_position) position = *device_position;
+  const int row = blockIdx.x / heads;
+  const int head_idx = blockIdx.x % heads;
+  const int slot = ring ? (position + row) % ring : row;
+  normalize_row(x + blockIdx.x * width, weight, width, position < 0 ? position : position + row,
+                out + (slot * heads + head_idx) * width, sums);
+}
+
+__global__ void normalize_qkv(const Bf* qkv, const Bf* qnorm, const Bf* knorm, int q_heads,
+                              int kv_heads, int position, const int* device_position,
+                              Bf* q, Bf* k, Bf* v) {
+  __shared__ float sums[Threads];
+  if (device_position) position = *device_position;
+  const int heads = q_heads + 2 * kv_heads;
+  const int row = blockIdx.x / heads;
+  const int head = blockIdx.x % heads;
+  const Bf* src = qkv + blockIdx.x * D;
+  if (head < q_heads) {
+    normalize_row(src, qnorm, D, position + row, q + (row * q_heads + head) * D, sums);
+  } else if (head < q_heads + kv_heads) {
+    normalize_row(src, knorm, D, position + row, k + (row * kv_heads + head - q_heads) * D, sums);
+  } else {
+    v[(row * kv_heads + head - q_heads - kv_heads) * D + threadIdx.x] = src[threadIdx.x];
   }
 }
 
@@ -86,10 +117,12 @@ __global__ void convolution(const Bf* x, const Bf* coeff, const Bf* base, int pa
   out[index] = residual ? __hadd(out[index], value) : value;
 }
 
-__global__ void swiglu(const Bf* gate, const Bf* up, Bf* out) {
+template <bool Fused>
+__global__ void swiglu(const Bf* gate, const Bf* up, int width, Bf* out) {
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
-  const float x = __bfloat162float(gate[i]);
-  out[i] = __hmul(__float2bfloat16(x / (1.f + expf(-x))), up[i]);
+  const int j = Fused ? i + i / width * width : i;
+  const float x = __bfloat162float(gate[j]);
+  out[i] = __hmul(__float2bfloat16(x / (1.f + expf(-x))), up[j]);
 }
 
 __global__ void convert(const float* x, Bf* out, int size) {
@@ -365,11 +398,16 @@ __global__ void merge_attention(const float* partial, int splits, Bf* out,
 }
 
 __global__ void input_ids(int64_t* ids, int* anchor_out, int anchor,
-                          int* position_out, int position) {
+                          int* position_out, int position, float* temperature_out, float temperature,
+                          std::uint64_t* seed_out, std::uint64_t seed) {
   ids[threadIdx.x] = threadIdx.x ? DFlash2::mask_token : anchor;
   if (threadIdx.x == 0) {
     *anchor_out = anchor;
     if (position_out) *position_out = position;
+    if (temperature_out) {
+      *temperature_out = temperature;
+      *seed_out = seed;
+    }
   }
 }
 
@@ -428,6 +466,7 @@ struct DraftLayer {
   const Bf *pre, *post, *qnorm, *knorm;
   Conv attention, mlp;
   Linear q, k, v, o, gate, up, down;
+  Linear qkv, gate_up;
   Bf *keys, *values;
 };
 }  // namespace
@@ -510,16 +549,6 @@ struct DraftProfile {
 };
 }  // namespace
 
-namespace {
-__global__ void cumulative_confidence(float* confidence) {
-  float product = 1.f;
-  for (int i = 0; i < Proposals; ++i) {
-    product *= confidence[i];
-    confidence[i] = product;
-  }
-}
-}  // namespace
-
 struct DFlash2::Impl {
   cudaStream_t s;
   TpRuntime* tp = nullptr;
@@ -556,10 +585,14 @@ struct DFlash2::Impl {
   Bf *convolved = nullptr, *coeff = nullptr;
   Bf *q = nullptr, *key = nullptr, *value = nullptr, *block_key = nullptr, *attention = nullptr;
   Bf *projection = nullptr, *gate = nullptr, *up = nullptr, *projected = nullptr;
+  Bf *qkv = nullptr, *gate_up = nullptr;
   float* attention_partial = nullptr;
   float* partial_f32 = nullptr;
   float *fp4_scratch = nullptr, *lattice = nullptr, *confidence = nullptr;
   int* tokens = nullptr;
+  float* temperature = nullptr;
+  std::uint64_t* seed = nullptr;
+  draft::DFlash2Support support{};
   head::Nvfp4Matrix target_head;
   kernels::draft::DFlash2DraftHead draft_head;
   DFlash2Head* sharded_head = nullptr;
@@ -570,6 +603,8 @@ struct DFlash2::Impl {
   float* embed_output = nullptr;
   std::filesystem::path dump_dir;
   const bool cumulative = std::getenv("INKLING_DFLASH2_CUMULATIVE_CONFIDENCE") != nullptr;
+  const bool fused_selector = enabled_by_default("INGINE_DFLASH2_FUSED_SELECTOR");
+  bool fused_head = false;
   bool dump_written = false;
   int dump_round = 0, proposal_round = 0;
   float *unary = nullptr, *pool_values = nullptr, *top_values = nullptr;
@@ -580,6 +615,60 @@ struct DFlash2::Impl {
   T* allocate(std::size_t n) {
     buffers.emplace_back(n * sizeof(T));
     return static_cast<T*>(buffers.back().p);
+  }
+
+  Linear concatenate_rows(std::initializer_list<Linear*> parts) {
+    const Linear& first = **parts.begin();
+    const bool fp8 = first.fp8.w != nullptr;
+    const bool fp4 = first.packed.codes != nullptr;
+    // The GEMV kernels tile 16 output rows independently of N. BF16 uses
+    // cuBLASLt, whose accumulation algorithm can depend on N.
+    if (first.cols != H || (!fp8 && !fp4)) return {};
+    int rows = 0;
+    for (const auto* part : parts) {
+      if (part->rows % 16 || part->cols != first.cols) return {};
+      // NVFP4 uses one matrix-wide decode scale. Repacking with a common
+      // scale would change weights, so keep separate GEMMs if scales differ.
+      if (fp8 ? !part->fp8.w : (!part->packed.codes || part->packed.outer_scale != first.packed.outer_scale))
+        return {};
+      rows += part->rows;
+    }
+
+    const int code_stride = fp8 ? H : H / 2;
+    const int scale_stride = fp8 ? sizeof(float) : H / 16;
+    auto* codes = allocate<std::uint8_t>(std::size_t(rows) * code_stride);
+    auto* scales = allocate<std::uint8_t>(std::size_t(rows) * scale_stride);
+    const float outer = first.packed.outer_scale;
+    std::array<const void*, 6> old_storage{};
+    int old_count = 0;
+    int offset = 0;
+    for (auto* part : parts) {
+      auto* dst_codes = codes + std::size_t(offset) * code_stride;
+      auto* dst_scales = scales + std::size_t(offset) * scale_stride;
+      const void* src_codes = fp8 ? part->fp8.w : part->packed.codes;
+      const void* src_scales = fp8 ? static_cast<const void*>(part->fp8.scale) : part->packed.scales;
+      CUDA_CHECK(cudaMemcpyAsync(dst_codes, src_codes, std::size_t(part->rows) * code_stride,
+                                 cudaMemcpyDeviceToDevice, s));
+      CUDA_CHECK(cudaMemcpyAsync(dst_scales, src_scales, std::size_t(part->rows) * scale_stride,
+                                 cudaMemcpyDeviceToDevice, s));
+      old_storage[old_count++] = src_codes;
+      old_storage[old_count++] = src_scales;
+      // K/V commit still uses the individual row views and the FP8 BF16 mirrors.
+      if (fp8) part->fp8 = {dst_codes, reinterpret_cast<const float*>(dst_scales), part->rows, H};
+      else part->packed = {dst_codes, dst_scales, outer, part->rows, 0};
+      offset += part->rows;
+    }
+    CUDA_CHECK(cudaStreamSynchronize(s));
+    for (auto& buffer : buffers)
+      if (buffer.p && std::find(old_storage.begin(), old_storage.end(), buffer.p) != old_storage.end())
+        buffer = DeviceBuffer{};
+
+    Linear fused;
+    fused.rows = rows;
+    fused.cols = H;
+    if (fp8) fused.fp8 = {codes, reinterpret_cast<const float*>(scales), rows, H};
+    else fused.packed = {codes, scales, outer, rows, 0};
+    return fused;
   }
 
   Impl(const std::filesystem::path& path, cudaStream_t stream, bool nvfp4,
@@ -616,6 +705,7 @@ struct DFlash2::Impl {
     if (!precision.empty() && nvfp4)
       throw std::invalid_argument("Choose either INKLING_DFLASH2_PRECISION or --draft-nvfp4");
     const bool hybrid = precision == "hybrid";
+    const bool fused_proj = enabled_by_default("INGINE_DFLASH2_FUSED_PROJ");
     if (dump_dir.empty())
       device_position = allocate<int>(1);
     gqa = dflash2_gqa();
@@ -765,6 +855,8 @@ struct DFlash2::Impl {
       pred = load("candidate_selector.predecessor_codebook", {Vocabulary, Rank});
       succ = load("candidate_selector.successor_codebook", {Vocabulary, Rank});
     }
+    int fp4_width = std::max(i_dim, H);
+    bool separate_gate_up = false;
     for (std::size_t i = 0; i < layers.size(); ++i) {
       auto& l = layers[i];
       const std::string prefix = "layers." + std::to_string(i) + ".";
@@ -785,6 +877,15 @@ struct DFlash2::Impl {
       l.gate = linear(prefix + "mlp.gate_proj.weight", I, H, true, ShardMode::RowSlice);
       l.up = linear(prefix + "mlp.up_proj.weight", I, H, true, ShardMode::RowSlice);
       l.down = linear(prefix + "mlp.down_proj.weight", H, I, true, ShardMode::ColSlice);
+      if (fused_proj) {
+        l.qkv = concatenate_rows({&l.q, &l.k, &l.v});
+        l.gate_up = concatenate_rows({&l.gate, &l.up});
+        if (l.qkv.rows && !qkv) qkv = allocate(Block * l.qkv.rows);
+        if (l.gate_up.rows && !gate_up) gate_up = allocate(Block * l.gate_up.rows);
+        if (l.qkv.packed.codes) fp4_width = std::max(fp4_width, l.qkv.rows);
+        if (l.gate_up.packed.codes) fp4_width = std::max(fp4_width, l.gate_up.rows);
+      }
+      separate_gate_up |= !l.gate_up.rows;
       l.keys = allocate(W * kv_dim);
       l.values = allocate(W * kv_dim);
     }
@@ -804,14 +905,20 @@ struct DFlash2::Impl {
     // projection holds q_proj ([Block, q_dim]) as well as o_proj/down_proj ([Block, H]).
     projection = allocate(Block * std::max(q_dim, H));
     gate = allocate(Block * i_dim);
-    up = allocate(Block * i_dim);
+    if (separate_gate_up) up = allocate(Block * i_dim);
     if (tp_size == 2) partial_f32 = allocate<float>(Block * H);
-    fp4_scratch = (nvfp4 || hybrid) ? allocate<float>(Block * std::max(i_dim, H)) : nullptr;
+    fp4_scratch = (nvfp4 || hybrid) ? allocate<float>(Block * fp4_width) : nullptr;
     if (tp_rank == 0) {
       projected = allocate(Proposals * Rank);
-      lattice = allocate<float>(Proposals * 16 * 16);
+      if (!fused_selector || !dump_dir.empty())
+        lattice = allocate<float>(Proposals * draft::DFLASH2_SUPPORT * draft::DFLASH2_SUPPORT);
       tokens = allocate<int>(Proposals);
       confidence = allocate<float>(Proposals);
+      temperature = allocate<float>(1);
+      seed = allocate<std::uint64_t>(1);
+      support.ids = allocate<int>(Proposals * draft::DFLASH2_SUPPORT);
+      support.probs = allocate<float>(Proposals * draft::DFLASH2_SUPPORT);
+      support.picked = allocate<int>(Proposals);
     }
   }
 
@@ -944,11 +1051,17 @@ struct DFlash2::Impl {
     prepare(l.pre, l.attention);
     profile.end();
     profile.begin(DraftProfile::Linear);
-    linear(convolved, Block, l.q, projection);
-    normalize<<<Block * q_heads, Threads, 0, s>>>(projection, l.qnorm, D, q_heads, length, q, 0, position);
-    linear(convolved, Block, l.k, key);
-    normalize<<<Block * kv_heads, Threads, 0, s>>>(key, l.knorm, D, kv_heads, length, block_key, 0, position);
-    linear(convolved, Block, l.v, value);
+    if (l.qkv.rows) {
+      linear(convolved, Block, l.qkv, qkv);
+      normalize_qkv<<<Block * (q_heads + 2 * kv_heads), Threads, 0, s>>>(
+          qkv, l.qnorm, l.knorm, q_heads, kv_heads, length, position, q, block_key, value);
+    } else {
+      linear(convolved, Block, l.q, projection);
+      normalize<<<Block * q_heads, Threads, 0, s>>>(projection, l.qnorm, D, q_heads, length, q, 0, position);
+      linear(convolved, Block, l.k, key);
+      normalize<<<Block * kv_heads, Threads, 0, s>>>(key, l.knorm, D, kv_heads, length, block_key, 0, position);
+      linear(convolved, Block, l.v, value);
+    }
     profile.end();
     profile.begin(DraftProfile::Attention);
     if (tp_size == 2) run_attention<QHeads / 2, KVHeads / 2>(l, splits, position);
@@ -967,9 +1080,14 @@ struct DFlash2::Impl {
     prepare(l.post, l.mlp);
     profile.end();
     profile.begin(DraftProfile::Linear);
-    linear(convolved, Block, l.gate, gate);
-    linear(convolved, Block, l.up, up);
-    swiglu<<<Block * i_dim / Threads, Threads, 0, s>>>(gate, up, gate);
+    if (l.gate_up.rows) {
+      linear(convolved, Block, l.gate_up, gate_up);
+      swiglu<true><<<Block * i_dim / Threads, Threads, 0, s>>>(gate_up, gate_up + i_dim, i_dim, gate);
+    } else {
+      linear(convolved, Block, l.gate, gate);
+      linear(convolved, Block, l.up, up);
+      swiglu<false><<<Block * i_dim / Threads, Threads, 0, s>>>(gate, up, i_dim, gate);
+    }
     if (to_f32) linear_f32(gate, l.down, partial_f32);
     else linear(gate, Block, l.down, projection);
     profile.end();
@@ -998,10 +1116,28 @@ struct DFlash2::Impl {
 
   void project_head(const Bf* hidden) {
     const auto matrix = draft_head.matrix();
+    if (fused_head) {
+      // The batch head ranks raw FP32 dots. The legacy path keeps its BF16-rounded logits.
+      batch::head_topk16_nvfp4(hidden, H, matrix, Proposals, top_workspace, top_values, top_ids, s);
+      return;
+    }
     head::project_nvfp4(hidden, Proposals, H, matrix, unary, s);
     kernels::draft::topk_candidates(unary, Proposals, matrix.rows, draft_head.token_ids(),
                                     pool_values, pool_ids, top_workspace, s);
     best16<<<Proposals, Threads, 0, s>>>(pool_values, pool_ids, top_values, top_ids);
+  }
+
+  const int* select(const int* candidates, const float* logits, const int* anchor, bool proposal) {
+    linear(normed + H, Proposals, selector, projected);
+    const auto* temp = proposal ? temperature : nullptr;
+    if (fused_selector && dump_dir.empty()) {
+      draft::dflash2_fused_selector(candidates, logits, projected, pred, succ, anchor, tokens,
+                                    confidence, cumulative, temp, seed, support, s);
+    } else {
+      draft::dflash2_lattice_selector(candidates, logits, projected, pred, succ, anchor, lattice, tokens,
+                                      confidence, cumulative, temp, seed, support, s);
+    }
+    return tokens;
   }
 
   const Bf* forward(const Bf* embeds, const int* position = nullptr) {
@@ -1051,22 +1187,36 @@ struct DFlash2Head::Impl {
   TpRuntime& tp;
   kernels::draft::DFlash2DraftHead draft_head;
   cudaStream_t stream;
+  bool fused;
   DeviceBuffer hidden{Proposals * H * sizeof(Bf)};
-  DeviceBuffer logits{std::size_t(Proposals) * draft_head.matrix().rows * sizeof(float)};
-  DeviceBuffer pool_values{Proposals * kernels::draft::CANDIDATES * sizeof(float)};
-  DeviceBuffer pool_ids{Proposals * kernels::draft::CANDIDATES * sizeof(int)};
+  DeviceBuffer logits, pool_values, pool_ids;
   DeviceBuffer top_values{HeadCandidates * sizeof(float)}, top_ids{HeadCandidates * sizeof(int)};
   DeviceBuffer local{HeadCandidates * sizeof(head::Candidate)}, gathered{2 * local.bytes};
-  DeviceBuffer workspace{kernels::draft::topk_workspace_bytes(Proposals, draft_head.matrix().rows)};
+  DeviceBuffer workspace;
 
-  Impl(TpRuntime& tp_in, head::Nvfp4Matrix matrix, cudaStream_t s) : tp(tp_in), draft_head(matrix, s), stream(s) {}
+  Impl(TpRuntime& tp_in, head::Nvfp4Matrix matrix, cudaStream_t s)
+      : tp(tp_in), draft_head(matrix, s), stream(s) {
+    const char* dump = std::getenv("INKLING_DFLASH2_DUMP");
+    const char* fh = std::getenv("INGINE_DFLASH2_FUSED_HEAD");
+    // Opt-in only: batch head_topk16_nvfp4 uses TM=32 MMA tiles (+0.88 ms slower at M=7 solo than GEMV).
+    fused = (fh && std::string_view(fh) == "1") && (!dump || !*dump) && !draft_head.token_ids();
+    const int rows = draft_head.matrix().rows;
+    if (fused) {
+      workspace = DeviceBuffer(batch::head_topk16_nvfp4_workspace_bytes(Proposals, rows));
+    } else {
+      logits = DeviceBuffer(std::size_t(Proposals) * rows * sizeof(float));
+      pool_values = DeviceBuffer(Proposals * draft::CANDIDATES * sizeof(float));
+      pool_ids = DeviceBuffer(Proposals * draft::CANDIDATES * sizeof(int));
+      workspace = DeviceBuffer(draft::topk_workspace_bytes(Proposals, rows));
+      CUDA_CHECK(cudaMemsetAsync(workspace.p, 0, workspace.bytes, stream));
+    }
+  }
 };
 
 DFlash2Head::DFlash2Head(TpRuntime& tp, head::Nvfp4Matrix matrix, cudaStream_t stream) {
   if (!matrix.codes || !matrix.scales)
     throw std::invalid_argument("DFlash2 sharded head requires --head-nvfp4");
   impl_ = std::make_unique<Impl>(tp, matrix, stream);
-  CUDA_CHECK(cudaMemsetAsync(impl_->workspace.p, 0, impl_->workspace.bytes, stream));
 }
 DFlash2Head::~DFlash2Head() = default;
 
@@ -1085,13 +1235,17 @@ void DFlash2Head::run(const Bf* hidden, bool replicated, bool run_merge) {
   auto* values = static_cast<float*>(d.top_values.p);
   auto* ids = static_cast<int*>(d.top_ids.p);
   const auto matrix = d.draft_head.matrix();
-  head::project_nvfp4(input, Proposals, H, matrix, logits, d.stream);
-  kernels::draft::topk_candidates(logits, Proposals, matrix.rows, d.draft_head.token_ids(),
-                                   pool_values, pool_ids, d.workspace.p, d.stream);
-  best16<<<Proposals, Threads, 0, d.stream>>>(pool_values, pool_ids, values, ids);
-  // A mapped shortlist already supplies global IDs and has v_begin == 0.
+  if (d.fused) {
+    batch::head_topk16_nvfp4(input, H, matrix, Proposals, d.workspace.p, values, ids, d.stream);
+  } else {
+    head::project_nvfp4(input, Proposals, H, matrix, logits, d.stream);
+    draft::topk_candidates(logits, Proposals, matrix.rows, d.draft_head.token_ids(),
+                            pool_values, pool_ids, d.workspace.p, d.stream);
+    best16<<<Proposals, Threads, 0, d.stream>>>(pool_values, pool_ids, values, ids);
+  }
+  // The fused head and mapped shortlists already return global token IDs.
   pack_head_candidates<<<1, HeadCandidates, 0, d.stream>>>(
-      values, ids, matrix.v_begin, static_cast<head::Candidate*>(d.local.p));
+      values, ids, d.fused ? 0 : matrix.v_begin, static_cast<head::Candidate*>(d.local.p));
   d.tp.exchange_draft_head(d.local.p, d.local.bytes, d.gathered.p, d.stream);
   if (replicated ? run_merge : (hidden != nullptr))
     merge_head_candidates<<<1, Proposals, 0, d.stream>>>(
@@ -1121,14 +1275,22 @@ void DFlash2::bind_head(head::Nvfp4Matrix matrix, const Bf* embed, const float* 
   // Oracle dumps use full-vocabulary tensors with token IDs as row indices.
   d.draft_head = kernels::draft::DFlash2DraftHead(matrix, d.s, d.dump_dir.empty());
   const int rows = d.draft_head.matrix().rows;
-  d.unary = d.allocate<float>(Proposals * rows);
-  d.pool_values = d.allocate<float>(Proposals * kernels::draft::CANDIDATES);
-  d.pool_ids = d.allocate<int>(Proposals * kernels::draft::CANDIDATES);
-  d.top_values = d.allocate<float>(Proposals * 16);
-  d.top_ids = d.allocate<int>(Proposals * 16);
-  const auto bytes = kernels::draft::topk_workspace_bytes(Proposals, rows);
-  d.top_workspace = d.allocate<std::byte>(bytes);
-  CUDA_CHECK(cudaMemsetAsync(d.top_workspace, 0, bytes, d.s));
+  const char* fh = std::getenv("INGINE_DFLASH2_FUSED_HEAD");
+  // Opt-in only: batch head_topk16_nvfp4 uses TM=32 MMA tiles (+0.88 ms slower at M=7 solo than GEMV).
+  d.fused_head = (fh && std::string_view(fh) == "1") &&
+                 !d.draft_head.token_ids() && d.dump_dir.empty();
+  d.top_values = d.allocate<float>(HeadCandidates);
+  d.top_ids = d.allocate<int>(HeadCandidates);
+  if (d.fused_head) {
+    d.top_workspace = d.allocate<std::byte>(batch::head_topk16_nvfp4_workspace_bytes(Proposals, rows));
+  } else {
+    d.unary = d.allocate<float>(Proposals * rows);
+    d.pool_values = d.allocate<float>(Proposals * draft::CANDIDATES);
+    d.pool_ids = d.allocate<int>(Proposals * draft::CANDIDATES);
+    const auto bytes = draft::topk_workspace_bytes(Proposals, rows);
+    d.top_workspace = d.allocate<std::byte>(bytes);
+    CUDA_CHECK(cudaMemsetAsync(d.top_workspace, 0, bytes, d.s));
+  }
 }
 
 void DFlash2::bind_sharded_head(DFlash2Head& head, const Bf* embed, const float* embed_norm) {
@@ -1150,14 +1312,14 @@ void DFlash2::warmup() {
   DeviceBuffer taps(std::size_t(CommitBatch) * 4 * H * sizeof(Bf));
   CUDA_CHECK(cudaMemsetAsync(taps.p, 0, taps.bytes, d.s));
   d.commit(static_cast<const Bf*>(taps.p), 1, 0, false);
-  propose(0, true);  // Initialize the kernels before capturing.
+  propose(0, 0.f, 0, true);  // Initialize the kernels before capturing.
   d.profile.used = 0;
-  propose(0, true);
+  propose(0, 0.f, 0, true);
 
   // Capture one graph for each split count. GQA has a single split graph.
   for (int length = AttentionTile - Block + 1; length < W; length += AttentionTile) {
     d.commit(static_cast<const Bf*>(taps.p), length - d.length, d.length, false);
-    propose(0, true);
+    propose(0, 0.f, 0, true);
     if (d.gqa) break;
   }
   // When sharded (d.tp != nullptr), sharded_head runs inside every captured graph in lockstep.
@@ -1168,10 +1330,14 @@ void DFlash2::warmup() {
 }
 
 const int* DFlash2::propose(int anchor) {
-  return propose(anchor, false);
+  return propose(anchor, 0.f, 0);
 }
 
-const int* DFlash2::propose(int anchor, bool warming_up) {
+const int* DFlash2::propose(int anchor, float temperature, std::uint64_t seed) {
+  return propose(anchor, temperature, seed, false);
+}
+
+const int* DFlash2::propose(int anchor, float temperature, std::uint64_t seed, bool warming_up) {
   auto& d = *impl_;
   const int vocab_limit = d.target_head.codes ? d.target_head.rows : Vocabulary;
   if (!d.embed || anchor < 0 || anchor >= vocab_limit)
@@ -1181,7 +1347,8 @@ const int* DFlash2::propose(int anchor, bool warming_up) {
     d.profile.begin(DraftProfile::Commit);
     d.profile.end();
   }
-  input_ids<<<1, Block, 0, d.s>>>(d.ids, d.anchor_dev, anchor, d.device_position, d.length);
+  input_ids<<<1, Block, 0, d.s>>>(d.ids, d.anchor_dev, anchor, d.device_position, d.length,
+                                   d.temperature, temperature, d.seed, seed);
   const bool in_graph_sharded_head = d.sharded_head && d.tp != nullptr;
   auto launch = [&](const int* position) {
     d.profile.begin(DraftProfile::Embedding);
@@ -1200,7 +1367,7 @@ const int* DFlash2::propose(int anchor, bool warming_up) {
     d.project_head(hidden);
     d.profile.end();
     d.profile.begin(DraftProfile::Selector);
-    select(d.top_ids, d.top_values, d.anchor_dev);
+    d.select(d.top_ids, d.top_values, d.anchor_dev, true);
     d.profile.end();
   };
   if (d.device_position && d.warmed) {
@@ -1276,12 +1443,15 @@ void DFlash2::propose_sharded_head(const Bf* hidden, bool replicated) {
   d.profile.end();
   if (d.tp_rank == 0) {
     d.profile.begin(DraftProfile::Selector);
-    select(d.sharded_head->ids(), d.sharded_head->values(), d.anchor_dev);
+    d.select(d.sharded_head->ids(), d.sharded_head->values(), d.anchor_dev, true);
     d.profile.end();
   }
 }
 
 const float* DFlash2::confidence() const { return impl_->confidence; }
+const std::int32_t* DFlash2::support_ids() const { return impl_->support.ids; }
+const float* DFlash2::support_probs() const { return impl_->support.probs; }
+const std::int32_t* DFlash2::support_picked() const { return impl_->support.picked; }
 
 int batch_dflash2_max_ctx(int fallback, TpRuntime* tp, cudaStream_t stream) {
   int limit = fallback;
@@ -1379,12 +1549,7 @@ void DFlash2::commit(const Bf* taps, int n, int start, bool decode) {
 const Bf* DFlash2::forward(const Bf* embeddings) { return impl_->forward(embeddings); }
 
 const int* DFlash2::select(const int* candidates, const float* unary, const int* anchor) {
-  auto& d = *impl_;
-  d.linear(d.normed + H, Proposals, d.selector, d.projected);
-  kernels::draft::dflash2_greedy_selector(candidates, unary, d.projected, d.pred, d.succ,
-                                          anchor, d.lattice, d.tokens, d.s, d.confidence);
-  if (d.cumulative) cumulative_confidence<<<1, 1, 0, d.s>>>(d.confidence);
-  return d.tokens;
+  return impl_->select(candidates, unary, anchor, false);
 }
 
 const Bf* DFlash2::forward_pair(DFlash2& rank0, DFlash2& rank1, const Bf* embeddings,
@@ -1430,7 +1595,7 @@ const int* DFlash2::propose_pair(DFlash2& rank0, DFlash2& rank1, int anchor, boo
   auto& d0 = *rank0.impl_;
   if (!d0.embed || !d0.target_head.codes || anchor < 0 || anchor >= d0.target_head.rows)
     throw std::invalid_argument("propose_pair requires rank0 with full bound head and valid anchor");
-  input_ids<<<1, Block, 0, d0.s>>>(d0.ids, d0.anchor_dev, anchor, nullptr, d0.length);
+  input_ids<<<1, Block, 0, d0.s>>>(d0.ids, d0.anchor_dev, anchor, nullptr, d0.length, nullptr, 0.f, nullptr, 0);
   kernels::dense::embed(d0.ids, Block, d0.embed, d0.embed_norm, d0.embed_output, false, d0.s);
   convert<<<Block * H / Threads, Threads, 0, d0.s>>>(d0.embed_output, d0.embeddings, Block * H);
   const auto* hidden = forward_pair(rank0, rank1, d0.embeddings, fp32_reduce);

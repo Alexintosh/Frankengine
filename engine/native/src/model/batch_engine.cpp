@@ -94,12 +94,15 @@ BatchSpecConfig batch_spec_config(TpRuntime* tp, cudaStream_t stream) {
   return config;
 }
 
-BatchDraftSupport::BatchDraftSupport(int slots)
+BatchDraftSupport::BatchDraftSupport(int slots, TpRuntime* tp)
     : slot_temps_(slots), slot_has_support_(slots),
       slot_ids_(std::size_t(slots) * G * kSupport), slot_picked_(std::size_t(slots) * G),
       slot_probs_(slot_ids_.size()), download_ids_(slot_ids_.size()), download_picked_(slot_picked_.size()),
       download_probs_(slot_ids_.size()), row_active_(std::size_t(slots) * (G + 1)),
-      row_ids_(row_active_.size() * kSupport), row_picked_(row_active_.size()), row_probs_(row_ids_.size()) {}
+      row_ids_(row_active_.size() * kSupport), row_picked_(row_active_.size()), row_probs_(row_ids_.size()),
+      tp_(tp), broadcast_(tp ? slot_ids_.size() * sizeof(std::int32_t) + slot_probs_.size() * sizeof(float) +
+                                  slot_picked_.size() * sizeof(std::int32_t)
+                            : 0) {}
 
 void BatchDraftSupport::reset(int slot) {
   if (slot_temps_.empty()) return;
@@ -134,12 +137,29 @@ std::vector<float> BatchDraftSupport::proposal_temperatures(std::span<const std:
 
 void BatchDraftSupport::download(const BatchDFlash2::Drafts& drafts, std::size_t sequences, cudaStream_t stream) {
   const std::size_t count = sequences * G;
-  CUDA_CHECK(cudaMemcpyAsync(download_ids_.data(), drafts.support_ids, count * kSupport * sizeof(std::int32_t),
-                             cudaMemcpyDeviceToHost, stream));
-  CUDA_CHECK(cudaMemcpyAsync(download_probs_.data(), drafts.support_probs, count * kSupport * sizeof(float),
-                             cudaMemcpyDeviceToHost, stream));
-  CUDA_CHECK(cudaMemcpyAsync(download_picked_.data(), drafts.support_picked, count * sizeof(std::int32_t),
-                             cudaMemcpyDeviceToHost, stream));
+  const std::size_t ids_bytes = count * kSupport * sizeof(std::int32_t);
+  const std::size_t probs_bytes = count * kSupport * sizeof(float);
+  const std::size_t picked_bytes = count * sizeof(std::int32_t);
+  const void* ids = drafts.support_ids;
+  const void* probs = drafts.support_probs;
+  const void* picked = drafts.support_picked;
+  if (tp_) {
+    auto* base = static_cast<std::byte*>(broadcast_.p);
+    auto* probs_base = base + ids_bytes;
+    auto* picked_base = probs_base + probs_bytes;
+    if (tp_->layout.tp_rank == 0) {
+      CUDA_CHECK(cudaMemcpyAsync(base, ids, ids_bytes, cudaMemcpyDeviceToDevice, stream));
+      CUDA_CHECK(cudaMemcpyAsync(probs_base, probs, probs_bytes, cudaMemcpyDeviceToDevice, stream));
+      CUDA_CHECK(cudaMemcpyAsync(picked_base, picked, picked_bytes, cudaMemcpyDeviceToDevice, stream));
+    }
+    tp_->broadcast_proposal(base, ids_bytes + probs_bytes + picked_bytes, stream);
+    ids = base;
+    probs = probs_base;
+    picked = picked_base;
+  }
+  CUDA_CHECK(cudaMemcpyAsync(download_ids_.data(), ids, ids_bytes, cudaMemcpyDeviceToHost, stream));
+  CUDA_CHECK(cudaMemcpyAsync(download_probs_.data(), probs, probs_bytes, cudaMemcpyDeviceToHost, stream));
+  CUDA_CHECK(cudaMemcpyAsync(download_picked_.data(), picked, picked_bytes, cudaMemcpyDeviceToHost, stream));
 }
 
 void BatchDraftSupport::store(std::span<const std::int32_t> slots) {
@@ -422,7 +442,7 @@ BatchEngine::BatchEngine(const BatchEngineOptions& o)
                                                   head_ovr, dflash2_head_.get());
       }
     }
-    if (dflash2_ && dec_->reject_enabled()) draft_support_ = BatchDraftSupport(o.slots);
+    if (use_dflash2 && dec_->reject_enabled()) draft_support_ = BatchDraftSupport(o.slots, tp_.get());
     taps_chunk_ = DeviceBuffer(std::size_t(prefill_chunk_) * TAP_ROW * 2);
     gathered_ = DeviceBuffer(std::size_t(o.slots) * 8 * TAP_ROW * 2);
     rows_ = DeviceBuffer(std::size_t(o.slots) * 8 * 4);
@@ -450,7 +470,8 @@ std::size_t BatchEngine::device_bytes() const {
   for (const auto& b : dflash2_head_storage_) extra += b.bytes;
   return st_.device_bytes() + dec_->device_bytes() + pf_->device_bytes() + chunk_.bytes + logits_.bytes + first_.bytes +
          (drafter_ ? drafter_->device_bytes() : 0) + (dflash2_ ? dflash2_->device_bytes() : 0) +
-         (dflash2_head_ ? dflash2_head_->device_bytes() : 0) + extra + taps_chunk_.bytes + gathered_.bytes + rows_.bytes;
+         (dflash2_head_ ? dflash2_head_->device_bytes() : 0) + extra + taps_chunk_.bytes + gathered_.bytes +
+         rows_.bytes + draft_bcast_.bytes + draft_support_.device_bytes();
 }
 
 std::vector<std::int32_t> BatchEngine::admit(std::span<const Admission> requests) {
@@ -651,22 +672,23 @@ void BatchEngine::draft(int n) {
         total_rows += budget;
       }
     }
+    std::vector<std::int32_t> sl, an;
+    std::vector<std::int64_t> np;
+    gather_sub(df_idx, sl, an, np);
+    const auto temps = draft_support_.proposal_temperatures(sl);
+    const bool sampled = !temps.empty();
+    const auto seed = sampled ? seed_of(++draws_) : 0;
+    BatchDFlash2::Drafts d{};
     if (dflash2_) {
-      std::vector<std::int32_t> sl, an;
-      std::vector<std::int64_t> np;
-      gather_sub(df_idx, sl, an, np);
-      const auto temps = draft_support_.proposal_temperatures(sl);
-      const bool sampled = !temps.empty();
-      const BatchDFlash2::Drafts d = dflash2_->propose(
-          ndf, sl.data(), an.data(), np.data(), df_max_drafts.empty() ? nullptr : df_max_drafts.data(),
-          sampled ? temps.data() : nullptr, sampled ? seed_of(++draws_) : 0);
-      if (sampled) draft_support_.download(d, sl.size(), stream_.s);
-      scatter_sync(df_idx, d.tokens, d.conf);
-      if (sampled) draft_support_.store(sl);
-    } else if (tp_) {
-      if (dflash2_head_) dflash2_head_->run_rows(total_rows);
-      scatter_sync(df_idx, nullptr, nullptr);
+      d = dflash2_->propose(ndf, sl.data(), an.data(), np.data(),
+                            df_max_drafts.empty() ? nullptr : df_max_drafts.data(),
+                            sampled ? temps.data() : nullptr, seed);
+    } else if (dflash2_head_) {
+      dflash2_head_->run_rows(total_rows);
     }
+    if (sampled) draft_support_.download(d, sl.size(), stream_.s);
+    scatter_sync(df_idx, d.tokens, d.conf);
+    if (sampled) draft_support_.store(sl);
   }
 
   if (!ds_idx.empty()) {

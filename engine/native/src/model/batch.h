@@ -195,6 +195,7 @@ class BatchDecoder {
   std::int32_t *reject_ids_ = nullptr, *reject_picked_ = nullptr;
   float* reject_probs_ = nullptr;
   kernels::batch::RejectSpec reject_spec_;
+  kernels::batch::RejectShardPartial *local_reject_ = nullptr, *gathered_reject_ = nullptr;
   float* partial_ = nullptr;
   float* down_partial_ = nullptr;
   kernels::head::Candidate* local_cand_ = nullptr;

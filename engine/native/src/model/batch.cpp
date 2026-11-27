@@ -204,8 +204,10 @@ BatchDecoder::BatchDecoder(const Weights& w, const Ablation& abl, BatchState& st
   }
   if (partials_count) head_partials_ = static_cast<int2*>(alloc(partials_count * sizeof(int2)));
   const char* reject_env = std::getenv("INGINE_BATCH_REJECTION_SAMPLE");
-  reject_enabled_ = !tp_ && max_m > 1 && partials_count > 0 &&
+  reject_enabled_ = max_m > 1 && partials_count > 0 &&
                     (!reject_env || !*reject_env || std::strtol(reject_env, nullptr, 10) != 0);
+  if (tp_ && !tp_->agree(reject_enabled_, stream_))
+    throw std::invalid_argument("BatchDecoder: TP ranks disagree on rejection sampling");
   if (reject_enabled_) {
     const std::size_t support_count = N * kb::RejectSpec::kSupport;
     pin_reject_active_ = MappedHostBuffer(N * sizeof(std::uint8_t));
@@ -218,6 +220,10 @@ BatchDecoder::BatchDecoder(const Weights& w, const Ablation& abl, BatchState& st
     reject_picked_ = i32(N);
     reject_spec_ = {reject_active_, reject_ids_, reject_probs_, reject_picked_, f32(support_count),
                     f32(partials_count * 2)};
+    if (tp_) {
+      local_reject_ = static_cast<kb::RejectShardPartial*>(alloc(N * sizeof(kb::RejectShardPartial)));
+      gathered_reject_ = static_cast<kb::RejectShardPartial*>(alloc(2 * N * sizeof(kb::RejectShardPartial)));
+    }
   }
   if (const char* ge = std::getenv("INGINE_BATCH_GRAPH"); ge && *ge && std::atoi(ge) == 0) graph_enabled_ = false;
   // Keep the existing warmup for the path that still uses tuned dense GEMMs.
@@ -726,7 +732,20 @@ void BatchDecoder::run_body(int n, int T, int M, bool verify, std::uint64_t seed
     CUDA_CHECK(cudaMemcpy2DAsync(taps_ + std::size_t(NUM_TAPS - 1) * H, std::size_t(NUM_TAPS) * H * 2, xf_,
                                  std::size_t(H) * 2, std::size_t(H) * 2, T, cudaMemcpyDeviceToDevice, s));
   const Dense& head_w = unembed_override_ ? *unembed_override_ : w.unembed;
-  if (use_nvfp4_head_) {
+  if (tp_ && reject) {
+    if (use_nvfp4_head_) {
+      kb::head_sample_nvfp4(xf_, H, w.unembed_nvfp4, T, temps_, seed, nullptr, 0,
+                            head_partials_, nullptr, s, nullptr, d_seed_, reject, local_reject_);
+    } else {
+      const int n_local = layout_.v_end - layout_.v_begin;
+      kb::head_sample(xf_, H, head_w.w.data, H, T, n_local, H, temps_, seed, nullptr, 0,
+                      head_partials_, nullptr, s, layout_.v_begin, nullptr, d_seed_, head_w.matrix().pico12,
+                      reject, local_reject_);
+    }
+    tp_->exchange_draft_head(local_reject_, std::size_t(T) * sizeof(kb::RejectShardPartial), gathered_reject_, s);
+    const int v_split = layout_.tp_rank == 0 ? layout_.v_end : layout_.v_begin;
+    kb::head_reject_merge_tp2(gathered_reject_, v_split, temps_, seed, d_seed_, *reject, T, sampled_, s);
+  } else if (use_nvfp4_head_) {
     if (tp_) {
       kb::head_sample_nvfp4(xf_, H, w.unembed_nvfp4, T, temps_, seed, nullptr, 0,
                             head_partials_, nullptr, s, local_cand_, d_seed_);

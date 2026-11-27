@@ -766,12 +766,11 @@ __device__ __forceinline__ float reject_uniform(std::uint64_t seed, int row, int
 }
 
 __device__ int reject_token(const RejectSpec& reject, int row, float t, std::uint64_t seed,
-                            const RejectPartial& outside) {
+                            const RejectPartial& outside, const float* score) {
   constexpr int K = RejectSpec::kSupport;
   const auto offset = std::size_t(row) * K;
   const auto* ids = reject.ids + offset;
   const auto* q = reject.probs + offset;
-  const auto* score = reject.target_scores + offset;
   const float inv_t = 1.f / t;
   float z[K], max_all = outside.lse.max;
 #pragma unroll
@@ -817,9 +816,11 @@ __device__ int reject_token(const RejectSpec& reject, int row, float t, std::uin
   return fallback;
 }
 
+template <bool Sharded>
 __global__ void __launch_bounds__(PICK_T) head_reject_pick_kernel(
     const int2* __restrict__ partials, int ntiles, std::int32_t* __restrict__ out,
-    const float* temps, std::uint64_t seed, const std::uint64_t* d_seed, const __grid_constant__ RejectSpec reject) {
+    const float* temps, std::uint64_t seed, const std::uint64_t* d_seed, const __grid_constant__ RejectSpec reject,
+    int v_begin, int v_end, RejectShardPartial* __restrict__ shard_out) {
   const int row = blockIdx.x;
   const std::size_t begin = std::size_t(row) * ntiles;
   const float t = temps[row];
@@ -837,14 +838,64 @@ __global__ void __launch_bounds__(PICK_T) head_reject_pick_kernel(
   __shared__ RejectPartial reduced[PICK_T / 32];
   if ((threadIdx.x & 31) == 0) reduced[threadIdx.x >> 5] = part;
   __syncthreads();
-  if (threadIdx.x == 0 && out) {
+  const std::size_t support = std::size_t(row) * RejectSpec::kSupport;
+  if constexpr (Sharded) {
+    if (threadIdx.x < RejectSpec::kSupport) {
+      const int j = threadIdx.x;
+      const int id = active ? reject.ids[support + j] : -1;
+      // Only the owning vocabulary tile wrote this score in the current head pass.
+      shard_out[row].target_scores[j] =
+          id >= v_begin && id < v_end ? reject.target_scores[support + j] : -INFINITY;
+    }
+  }
+  if (threadIdx.x == 0 && (Sharded || out)) {
 #pragma unroll
     for (int w = 1; w < PICK_T / 32; ++w) {
       const auto other = reduced[w];
       if (better(other.key, other.token, part.key, part.token)) part.key = other.key, part.token = other.token;
       if (active) part.lse.merge(other.lse);
     }
-    out[row] = active ? reject_token(reject, row, t, d_seed ? *d_seed : seed, part) : part.token;
+    if constexpr (Sharded) {
+      auto& shard = shard_out[row];
+      shard.best_key = part.key;
+      shard.best_token = part.token;
+      shard.outside_max = part.lse.max;
+      shard.outside_sum = part.lse.sum;
+    } else {
+      out[row] = active
+                     ? reject_token(reject, row, t, d_seed ? *d_seed : seed, part, reject.target_scores + support)
+                     : part.token;
+    }
+  }
+}
+
+__global__ void head_reject_merge_tp2_kernel(const RejectShardPartial* __restrict__ gathered, int v_split,
+                                             const float* temps, std::uint64_t seed, const std::uint64_t* d_seed,
+                                             const __grid_constant__ RejectSpec reject, int M, std::int32_t* out) {
+  const int row = blockIdx.x;
+  const auto& left = gathered[row];
+  const auto& right = gathered[M + row];
+  const float t = temps[row];
+  const bool active = reject.active[row] && t > 0.f;
+  __shared__ float score[RejectSpec::kSupport];
+  if (active) {
+    if (threadIdx.x < RejectSpec::kSupport) {
+      const int j = threadIdx.x;
+      const int id = reject.ids[std::size_t(row) * RejectSpec::kSupport + j];
+      score[j] = id < v_split ? left.target_scores[j] : right.target_scores[j];
+    }
+    __syncwarp();
+  }
+  if (threadIdx.x == 0) {
+    RejectPartial part{left.best_key, left.best_token, {left.outside_max, left.outside_sum}};
+    if (better(right.best_key, right.best_token, part.key, part.token))
+      part.key = right.best_key, part.token = right.best_token;
+    if (active) {
+      part.lse.merge({right.outside_max, right.outside_sum});
+      out[row] = reject_token(reject, row, t, d_seed ? *d_seed : seed, part, score);
+    } else {
+      out[row] = part.token;
+    }
   }
 }
 
@@ -1391,10 +1442,16 @@ std::size_t head_partials_nvfp4(int M, int N) {
   return std::size_t(M) * ((N + NVFP4_SMALL_TILE - 1) / NVFP4_SMALL_TILE);
 }
 
+void head_reject_merge_tp2(const RejectShardPartial* gathered, int v_split, const float* temps,
+                           std::uint64_t seed, const std::uint64_t* d_seed, const RejectSpec& reject,
+                           int M, std::int32_t* out, cudaStream_t stream) {
+  head_reject_merge_tp2_kernel<<<M, 32, 0, stream>>>(gathered, v_split, temps, seed, d_seed, reject, M, out);
+}
+
 void head_sample(const __nv_bfloat16* A, int lda, const void* B, int ldb, int M, int N, int K,
                  const float* temps, std::uint64_t seed, float* logits, int ldc, int2* partials, std::int32_t* out,
                  cudaStream_t stream, int v_begin, void* cand_out, const std::uint64_t* d_seed,
-                 const pico12::Layout* packed, const RejectSpec* reject) {
+                 const pico12::Layout* packed, const RejectSpec* reject, RejectShardPartial* reject_shard_out) {
   if (M <= 0 || N <= 0 || K % BK || lda % 8 || ldb % 8 || (logits && (N % 2 || ldc % 2)) ||
       (packed && (packed->rows != N || packed->cols != K)))
     throw std::invalid_argument("batch head_sample: unsupported shape");
@@ -1410,9 +1467,14 @@ void head_sample(const __nv_bfloat16* A, int lda, const void* B, int ldb, int M,
     if (M <= 32) launch_tile.template operator()<Cfg32>();
     else launch_tile.template operator()<Cfg64>();
   };
-  if (reject && !cand_out && v_begin == 0) {
+  if (reject && (reject_shard_out || (!cand_out && v_begin == 0))) {
     dispatch.template operator()<true>({a, *reject});
-    head_reject_pick_kernel<<<M, PICK_T, 0, stream>>>(partials, a.ntiles, out, temps, seed, d_seed, *reject);
+    if (reject_shard_out)
+      head_reject_pick_kernel<true><<<M, PICK_T, 0, stream>>>(
+          partials, a.ntiles, nullptr, temps, seed, d_seed, *reject, v_begin, v_begin + N, reject_shard_out);
+    else
+      head_reject_pick_kernel<false><<<M, PICK_T, 0, stream>>>(
+          partials, a.ntiles, out, temps, seed, d_seed, *reject, 0, 0, nullptr);
   } else {
     dispatch.template operator()<false>(a);
     head_pick_kernel<<<M, PICK_T, 0, stream>>>(partials, a.ntiles, out, static_cast<int2*>(cand_out));
@@ -1421,7 +1483,8 @@ void head_sample(const __nv_bfloat16* A, int lda, const void* B, int ldb, int M,
 
 void head_sample_nvfp4(const __nv_bfloat16* A, int lda, kernels::head::Nvfp4Matrix w, int M, const float* temps,
                        std::uint64_t seed, float* logits, int ldc, int2* partials, std::int32_t* out,
-                       cudaStream_t stream, void* cand_out, const std::uint64_t* d_seed, const RejectSpec* reject) {
+                       cudaStream_t stream, void* cand_out, const std::uint64_t* d_seed, const RejectSpec* reject,
+                       RejectShardPartial* reject_shard_out) {
   if (M <= 0 || !A || !w.codes || !w.scales || w.rows <= 0 || lda % 8)
     throw std::invalid_argument("batch head_sample_nvfp4: unsupported shape");
   const int tile = M <= NVFP4_SMALL_M ? NVFP4_SMALL_TILE : NVFP4_TILED_TN;
@@ -1432,9 +1495,14 @@ void head_sample_nvfp4(const __nv_bfloat16* A, int lda, kernels::head::Nvfp4Matr
     else if (M <= 32) launch_nvfp4_tiled<Nvfp4Cfg32, Reject>(args, stream);
     else launch_nvfp4_tiled<Nvfp4Cfg64, Reject>(args, stream);
   };
-  if (reject && !cand_out && w.v_begin == 0) {
+  if (reject && (reject_shard_out || (!cand_out && w.v_begin == 0))) {
     dispatch.template operator()<true>({a, *reject});
-    head_reject_pick_kernel<<<M, PICK_T, 0, stream>>>(partials, ntiles, out, temps, seed, d_seed, *reject);
+    if (reject_shard_out)
+      head_reject_pick_kernel<true><<<M, PICK_T, 0, stream>>>(
+          partials, ntiles, nullptr, temps, seed, d_seed, *reject, w.v_begin, w.v_begin + w.rows, reject_shard_out);
+    else
+      head_reject_pick_kernel<false><<<M, PICK_T, 0, stream>>>(
+          partials, ntiles, out, temps, seed, d_seed, *reject, 0, 0, nullptr);
   } else {
     dispatch.template operator()<false>(a);
     head_pick_kernel<<<M, PICK_T, 0, stream>>>(partials, ntiles, out, static_cast<int2*>(cand_out));

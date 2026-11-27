@@ -143,6 +143,23 @@ class TpGenerator final : public model::Generator {
     return inner_->prefill_slot_chunk(slot, prompt, offset, sampling, stop_at);
   }
 
+  bool supports_batch_short_prefill() const override { return inner_->supports_batch_short_prefill(); }
+
+  std::vector<model::PrefillChunkResult> prefill_batch_short(
+      std::span<const model::BatchPrefillSlot> slots, int max_steps = 0) override {
+    auto packed = nlohmann::json::array();
+    for (const auto& input : slots) {
+      if (!input.sampling) throw std::invalid_argument("missing short batch sampling");
+      const auto& sample = input.sampling->params;
+      packed.push_back({{"slot", input.slot}, {"offset", input.offset},
+                        {"prompt", std::vector<int32_t>(input.prompt.begin(), input.prompt.end())},
+                        {"temperature", sample.temperature}, {"top_p", sample.top_p}, {"top_k", sample.top_k}});
+    }
+    socket_->send_frame(nlohmann::json{{"op", "prefill_batch_short"}, {"max_steps", max_steps},
+                                      {"slots", std::move(packed)}}.dump());
+    return inner_->prefill_batch_short(slots, max_steps);
+  }
+
   bool clone_slot(int src_slot, int dst_slot) override {
     socket_->send_frame(nlohmann::json{{"op", "clone"}, {"src", src_slot}, {"dst", dst_slot}}.dump());
     return inner_->clone_slot(src_slot, dst_slot);
@@ -232,6 +249,28 @@ inline void run_tp_worker(model::Generator& generator, TpControl& socket) {
         rows.push_back({row.at(0).get<int>(), row.at(1).get<int32_t>(), &samples[i]});
       }
       generator.decode_batch_step(rows);
+      continue;
+    }
+    if (op == "prefill_batch_short") {
+      const auto& packed = request.at("slots");
+      std::vector<std::vector<int32_t>> prompts(packed.size());
+      std::vector<model::BatchSampling> samples(packed.size());
+      std::vector<model::BatchPrefillSlot> slots;
+      slots.reserve(packed.size());
+      for (std::size_t i = 0; i < packed.size(); ++i) {
+        const auto& input = packed.at(i);
+        prompts[i] = input.at("prompt").get<std::vector<int32_t>>();
+        auto& sample = samples[i].params;
+        sample.temperature = input.at("temperature").get<float>();
+        sample.top_p = input.at("top_p").get<float>();
+        sample.top_k = input.at("top_k").get<int>();
+        slots.push_back({input.at("slot").get<int>(), prompts[i], input.at("offset").get<int>(), &samples[i]});
+      }
+      try {
+        generator.prefill_batch_short(slots, request.at("max_steps").get<int>());
+      } catch (const std::invalid_argument&) {
+        // Rank 0 rejects the same invalid batch before entering a collective.
+      }
       continue;
     }
     if (op == "prefill") {

@@ -29,7 +29,7 @@ struct Strided {
   std::int64_t a = 0, b = 0, c = 0;
 };
 
-// Host launch descriptor containing device pointers. Only used for an unsharded head without cand_out.
+// Host launch descriptor containing device pointers.
 struct RejectSpec {
   static constexpr int kSupport = 16;
   const std::uint8_t* active = nullptr;  // [M]: enable rejection sampling at positive temperature
@@ -40,6 +40,20 @@ struct RejectSpec {
   float* partial_lse = nullptr;         // Two floats per partial: (max, relative sum) outside support
 };
 
+// One row of a rank's rejection statistics. Support scores outside the rank's vocabulary are -infinity.
+struct RejectShardPartial {
+  float best_key;
+  std::int32_t best_token;
+  float outside_max, outside_sum;
+  float target_scores[RejectSpec::kSupport];
+};
+static_assert(sizeof(RejectShardPartial) == 80);
+
+// Each rank contributes M consecutive rows, in rank order.
+void head_reject_merge_tp2(const RejectShardPartial* gathered, int v_split, const float* temps,
+                           std::uint64_t seed, const std::uint64_t* d_seed, const RejectSpec& reject,
+                           int M, std::int32_t* out, cudaStream_t stream);
+
 // The head with kernels::batch::sample's token choice fused (raw logits): L[M, N] = A[M, K] . B[N, K]^T (BF16,
 // mma.m16n8k16, FP32 accumulation; CTA tiles of 64 or, up to 32 rows, 32 rows of A x 128 rows of B, K in 64-element
 // stages, the first weight stages loaded before the wait for the previous kernel: programmatic dependent launch),
@@ -47,14 +61,15 @@ struct RejectSpec {
 // key_v = s_v = 30 tanh(bf16(L[r, v]) / 30) where temps[r] <= 0, else s_v / temps[r] + G(seed, r, v) as sample
 // computes it: the same token as sample over the stored logits. Each CTA writes its rows' best (key, v) to
 // partials (head_partials(M, N) elements), a second kernel picks per row. temps: device fp32 [M]; out: device int32
-// [M]. With a RejectSpec, active rows sample using the draft proposal and its target residual.
+// [M]. With a RejectSpec, active rows sample using the draft proposal and its target residual. On a vocabulary
+// shard, provide reject_shard_out [M] in place of out and cand_out to export the row statistics for the merge.
 // With packed metadata, B is a PICO12 blob decoded into BF16 tiles. Requires K % 64 == 0, lda and ldb multiples of 8, N (and ldc) even, A, B 16-byte and logits 8-byte aligned.
 std::size_t head_partials(int M, int N);
 void head_sample(const __nv_bfloat16* A, int lda, const void* B, int ldb, int M, int N, int K,
                  const float* temps, std::uint64_t seed, float* logits, int ldc, int2* partials, std::int32_t* out,
                  cudaStream_t stream, int v_begin = 0, void* cand_out = nullptr,
                  const std::uint64_t* d_seed = nullptr, const pico12::Layout* packed = nullptr,
-                 const RejectSpec* reject = nullptr);
+                 const RejectSpec* reject = nullptr, RejectShardPartial* reject_shard_out = nullptr);
 
 // NVFP4 unembedding head with kernels::batch::sample fused: reads NVFP4 weights (3.56x smaller than BF16) with
 // exact nvfp4::decode arithmetic, supporting any M >= 1, greedy or Gumbel-max sampling, and CUDA-graph capture via d_seed.
@@ -62,7 +77,7 @@ std::size_t head_partials_nvfp4(int M, int N);
 void head_sample_nvfp4(const __nv_bfloat16* A, int lda, kernels::head::Nvfp4Matrix w, int M, const float* temps,
                        std::uint64_t seed, float* logits, int ldc, int2* partials, std::int32_t* out,
                        cudaStream_t stream, void* cand_out = nullptr, const std::uint64_t* d_seed = nullptr,
-                       const RejectSpec* reject = nullptr);
+                       const RejectSpec* reject = nullptr, RejectShardPartial* reject_shard_out = nullptr);
 
 // Fused NVFP4 head + exact top-16 candidate selection per row (raw logits before softcap, tie-break by lowest global id).
 // Supports arbitrary M >= 1 (K = 2304). ws must hold head_topk16_nvfp4_workspace_bytes(M, w.rows) bytes.

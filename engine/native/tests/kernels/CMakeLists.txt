@@ -11,3 +11,6 @@ ingine_add_test(NAME test_tp2_kernels SOURCES test_tp2_kernels.cu LIBS ingine_mo
 
 ingine_add_test(NAME kernels_batch SOURCES test_batch.cpp
   LIBS ingine_kernels_dense ingine_kernels_attn GPU TIMEOUT 120)
+
+ingine_add_test(NAME kernels_batch_reject_tp2 SOURCES test_batch_reject_tp2.cpp
+  LIBS ingine_kernels_batch GPU TIMEOUT 120)
