@@ -16,7 +16,7 @@ Same-harness measurement using [`knapcio/inkling-2-mini-spark-bench`](https://gi
 | **VRAM Used (`256K` + `32×32K` batch)** | `~55 GiB` (`56.8 GiB` free) | **`54.6 / 97.9 GiB`** | — |
 | **`speedbench full` ALL 73 (`c1`, reasoning on)** | `82.1 tok/s` *(geo `86.0`, TTFT `49.7 ms`)* | **`398.4 tok/s`** *(geo `410.4`, TTFT `9.7 ms`)* | **`4.85×`** |
 | **Prose / Code (`c1`)** | `78.8 / 96.3 tok/s` | **`379.2 / 416.2 tok/s`** | **`4.81× / 4.32×`** |
-| **Thinking `c1` (`T=0.8`, high)** | `83.2 tok/s` (`87.7/req`, TTFT `0.17 s`) | **`412.2 tok/s`** (`422.5/req`, TTFT `0.04 s`) | **`4.95×`** |
+| **Thinking `c1` (`T=0.8`, high)** | `88.7 tok/s` (`90.6/req`, TTFT `0.16 s`) | **`412.2 tok/s`** (`422.5/req`, TTFT `0.04 s`) | **`4.65×`** |
 | **Thinking `c8` (`16×4096`, `T=0.8`)** | `269.9 tok/s` (`40.1/req`, TTFT `0.36 s`) | **`1,020.1 tok/s`** (`152.8/req`, TTFT `0.27 s`) | **`3.78×`** |
 | **Thinking `c24` (`48×4096`, `T=0.8`)** | `522.7 tok/s` (`26.6/req`, TTFT `0.69 s`) | **`2,339.9 tok/s`** (`119.3/req`, TTFT `0.45 s`) | **`4.48×`** |
 | **Decode Table Prose `c8 / c24`** | `191.3 / 380.9 tok/s` | **`750.5 / 1,586.2 tok/s`** | **`3.92× / 4.16×`** |
@@ -79,6 +79,18 @@ Each DGX Spark (`GB10`) has **128 GB LPDDR5X unified memory** (`231.38 GB/s` str
 ---
 
 ## 4. Batched Speculative Decoding & Persistent Prefix Cache (`2× DGX Spark TP=2`)
+
+### A0. `spark-bench` Thinking & Decode Table (`2× DGX Spark TP=2`, `fp32` wire, 80 B/row Exact Rejection Sampling)
+
+Measured live on `2× DGX Spark (GB10)` over dual-rail ConnectX-7 RoCEv2 (`8 s` startup, `0` failed requests, `30/30` quality guard `PASS` at `136.4 tok/s`, `30.6 ms` TTFT, drift `-0.06%`):
+
+| Workload (`2× DGX Spark TP=2`, `spark-bench`) | Before (`REJECT=0`) | **After (`Track 4 + 5`, `REJECT=1`)** | Gain |
+|---|---:|---:|---:|
+| **Thinking `c = 1` (`3×2048`, `T=0.8`, high)** | `137.3 tok/s` (`141.2/req`, TTFT `0.12 s`) | **`142.3 tok/s`** (`142.9/req`, TTFT `0.12 s`) | **`+3.6%`** |
+| **Thinking `c = 8` (`16×4096`, `T=0.8`, high)** | `325.1 tok/s` (`47.0/req`, TTFT `0.42 s`) | **`365.1 tok/s`** (`53.6/req`, TTFT `0.41 s`) | **`+12.3%`** (`+14.0%/req`) |
+| **Thinking `c = 24` (`48×4096`, `T=0.8`, high)** | `599.2 tok/s` (`31.2/req`, TTFT `0.56 s`) | **`698.8 tok/s`** (`33.9/req`, TTFT `0.64 s`) | **`+16.6%`** |
+| **Thinking `c = 32` (`32×2048`, `T=0.8`, high)** | `717.8 tok/s` (`26.4/req`) | **`787.0–798.5 tok/s`** (`29.9/req`) | **`+10–11%`** (`+13.3%/req`) |
+| **Decode Table Code `c = 8`** | `274.0 tok/s` (`TTFT 0.566 s`) | **`280.3 tok/s`** (`TTFT 0.247 s`) | **`+2.3%`** (`-56%` TTFT) |
 
 ### A. Live OpenAI HTTP/SSE (`--max-batch 32 --batch-ctx 32768 --batch-spec 7 --tp-wire bf16-moe`)
 

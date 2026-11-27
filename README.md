@@ -11,16 +11,21 @@ Frankengine is a C++/CUDA inference engine for **`Inkling-2-Mini` (`30B-A3.6B` L
   <img src="docs/assets/frankengine_tp1_leaderboard.png" alt="Inkling-2-Mini 1× DGX Spark Public Recipes Leaderboard (Frankengine TP=1 FP8 & Bit-Exact Lossless)" width="880"/>
 </p>
 
+<p align="center">
+  <img src="docs/assets/frankengine_hardware_scaling.png" alt="Frankengine Blackwell Hardware Scaling (1× & 2× DGX Spark TP=2 RoCEv2, 1× RTX PRO 6000 96 GB)" width="880"/>
+</p>
+
 ## Highlights
 
-Measured with [`knapcio/inkling-2-mini-spark-bench`](https://github.com/knapcio/inkling-2-mini-spark-bench) (`Vision ON`, `0` errors, `128K` + `240K` needles `PASS`, `30/30` quality guard `PASS`):
+Measured with [`knapcio/inkling-2-mini-spark-bench`](https://github.com/knapcio/inkling-2-mini-spark-bench) (`0` errors, `128K` + `240K` needles `PASS`, `30/30` quality guard `PASS`):
 
-| Hardware & Preset | Lossy? | ALL 73 (`c1`) | Thinking `c8` | Thinking `c24` | Prefill `128K` | Startup | Quality (`/295`) |
+| Hardware & Preset | Lossy? | ALL 73 / Guard (`c1`) | Thinking `c1` | Thinking `c8` | Thinking `c24` | Startup | Quality (`/295`) |
 |---|---|---:|---:|---:|---:|---:|---:|
-| **1× RTX PRO 6000 96 GB (FP8)** | Yes (`FP8`) | **`398.4 tok/s`** | **`1,020`** | **`2,340`** | **`18,743`** | **`3 s`** | `30/30 PASS` |
-| **1× RTX PRO 6000 96 GB (`PICO12 + CERT`)** | **No (bit-exact)** | **`365.9 tok/s`** | **`809`** | **`1,764`** | **`14,512`** | **`4 s`** | `30/30 PASS` |
-| **1× DGX Spark GB10 (FP8)** | Yes (`FP8`) | **`82.1 tok/s`** | **`270`** | **`523`** | **`3,930`** | **`8 s`** | `285.7` |
-| **1× DGX Spark GB10 (`PICO12 + CERT`)** | **No (bit-exact)** | **`76.7 tok/s`** | **`219`** | **`449`** | **`3,146`** | **`10 s`** | **`286.0`** |
+| **1× RTX PRO 6000 96 GB (FP8)** | Yes (`FP8`) | **`398.4 tok/s`** | **`412.2`** | **`1,020`** | **`2,340`** | **`3 s`** | `30/30 PASS` |
+| **1× RTX PRO 6000 96 GB (`PICO12 + CERT`)** | **No (bit-exact)** | **`365.9 tok/s`** | **`357.6`** | **`809`** | **`1,764`** | **`4 s`** | `30/30 PASS` |
+| **2× DGX Spark GB10 (`TP=2` RoCEv2, FP8)** | Yes (`FP8`) | **`136.4 tok/s`** *(guard)* | **`142.3`** | **`365`** | **`699`** *(c32 `799`)* | **`8 s`** | `30/30 PASS` |
+| **1× DGX Spark GB10 (FP8, Vision ON)** | Yes (`FP8`) | **`82.1 tok/s`** | **`88.7`** | **`270`** | **`523`** | **`8 s`** | `285.7` |
+| **1× DGX Spark GB10 (`PICO12 + CERT`, Vision ON)** | **No (bit-exact)** | **`76.7 tok/s`** | **`73.2`** | **`219`** | **`449`** | **`10 s`** | **`286.0`** |
 
 Full tables (including `2× DGX Spark TP=2` RoCEv2, `Decode Table`, `Decode @32K/@128K`, and Persistent Prefix Cache): [**Benchmarks**](docs/BENCHMARKS.md).
 
