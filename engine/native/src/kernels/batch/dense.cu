@@ -9,6 +9,7 @@
 
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 
 namespace ingine::kernels::batch {
 namespace {
@@ -51,13 +52,13 @@ __device__ __forceinline__ std::uint64_t mix64(std::uint64_t z) {
 __device__ __forceinline__ std::uint64_t row_key(std::uint64_t seed, int row) {
   return mix64(seed ^ (std::uint64_t(row) * 0xD1B54A32D192ED03ull));
 }
+__device__ __forceinline__ float gumbel_key(float z, std::uint64_t rkey, int v) {
+  const float u = (float(mix64(rkey ^ std::uint64_t(v)) >> 41) + 0.5f) * (1.f / 8388608.f);
+  return z - logf(-logf(u));
+}
 __device__ __forceinline__ float pick_key(float l, bool greedy, float inv_t, std::uint64_t rkey, int v) {
-  float key = 30.f * tanhf(bf16r(l) / 30.f);
-  if (!greedy) {
-    const float u = (float(mix64(rkey ^ std::uint64_t(v)) >> 41) + 0.5f) * (1.f / 8388608.f);
-    key = key * inv_t - logf(-logf(u));
-  }
-  return key;
+  const float score = 30.f * tanhf(bf16r(l) / 30.f);
+  return greedy ? score : gumbel_key(score * inv_t, rkey, v);
 }
 __device__ __forceinline__ bool better(float a, int av, float b, int bv) { return a > b || (a == b && av < bv); }
 template <int LANES>
@@ -67,6 +68,164 @@ __device__ __forceinline__ void lanes_best(float& k, int& v) {
     const float ok = __shfl_xor_sync(0xffffffffu, k, o);
     const int ov = __shfl_xor_sync(0xffffffffu, v, o);
     if (better(ok, ov, k, v)) k = ok, v = ov;
+  }
+}
+
+template <class Args>
+struct HeadWithReject : Args {
+  RejectSpec reject;
+};
+
+template <class Args, bool Reject>
+using HeadKernelArgs = std::conditional_t<Reject, HeadWithReject<Args>, Args>;
+
+struct OutsideLse {
+  float max;
+  float sum;
+
+  __device__ __forceinline__ void add(float z) {
+    if (z > max) {
+      sum = sum * expf(max - z) + 1.f;
+      max = z;
+    } else {
+      sum += expf(z - max);
+    }
+  }
+
+  __device__ __forceinline__ void merge(OutsideLse other) {
+    if (other.sum == 0.f) return;
+    if (other.max > max) {
+      sum = sum * expf(max - other.max) + other.sum;
+      max = other.max;
+    } else {
+      sum += other.sum * expf(other.max - max);
+    }
+  }
+};
+
+template <int Lanes>
+__device__ __forceinline__ void lanes_merge(OutsideLse& lse) {
+#pragma unroll
+  for (int o = 1; o < Lanes; o <<= 1) {
+    const OutsideLse other{__shfl_xor_sync(0xffffffffu, lse.max, o), __shfl_xor_sync(0xffffffffu, lse.sum, o)};
+    lse.merge(other);
+  }
+}
+
+// After MMA, reuse the staging arena for a map from tile column to draft index plus one.
+// Each support entry is read once per CTA. Distinct IDs guarantee disjoint writes.
+template <int TM, int TN, int NT>
+__device__ __forceinline__ void load_support(std::uint8_t* support, int m_begin, int m_rows, int v_begin,
+                                            const float* temps, const RejectSpec& reject) {
+  for (int i = threadIdx.x; i < TM * TN / 4; i += NT)
+    reinterpret_cast<std::uint32_t*>(support)[i] = 0;
+  __syncthreads();
+  for (int i = threadIdx.x; i < m_rows * RejectSpec::kSupport; i += NT) {
+    const int grow = m_begin + i / RejectSpec::kSupport;
+    if (reject.active[grow] && temps[grow] > 0.f) {
+      const int col = reject.ids[m_begin * std::size_t(RejectSpec::kSupport) + i] - v_begin;
+      if (static_cast<unsigned>(col) < TN)
+        support[(i / RejectSpec::kSupport) * TN + col] = i % RejectSpec::kSupport + 1;
+    }
+  }
+  __syncthreads();
+}
+
+__device__ __forceinline__ float reject_key(float dot, float inv_t, std::uint64_t rkey, int v, int support,
+                                           float* target_scores, OutsideLse& lse) {
+  const float score = 30.f * tanhf(bf16r(dot) / 30.f);
+  if (support) {
+    target_scores[support - 1] = score;
+    return -INFINITY;
+  }
+  const float z = score * inv_t;
+  lse.add(z);
+  return gumbel_key(z, rkey, v);
+}
+
+struct RejectPartial {
+  float key;
+  int token;
+  OutsideLse lse;
+};
+
+__device__ __forceinline__ void store_reject_partial(std::size_t i, int2* partials, float* partial_lse,
+                                                     const RejectPartial& part, bool active) {
+  partials[i] = make_int2(__float_as_int(part.key), part.token);
+  if (active) {
+    partial_lse[2 * i] = part.lse.max;
+    partial_lse[2 * i + 1] = part.lse.sum;
+  }
+}
+
+template <class C, class Args>
+__device__ __forceinline__ void head_reject_epilogue(const Args& p, std::uint8_t* smem,
+                                                     float (&acc)[C::MF][C::NF][4], int m_rows, int n_rows,
+                                                     int v_begin) {
+  constexpr int TM = C::TM, TN = C::TN, NT = C::NT;
+  static_assert(TM * TN + TM * C::WN * sizeof(RejectPartial) <= C::SMEM);
+  const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+  const int warp_m = warp / C::WN, warp_n = warp % C::WN;
+  const int m_begin = blockIdx.x * TM, n_begin = blockIdx.y * TN;
+  const auto& reject = p.reject;
+  // All warps must finish reading the MMA staging buffers before their storage is reused.
+  __syncthreads();
+  load_support<TM, TN, NT>(smem, m_begin, m_rows, v_begin + n_begin, p.temps, reject);
+  auto* reduction = reinterpret_cast<RejectPartial(*)[C::WN]>(smem + TM * TN);
+  const std::uint64_t seed = p.d_seed ? *p.d_seed : p.seed;
+#pragma unroll
+  for (int i = 0; i < C::MF; ++i)
+#pragma unroll
+    for (int h = 0; h < 2; ++h) {
+      const int row = warp_m * C::MF * 16 + i * 16 + (lane >> 2) + h * 8, grow = m_begin + row;
+      RejectPartial part{-INFINITY, 0x7fffffff, {-INFINITY, 0.f}};
+      const float t = row < m_rows ? p.temps[grow] : 0.f;
+      const bool greedy = !(t > 0.f);
+      const bool active = !greedy && reject.active[grow];
+      const float inv_t = greedy ? 1.f : 1.f / t;
+      const std::uint64_t rkey = row_key(seed, grow);
+      if (row < m_rows) {
+#pragma unroll
+        for (int j = 0; j < C::NF; ++j) {
+          const int col = warp_n * C::NF * 8 + j * 8 + (lane & 3) * 2;
+          if (col >= n_rows) continue;
+          if (p.C) {
+            auto* dst = p.C + std::size_t(grow) * p.ldc + n_begin + col;
+            if (col + 1 < n_rows)
+              *reinterpret_cast<float2*>(dst) = make_float2(acc[i][j][2 * h], acc[i][j][2 * h + 1]);
+            else
+              *dst = acc[i][j][2 * h];
+          }
+#pragma unroll
+          for (int e = 0; e < 2; ++e) {
+            if (col + e >= n_rows) continue;
+            const int v = v_begin + n_begin + col + e;
+            const int support = active ? smem[row * TN + col + e] : 0;
+            const float dot = acc[i][j][2 * h + e];
+            const float key = active
+                                  ? reject_key(dot, inv_t, rkey, v, support,
+                                               reject.target_scores + std::size_t(grow) * RejectSpec::kSupport, part.lse)
+                                  : pick_key(dot, greedy, inv_t, rkey, v);
+            if (!support && better(key, v, part.key, part.token)) part.key = key, part.token = v;
+          }
+        }
+      }
+      lanes_best<4>(part.key, part.token);
+      lanes_merge<4>(part.lse);
+      if ((lane & 3) == 0) reduction[row][warp_n] = part;
+    }
+  __syncthreads();
+  for (int row = threadIdx.x; row < m_rows; row += NT) {
+    auto part = reduction[row][0];
+#pragma unroll
+    for (int w = 1; w < C::WN; ++w) {
+      const auto other = reduction[row][w];
+      if (better(other.key, other.token, part.key, part.token)) part.key = other.key, part.token = other.token;
+      part.lse.merge(other.lse);
+    }
+    const int grow = m_begin + row;
+    store_reject_partial(std::size_t(grow) * p.ntiles + blockIdx.y, p.partials, reject.partial_lse, part,
+                         reject.active[grow] && p.temps[grow] > 0.f);
   }
 }
 
@@ -107,8 +266,8 @@ struct MmaCfg {
   static_assert(NF % 2 == 0 && SMEM <= 96 * 1024);
 };
 
-template <class C, bool Packed, bool Escapes>
-__global__ void __launch_bounds__(C::NT) head_kernel(const HeadArgs p) {
+template <class C, bool Packed, bool Escapes, bool Reject>
+__global__ void __launch_bounds__(C::NT) head_kernel(const HeadKernelArgs<HeadArgs, Reject> p) {
   extern __shared__ __align__(128) std::uint8_t smem[];
   constexpr int MF = C::MF, NF = C::NF, TM = C::TM, TN = C::TN, NT = C::NT, STAGES = C::STAGES;
   const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
@@ -196,6 +355,11 @@ __global__ void __launch_bounds__(C::NT) head_kernel(const HeadArgs p) {
   cp_wait<0>();
   asm volatile("griddepcontrol.launch_dependents;\n" ::: "memory");
 
+  if constexpr (Reject) {
+    head_reject_epilogue<C>(p, smem, acc, m_rows, n_rows, p.v_begin);
+    return;
+  }
+
   const std::uint64_t seed = p.d_seed ? *p.d_seed : p.seed;
   float best_k[MF][2];
   int best_v[MF][2];
@@ -252,6 +416,8 @@ __global__ void __launch_bounds__(C::NT) head_kernel(const HeadArgs p) {
 // =================================================================================================
 constexpr int NVFP4_SMALL_TILE = 16;
 constexpr int NVFP4_SMALL_SPLIT = 6;
+constexpr int NVFP4_SMALL_M = 8;
+constexpr int NVFP4_SMALL_REJECT_SMEM = NVFP4_SMALL_M * NVFP4_SMALL_TILE * (sizeof(std::uint8_t) + sizeof(float));
 constexpr int NVFP4_TILED_TN = 128;
 
 struct HeadNvfp4Args {
@@ -280,11 +446,14 @@ __device__ __forceinline__ std::uint32_t decode_e2m1_byte_scaled(std::uint8_t co
   return nvfp4::pack_bf16(v.x * factor, v.y * factor);
 }
 
+template <bool Reject>
 __global__ void __launch_bounds__(NVFP4_SMALL_SPLIT * 32)
-    head_nvfp4_small_kernel(const HeadNvfp4Args p) {
+    head_nvfp4_small_kernel(const HeadKernelArgs<HeadNvfp4Args, Reject> p) {
   __shared__ float partial[NVFP4_SMALL_SPLIT][32][4];
-  __shared__ float sk[8][NVFP4_SMALL_TILE];
-  __shared__ int sv[8][NVFP4_SMALL_TILE];
+  __shared__ float sk[NVFP4_SMALL_M][NVFP4_SMALL_TILE];
+  __shared__ int sv[NVFP4_SMALL_M][NVFP4_SMALL_TILE];
+  extern __shared__ __align__(16) std::uint8_t reject_smem[];
+  auto* scaled = reinterpret_cast<float(*)[NVFP4_SMALL_TILE]>(reject_smem + NVFP4_SMALL_M * NVFP4_SMALL_TILE);
   constexpr int Chunks = H / (32 * 4 * NVFP4_SMALL_SPLIT);  // 2304 / 768 = 3
   const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
   const int row = blockIdx.x * NVFP4_SMALL_TILE + (lane >> 2);
@@ -323,6 +492,10 @@ __global__ void __launch_bounds__(NVFP4_SMALL_SPLIT * 32)
   __syncthreads();
   asm volatile("griddepcontrol.launch_dependents;\n" ::: "memory");
 
+  if constexpr (Reject)
+    load_support<NVFP4_SMALL_M, NVFP4_SMALL_TILE, NVFP4_SMALL_SPLIT * 32>(
+        reject_smem, 0, p.M, p.w.v_begin + blockIdx.x * NVFP4_SMALL_TILE, p.temps, p.reject);
+
   if (warp == 0) {
     const std::uint64_t seed = p.d_seed ? *p.d_seed : p.seed;
 #pragma unroll
@@ -334,16 +507,35 @@ __global__ void __launch_bounds__(NVFP4_SMALL_SPLIT * 32)
         for (int j = 0; j < NVFP4_SMALL_SPLIT; ++j) dot += partial[j][lane][i];
         float key = -INFINITY;
         int v = 0x7fffffff;
+        float z = -INFINITY;
         if (r < p.w.rows) {
           if (p.C) p.C[std::size_t(m) * p.ldc + r] = dot;
           const float temp = p.temps[m];
           const bool greedy = !(temp > 0.f);
           const float inv_t = greedy ? 1.f : 1.f / temp;
           v = p.w.v_begin + r;
-          key = pick_key(dot, greedy, inv_t, row_key(seed, m), v);
+          if constexpr (Reject) {
+            if (!greedy && p.reject.active[m]) {
+              const int col = r - blockIdx.x * NVFP4_SMALL_TILE;
+              const int support = reject_smem[m * NVFP4_SMALL_TILE + col];
+              const float score = 30.f * tanhf(bf16r(dot) / 30.f);
+              if (support) {
+                p.reject.target_scores[m * RejectSpec::kSupport + support - 1] = score;
+                v = 0x7fffffff;
+              } else {
+                z = score * inv_t;
+                key = gumbel_key(z, row_key(seed, m), v);
+              }
+            } else {
+              key = pick_key(dot, greedy, inv_t, row_key(seed, m), v);
+            }
+          } else {
+            key = pick_key(dot, greedy, inv_t, row_key(seed, m), v);
+          }
         }
         sk[m][r - blockIdx.x * NVFP4_SMALL_TILE] = key;
         sv[m][r - blockIdx.x * NVFP4_SMALL_TILE] = v;
+        if constexpr (Reject) scaled[m][r - blockIdx.x * NVFP4_SMALL_TILE] = z;
       }
     }
   }
@@ -355,7 +547,19 @@ __global__ void __launch_bounds__(NVFP4_SMALL_SPLIT * 32)
 #pragma unroll
     for (int i = 1; i < NVFP4_SMALL_TILE; ++i)
       if (better(sk[m][i], sv[m][i], bk, bv)) bk = sk[m][i], bv = sv[m][i];
-    p.partials[std::size_t(m) * p.ntiles + blockIdx.x] = make_int2(__float_as_int(bk), bv);
+    const std::size_t i = std::size_t(m) * p.ntiles + blockIdx.x;
+    if constexpr (Reject) {
+      const bool active = p.reject.active[m] && p.temps[m] > 0.f;
+      OutsideLse lse{-INFINITY, 0.f};
+      if (active) {
+#pragma unroll
+        for (int col = 0; col < NVFP4_SMALL_TILE; ++col)
+          if (scaled[m][col] != -INFINITY) lse.add(scaled[m][col]);
+      }
+      store_reject_partial(i, p.partials, p.reject.partial_lse, {bk, bv, lse}, active);
+    } else {
+      p.partials[i] = make_int2(__float_as_int(bk), bv);
+    }
   }
 }
 
@@ -372,8 +576,9 @@ struct Nvfp4HeadCfg {
   static_assert(TN == NVFP4_TILED_TN && SMEM <= 48 * 1024);
 };
 
-template <class C>
-__global__ void __launch_bounds__(C::NT, 2) head_nvfp4_tiled_kernel(const HeadNvfp4Args p) {
+template <class C, bool Reject>
+__global__ void __launch_bounds__(C::NT, 2)
+    head_nvfp4_tiled_kernel(const HeadKernelArgs<HeadNvfp4Args, Reject> p) {
   extern __shared__ __align__(128) std::uint8_t smem[];
   constexpr int MF = C::MF, NF = C::NF, TM = C::TM, TN = C::TN, NT = C::NT, STAGES = C::STAGES;
   const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
@@ -472,6 +677,11 @@ __global__ void __launch_bounds__(C::NT, 2) head_nvfp4_tiled_kernel(const HeadNv
   cp_wait<0>();
   asm volatile("griddepcontrol.launch_dependents;\n" ::: "memory");
 
+  if constexpr (Reject) {
+    head_reject_epilogue<C>(p, smem, acc, m_rows, n_rows, p.w.v_begin);
+    return;
+  }
+
   const std::uint64_t seed = p.d_seed ? *p.d_seed : p.seed;
   float best_k[MF][2];
   int best_v[MF][2];
@@ -551,18 +761,262 @@ __global__ void __launch_bounds__(PICK_T) head_pick_kernel(const int2* __restric
   }
 }
 
+__device__ __forceinline__ float reject_uniform(std::uint64_t seed, int row, int draw) {
+  return float(mix64(row_key(seed, row) ^ std::uint64_t(draw)) >> 40) * 0x1p-24f;
+}
+
+__device__ int reject_token(const RejectSpec& reject, int row, float t, std::uint64_t seed,
+                            const RejectPartial& outside) {
+  constexpr int K = RejectSpec::kSupport;
+  const auto offset = std::size_t(row) * K;
+  const auto* ids = reject.ids + offset;
+  const auto* q = reject.probs + offset;
+  const auto* score = reject.target_scores + offset;
+  const float inv_t = 1.f / t;
+  float z[K], max_all = outside.lse.max;
+#pragma unroll
+  for (int j = 0; j < K; ++j) {
+    z[j] = ids[j] >= 0 ? score[j] * inv_t : -INFINITY;
+    max_all = fmaxf(max_all, z[j]);
+  }
+  const float w_out = outside.lse.sum > 0.f ? outside.lse.sum * expf(outside.lse.max - max_all) : 0.f;
+  float weights[K], total = w_out;
+#pragma unroll
+  for (int j = 0; j < K; ++j) {
+    weights[j] = expf(z[j] - max_all);
+    total += weights[j];
+  }
+
+  const int picked = reject.picked[row];
+  const float p_d = expf(score[picked] * inv_t - max_all) / total;
+  const float q_d = q[picked];
+  const float u1 = reject_uniform(seed ^ 0x9E3779B97F4A7C15ull, row, 0);
+  if (q_d > 0.f && (p_d >= q_d || u1 * q_d < p_d)) return ids[picked];
+
+  float residual = w_out;
+#pragma unroll
+  for (int j = 0; j < K; ++j) {
+    // The picked token has zero residual on rejection. Enforce that even at a rounding boundary.
+    weights[j] = j == picked || ids[j] < 0 ? 0.f : fmaxf(0.f, weights[j] - total * q[j]);
+    residual += weights[j];
+  }
+  int fallback = outside.token != 0x7fffffff ? outside.token : ids[picked];
+  if (!(residual > 0.f)) return fallback;
+
+  float draw = reject_uniform(seed ^ 0xBF58476D1CE4E5B9ull, row, 1) * residual;
+  if (draw < w_out) return outside.token;
+  draw -= w_out;
+#pragma unroll
+  for (int j = 0; j < K; ++j) {
+    if (weights[j] > 0.f) {
+      if (draw < weights[j]) return ids[j];
+      draw -= weights[j];
+      fallback = ids[j];
+    }
+  }
+  return fallback;
+}
+
+__global__ void __launch_bounds__(PICK_T) head_reject_pick_kernel(
+    const int2* __restrict__ partials, int ntiles, std::int32_t* __restrict__ out,
+    const float* temps, std::uint64_t seed, const std::uint64_t* d_seed, const __grid_constant__ RejectSpec reject) {
+  const int row = blockIdx.x;
+  const std::size_t begin = std::size_t(row) * ntiles;
+  const float t = temps[row];
+  const bool active = reject.active[row] && t > 0.f;
+  RejectPartial part{-INFINITY, 0x7fffffff, {-INFINITY, 0.f}};
+  for (int i = threadIdx.x; i < ntiles; i += PICK_T) {
+    const std::size_t index = begin + i;
+    const int2 x = partials[index];
+    const float key = __int_as_float(x.x);
+    if (better(key, x.y, part.key, part.token)) part.key = key, part.token = x.y;
+    if (active) part.lse.merge({reject.partial_lse[2 * index], reject.partial_lse[2 * index + 1]});
+  }
+  lanes_best<32>(part.key, part.token);
+  if (active) lanes_merge<32>(part.lse);
+  __shared__ RejectPartial reduced[PICK_T / 32];
+  if ((threadIdx.x & 31) == 0) reduced[threadIdx.x >> 5] = part;
+  __syncthreads();
+  if (threadIdx.x == 0 && out) {
+#pragma unroll
+    for (int w = 1; w < PICK_T / 32; ++w) {
+      const auto other = reduced[w];
+      if (better(other.key, other.token, part.key, part.token)) part.key = other.key, part.token = other.token;
+      if (active) part.lse.merge(other.lse);
+    }
+    out[row] = active ? reject_token(reject, row, t, d_seed ? *d_seed : seed, part) : part.token;
+  }
+}
+
 constexpr int HEAD_TN = 128;
 using Cfg64 = MmaCfg<2, 4, 2, 4, 2>;
 using Cfg32 = MmaCfg<1, 4, 2, 4, 2>;
 static_assert(Cfg64::TN == HEAD_TN && Cfg32::TN == HEAD_TN);
 
+struct PicoGemmArgs {
+  const __nv_bfloat16* A;
+  const std::uint8_t* B;
+  void* C;
+  int lda, ldc, M, N, K, row_offset;
+  bool aligned_a, aligned_c;
+  pico12::DeviceView pico;
+};
+
+template <class C, bool Escapes, bool FP32>
+__global__ void __launch_bounds__(C::NT) pico12_gemm_kernel(const __grid_constant__ PicoGemmArgs p) {
+  constexpr int MF = C::MF, NF = C::NF, TM = C::TM, TN = C::TN, NT = C::NT;
+  constexpr int LOW_BYTES = TN * BK, HI_BYTES = LOW_BYTES / 2;
+  constexpr int STAGE = C::A_BYTES + LOW_BYTES + HI_BYTES;
+  __shared__ __align__(128) std::uint8_t smem[2 * STAGE];
+  const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+  const int warp_m = warp / C::WN, warp_n = warp % C::WN;
+  const int m_begin = blockIdx.x * TM, n_begin = blockIdx.y * TN;
+  const int m_rows = min(TM, p.M - m_begin), n_rows = min(TN, p.N - n_begin);
+  const int nk = p.K / BK;
+  const std::size_t row_bytes = pico12::row_bytes(p.K);
+  const auto* A = p.A + std::size_t(m_begin) * p.lda;
+  const auto* B = p.B + std::size_t(p.row_offset + n_begin) * row_bytes;
+
+  auto load_stage = [&](int stage, int kt) {
+    auto* base = smem + stage * STAGE;
+#pragma unroll
+    for (int i = tid; i < TM * 8; i += NT) {
+      const int row = i >> 3, chunk = i & 7;
+      const bool valid = row < m_rows;
+      const auto* src = A + std::size_t(valid ? row : 0) * p.lda + kt * BK + chunk * 8;
+      auto* dst = base + swz(row, chunk);
+      if (p.aligned_a) {
+        cp_async16(smem_addr(dst), src, valid);
+      } else {
+        // A subview can start at any BF16 element and have an odd row pitch.
+        auto* scalar_dst = reinterpret_cast<__nv_bfloat16*>(dst);
+#pragma unroll
+        for (int e = 0; e < 8; ++e) scalar_dst[e] = valid ? src[e] : __ushort_as_bfloat16(0);
+      }
+    }
+    auto* low = base + C::A_BYTES;
+    auto* hi = low + LOW_BYTES;
+    // Store 16-byte packets in chunk-major order. A warp's eight B rows then occupy
+    // eight distinct groups of four shared-memory banks for both low bytes and codes.
+#pragma unroll
+    for (int i = tid; i < TN * 4; i += NT) {
+      const int row = i >> 2, chunk = i & 3;
+      const bool valid = row < n_rows;
+      const auto* src = B + std::size_t(valid ? row : 0) * row_bytes + kt * BK + chunk * 16;
+      cp_async16(smem_addr(low + (chunk * TN + row) * 16), src, valid);
+    }
+#pragma unroll
+    for (int i = tid; i < TN * 2; i += NT) {
+      const int row = i >> 1, chunk = i & 1;
+      const bool valid = row < n_rows;
+      const auto* src = B + std::size_t(valid ? row : 0) * row_bytes + p.K + kt * (BK / 2) + chunk * 16;
+      cp_async16(smem_addr(hi + (chunk * TN + row) * 16), src, valid);
+    }
+    cp_commit();
+  };
+
+  float acc[MF][NF][4]{};
+  const int k_pair = lane & 3;
+  const unsigned code_sel = 0x0040u + 0x11u * k_pair;
+  load_stage(0, 0);
+  for (int kt = 0; kt < nk; ++kt) {
+    cp_wait<0>();
+    __syncthreads();
+    const int stage = kt & 1;
+    if (kt + 1 < nk) load_stage(stage ^ 1, kt + 1);
+    const auto* base = smem + stage * STAGE;
+    const std::uint32_t a_base = smem_addr(base);
+    const auto* low = base + C::A_BYTES;
+    const auto* hi = low + LOW_BYTES;
+#pragma unroll
+    for (int ks = 0; ks < BK / 16; ++ks) {
+      std::uint32_t af[MF][4];
+#pragma unroll
+      for (int i = 0; i < MF; ++i)
+        ldsm_x4(af[i], a_base + swz(warp_m * MF * 16 + i * 16 + (lane & 15), ks * 2 + (lane >> 4)));
+#pragma unroll
+      for (int j = 0; j < NF; ++j) {
+        const int row = warp_n * NF * 8 + j * 8 + (lane >> 2);
+        const auto* bytes = reinterpret_cast<const std::uint16_t*>(low + (ks * TN + row) * 16);
+        const auto codes = *reinterpret_cast<const uint2*>(hi + ((ks >> 1) * TN + row) * 16 + (ks & 1) * 8);
+        // MMA B registers hold K=(2t, 2t+1) and K=(2t+8, 2t+9) for t=lane%4.
+        const std::uint32_t low4 = bytes[k_pair] | (std::uint32_t(bytes[k_pair + 4]) << 16);
+        const auto bf = pico12::decode4(p.pico, low4, __byte_perm(codes.x, codes.y, code_sel));
+#pragma unroll
+        for (int i = 0; i < MF; ++i) mma_bf16(acc[i][j], af[i], bf.x, bf.y);
+      }
+    }
+  }
+
+#pragma unroll
+  for (int j = 0; j < NF; ++j) {
+    const int col = warp_n * NF * 8 + j * 8 + 2 * k_pair;
+    if (col >= n_rows) continue;
+    if constexpr (Escapes) {
+#pragma unroll
+      for (int e = 0; e < 2; ++e) {
+        const int row = p.row_offset + n_begin + col + e;
+        if (p.pico.row_mask && !((__ldg(p.pico.row_mask + (row >> 5)) >> (row & 31)) & 1u)) continue;
+        const std::uint32_t end = __ldg(p.pico.row_ptr + row + 1);
+        for (std::uint32_t entry = __ldg(p.pico.row_ptr + row); entry < end; ++entry) {
+          std::uint32_t k, bits;
+          if (p.K > pico12::kCompactCols) {
+            const auto* pair = p.pico.entries + std::size_t(entry) * 2;
+            k = __ldg(pair);
+            bits = __ldg(pair + 1);
+          } else {
+            const std::uint32_t packed = __ldg(p.pico.entries + entry);
+            k = packed & 0xffffu;
+            bits = packed >> 16;
+          }
+          const float weight = __uint_as_float(bits << 16);
+#pragma unroll
+          for (int i = 0; i < MF; ++i)
+#pragma unroll
+            for (int h = 0; h < 2; ++h) {
+              const int m = warp_m * MF * 16 + i * 16 + (lane >> 2) + h * 8;
+              if (m < m_rows)
+                acc[i][j][2 * h + e] = fmaf(weight, __bfloat162float(A[std::size_t(m) * p.lda + k]),
+                                             acc[i][j][2 * h + e]);
+            }
+        }
+      }
+    }
+#pragma unroll
+    for (int i = 0; i < MF; ++i)
+#pragma unroll
+      for (int h = 0; h < 2; ++h) {
+        const int m = warp_m * MF * 16 + i * 16 + (lane >> 2) + h * 8;
+        if (m >= m_rows) continue;
+        const std::size_t out = std::size_t(m_begin + m) * p.ldc + n_begin + col;
+        const float lo = acc[i][j][2 * h], hi = acc[i][j][2 * h + 1];
+        if constexpr (FP32) {
+          auto* dst = static_cast<float*>(p.C) + out;
+          if (p.aligned_c) *reinterpret_cast<float2*>(dst) = make_float2(lo, hi);
+          else dst[0] = lo, dst[1] = hi;
+        } else {
+          auto* dst = static_cast<__nv_bfloat16*>(p.C) + out;
+          if (p.aligned_c) *reinterpret_cast<std::uint32_t*>(dst) = pack_bf16x2(lo, hi);
+          else dst[0] = __float2bfloat16_rn(lo), dst[1] = __float2bfloat16_rn(hi);
+        }
+      }
+  }
+}
+
+template <class C, bool Escapes, bool FP32>
+void launch_pico12_gemm(const PicoGemmArgs& p, cudaStream_t stream) {
+  const dim3 grid((p.M - 1) / C::TM + 1, (p.N - 1) / C::TN + 1);
+  pico12_gemm_kernel<C, Escapes, FP32><<<grid, C::NT, 0, stream>>>(p);
+}
+
 using Nvfp4Cfg32 = Nvfp4HeadCfg<2, 2, 1, 8, 2>;
 using Nvfp4Cfg64 = Nvfp4HeadCfg<2, 4, 2, 4, 2>;
 
-template <class C, bool Packed, bool Escapes>
-void launch(const HeadArgs& a, cudaStream_t stream) {
+template <class C, bool Packed, bool Escapes, bool Reject>
+void launch(const HeadKernelArgs<HeadArgs, Reject>& a, cudaStream_t stream) {
   static const bool attr = [] {
-    return cudaFuncSetAttribute(head_kernel<C, Packed, Escapes>, cudaFuncAttributeMaxDynamicSharedMemorySize, C::SMEM) == cudaSuccess;
+    return cudaFuncSetAttribute(head_kernel<C, Packed, Escapes, Reject>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                C::SMEM) == cudaSuccess;
   }();
   if (!attr) throw std::runtime_error("batch head_sample: shared memory attribute");
   cudaLaunchConfig_t cfg{};
@@ -575,7 +1029,7 @@ void launch(const HeadArgs& a, cudaStream_t stream) {
   pdl.val.programmaticStreamSerializationAllowed = 1;
   cfg.attrs = &pdl;
   cfg.numAttrs = 1;
-  if (cudaLaunchKernelEx(&cfg, head_kernel<C, Packed, Escapes>, a) != cudaSuccess)
+  if (cudaLaunchKernelEx(&cfg, head_kernel<C, Packed, Escapes, Reject>, a) != cudaSuccess)
     throw std::runtime_error("batch head_sample: launch failed");
 }
 
@@ -835,11 +1289,27 @@ void launch_nvfp4_topk16(const HeadNvfp4TopkArgs& a, cudaStream_t stream) {
   if (cudaGetLastError() != cudaSuccess) throw std::runtime_error("batch head_topk16_nvfp4: launch failed");
 }
 
-template <class C>
-void launch_nvfp4_tiled(const HeadNvfp4Args& a, cudaStream_t stream) {
+template <bool Reject>
+void launch_nvfp4_small(const HeadKernelArgs<HeadNvfp4Args, Reject>& a, cudaStream_t stream) {
+  cudaLaunchConfig_t cfg{};
+  cfg.gridDim = dim3(a.ntiles);
+  cfg.blockDim = dim3(NVFP4_SMALL_SPLIT * 32);
+  cfg.dynamicSmemBytes = Reject ? NVFP4_SMALL_REJECT_SMEM : 0;
+  cfg.stream = stream;
+  cudaLaunchAttribute pdl;
+  pdl.id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  pdl.val.programmaticStreamSerializationAllowed = 1;
+  cfg.attrs = &pdl;
+  cfg.numAttrs = 1;
+  if (cudaLaunchKernelEx(&cfg, head_nvfp4_small_kernel<Reject>, a) != cudaSuccess)
+    throw std::runtime_error("batch head_sample_nvfp4 small: launch failed");
+}
+
+template <class C, bool Reject>
+void launch_nvfp4_tiled(const HeadKernelArgs<HeadNvfp4Args, Reject>& a, cudaStream_t stream) {
   static const bool attr = [] {
-    return cudaFuncSetAttribute(head_nvfp4_tiled_kernel<C>, cudaFuncAttributeMaxDynamicSharedMemorySize, C::SMEM) ==
-           cudaSuccess;
+    return cudaFuncSetAttribute(head_nvfp4_tiled_kernel<C, Reject>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                C::SMEM) == cudaSuccess;
   }();
   if (!attr) throw std::runtime_error("batch head_sample_nvfp4: shared memory attribute");
   cudaLaunchConfig_t cfg{};
@@ -852,7 +1322,7 @@ void launch_nvfp4_tiled(const HeadNvfp4Args& a, cudaStream_t stream) {
   pdl.val.programmaticStreamSerializationAllowed = 1;
   cfg.attrs = &pdl;
   cfg.numAttrs = 1;
-  if (cudaLaunchKernelEx(&cfg, head_nvfp4_tiled_kernel<C>, a) != cudaSuccess)
+  if (cudaLaunchKernelEx(&cfg, head_nvfp4_tiled_kernel<C, Reject>, a) != cudaSuccess)
     throw std::runtime_error("batch head_sample_nvfp4: launch failed");
 }
 
@@ -889,6 +1359,32 @@ __global__ void __launch_bounds__(ROW_T)
 
 }  // namespace
 
+void pico12_gemm(const __nv_bfloat16* A, int lda, const void* B_blob, const pico12::Layout& layout,
+                 int row_offset, void* C, int ldc, bool c_fp32, int M, int N, int K, cudaStream_t stream) {
+  if (!A || !B_blob || !C || M <= 0 || N <= 0 || K <= 0 || N % 2 || K % BK || lda < K || ldc < N ||
+      row_offset < 0 || N > layout.rows || row_offset > layout.rows - N || K != layout.cols ||
+      std::uintptr_t(B_blob) % 16)
+    throw std::invalid_argument("batch pico12_gemm: unsupported shape or alignment");
+  const auto* blob = static_cast<const std::uint8_t*>(B_blob);
+  const int c_pair_align = c_fp32 ? alignof(float2) : alignof(std::uint32_t);
+  const PicoGemmArgs p{A, blob, C, lda, ldc, M, N, K, row_offset, lda % 8 == 0 && std::uintptr_t(A) % 16 == 0,
+                      ldc % 2 == 0 && std::uintptr_t(C) % c_pair_align == 0, pico12::device_view(layout, blob)};
+  auto dispatch = [&]<class T>() {
+    if (layout.escapes) {
+      if (c_fp32) launch_pico12_gemm<T, true, true>(p, stream);
+      else launch_pico12_gemm<T, true, false>(p, stream);
+    } else {
+      if (c_fp32) launch_pico12_gemm<T, false, true>(p, stream);
+      else launch_pico12_gemm<T, false, false>(p, stream);
+    }
+  };
+  // The 32-column dynamic K/V slices need more CTAs than the full projections.
+  if (N <= 64) dispatch.template operator()<MmaCfg<1, 2, 1, 1, 2>>();
+  else if (M <= 32) dispatch.template operator()<Cfg32>();
+  else dispatch.template operator()<Cfg64>();
+  if (cudaGetLastError() != cudaSuccess) throw std::runtime_error("batch pico12_gemm: launch failed");
+}
+
 std::size_t head_partials(int M, int N) { return std::size_t(M) * ((N + HEAD_TN - 1) / HEAD_TN); }
 
 std::size_t head_partials_nvfp4(int M, int N) {
@@ -898,48 +1394,49 @@ std::size_t head_partials_nvfp4(int M, int N) {
 void head_sample(const __nv_bfloat16* A, int lda, const void* B, int ldb, int M, int N, int K,
                  const float* temps, std::uint64_t seed, float* logits, int ldc, int2* partials, std::int32_t* out,
                  cudaStream_t stream, int v_begin, void* cand_out, const std::uint64_t* d_seed,
-                 const pico12::Layout* packed) {
+                 const pico12::Layout* packed, const RejectSpec* reject) {
   if (M <= 0 || N <= 0 || K % BK || lda % 8 || ldb % 8 || (logits && (N % 2 || ldc % 2)) ||
       (packed && (packed->rows != N || packed->cols != K)))
     throw std::invalid_argument("batch head_sample: unsupported shape");
   const auto pico = packed ? pico12::device_view(*packed, static_cast<const std::uint8_t*>(B)) : pico12::DeviceView{};
   const HeadArgs a{A, B, logits, lda, ldb, ldc, M, N, K, temps, seed, partials, (N + HEAD_TN - 1) / HEAD_TN, v_begin,
                    d_seed, pico};
-  auto dispatch = [&]<class C>() {
-    if (!packed) launch<C, false, false>(a, stream);
-    else if (packed->escapes) launch<C, true, true>(a, stream);
-    else launch<C, true, false>(a, stream);
+  auto dispatch = [&]<bool Reject>(const HeadKernelArgs<HeadArgs, Reject>& args) {
+    auto launch_tile = [&]<class C>() {
+      if (!packed) launch<C, false, false, Reject>(args, stream);
+      else if (packed->escapes) launch<C, true, true, Reject>(args, stream);
+      else launch<C, true, false, Reject>(args, stream);
+    };
+    if (M <= 32) launch_tile.template operator()<Cfg32>();
+    else launch_tile.template operator()<Cfg64>();
   };
-  if (M <= 32) dispatch.template operator()<Cfg32>();
-  else dispatch.template operator()<Cfg64>();
-  head_pick_kernel<<<M, PICK_T, 0, stream>>>(partials, a.ntiles, out, static_cast<int2*>(cand_out));
+  if (reject && !cand_out && v_begin == 0) {
+    dispatch.template operator()<true>({a, *reject});
+    head_reject_pick_kernel<<<M, PICK_T, 0, stream>>>(partials, a.ntiles, out, temps, seed, d_seed, *reject);
+  } else {
+    dispatch.template operator()<false>(a);
+    head_pick_kernel<<<M, PICK_T, 0, stream>>>(partials, a.ntiles, out, static_cast<int2*>(cand_out));
+  }
 }
 
 void head_sample_nvfp4(const __nv_bfloat16* A, int lda, kernels::head::Nvfp4Matrix w, int M, const float* temps,
                        std::uint64_t seed, float* logits, int ldc, int2* partials, std::int32_t* out,
-                       cudaStream_t stream, void* cand_out, const std::uint64_t* d_seed) {
+                       cudaStream_t stream, void* cand_out, const std::uint64_t* d_seed, const RejectSpec* reject) {
   if (M <= 0 || !A || !w.codes || !w.scales || w.rows <= 0 || lda % 8)
     throw std::invalid_argument("batch head_sample_nvfp4: unsupported shape");
-  if (M <= 8) {
-    const int ntiles = (w.rows + NVFP4_SMALL_TILE - 1) / NVFP4_SMALL_TILE;
-    const HeadNvfp4Args a{A, w, logits, lda, ldc, M, temps, seed, partials, ntiles, d_seed};
-    cudaLaunchConfig_t cfg{};
-    cfg.gridDim = dim3(ntiles);
-    cfg.blockDim = dim3(NVFP4_SMALL_SPLIT * 32);
-    cfg.stream = stream;
-    cudaLaunchAttribute pdl;
-    pdl.id = cudaLaunchAttributeProgrammaticStreamSerialization;
-    pdl.val.programmaticStreamSerializationAllowed = 1;
-    cfg.attrs = &pdl;
-    cfg.numAttrs = 1;
-    if (cudaLaunchKernelEx(&cfg, head_nvfp4_small_kernel, a) != cudaSuccess)
-      throw std::runtime_error("batch head_sample_nvfp4 small: launch failed");
-    head_pick_kernel<<<M, PICK_T, 0, stream>>>(partials, ntiles, out, static_cast<int2*>(cand_out));
+  const int tile = M <= NVFP4_SMALL_M ? NVFP4_SMALL_TILE : NVFP4_TILED_TN;
+  const int ntiles = (w.rows + tile - 1) / tile;
+  const HeadNvfp4Args a{A, w, logits, lda, ldc, M, temps, seed, partials, ntiles, d_seed};
+  auto dispatch = [&]<bool Reject>(const HeadKernelArgs<HeadNvfp4Args, Reject>& args) {
+    if (M <= NVFP4_SMALL_M) launch_nvfp4_small<Reject>(args, stream);
+    else if (M <= 32) launch_nvfp4_tiled<Nvfp4Cfg32, Reject>(args, stream);
+    else launch_nvfp4_tiled<Nvfp4Cfg64, Reject>(args, stream);
+  };
+  if (reject && !cand_out && w.v_begin == 0) {
+    dispatch.template operator()<true>({a, *reject});
+    head_reject_pick_kernel<<<M, PICK_T, 0, stream>>>(partials, ntiles, out, temps, seed, d_seed, *reject);
   } else {
-    const int ntiles = (w.rows + NVFP4_TILED_TN - 1) / NVFP4_TILED_TN;
-    const HeadNvfp4Args a{A, w, logits, lda, ldc, M, temps, seed, partials, ntiles, d_seed};
-    if (M <= 32) launch_nvfp4_tiled<Nvfp4Cfg32>(a, stream);
-    else launch_nvfp4_tiled<Nvfp4Cfg64>(a, stream);
+    dispatch.template operator()<false>(a);
     head_pick_kernel<<<M, PICK_T, 0, stream>>>(partials, ntiles, out, static_cast<int2*>(cand_out));
   }
 }

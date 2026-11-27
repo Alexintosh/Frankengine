@@ -5,6 +5,7 @@
 #include "core/arena.h"
 #include "ingine/batch.h"
 #include "model/batch.h"
+#include "model/batch_dflash2.h"
 #include "model/tp_runtime.h"
 #include "model/model_data.h"
 
@@ -20,31 +21,85 @@
 
 namespace ingine::model {
 
-class BatchDFlash2;
-class BatchDFlash2Head;
 class BatchDrafter;
 class Prefiller;
 
-// Both batched entry points use the same policy so proposal budgets can be computed
-// independently on each TP rank from the accepted prefixes.
-bool batch_spec_adaptive(TpRuntime* tp, cudaStream_t stream);
+struct BatchSpecConfig {
+  int adaptive = 1;
+  int dcut = 1;
+  float dcut_theta = 0.f;
+  int dcut_min_k = -1;
+  int dcut_max_t = 0;
+  int dcut_bucket = 16;
+  float dcut_reject_ema_weight = 0.f;
+};
+
+// Read policy settings on rank zero so both ranks compute the same row counts.
+BatchSpecConfig batch_spec_config(TpRuntime* tp, cudaStream_t stream);
+
+// Host storage shared by the serving and benchmark batch paths. A slot's temperature describes its last proposal
+// until the current verification has been assembled.
+class BatchDraftSupport {
+ public:
+  explicit BatchDraftSupport(int slots = 0);
+  void reset(int slot);
+  void set_temperature(int slot, float temperature);
+  void clear_support(int slot);
+  bool has_support(int slot, float temperature) const;
+  std::vector<float> proposal_temperatures(std::span<const std::int32_t> slots) const;
+
+  // Enqueue this alongside the draft tokens and confidences. Store the results after the stream has synchronized.
+  void download(const BatchDFlash2::Drafts& drafts, std::size_t sequences, cudaStream_t stream);
+  void store(std::span<const std::int32_t> slots);
+
+  const BatchRejectInputs* verification_inputs(std::span<const std::int32_t> slots,
+                                               std::span<const std::int32_t> widths,
+                                               std::span<const std::int32_t> tokens,
+                                               std::span<const float> temperatures);
+
+ private:
+  std::vector<float> slot_temps_;
+  std::vector<bool> slot_has_support_;
+  std::vector<std::int32_t> slot_ids_, slot_picked_;
+  std::vector<float> slot_probs_;
+  std::vector<std::int32_t> download_ids_, download_picked_;
+  std::vector<float> download_probs_;
+  std::vector<std::uint8_t> row_active_;
+  std::vector<std::int32_t> row_ids_, row_picked_;
+  std::vector<float> row_probs_;
+  BatchRejectInputs inputs_;
+};
 
 class BatchSpecCost {
  public:
   static constexpr float initial_p = 0.75f;
 
-  BatchSpecCost(bool adaptive, int n, int slots, float threshold);
-  int verification_width(int k_max, int k_min, const float* confidence, float ema_p, int steps) const;
+  struct Slot {
+    int k_max;
+    const float* confidence;
+    float ema_p;
+    int steps;
+    float temperature;
+    bool reject = false;
+  };
+
+  BatchSpecCost(BatchSpecConfig config, int n, int slots, float threshold);
+  void allocate_widths(std::span<const Slot> slots, int k_min, std::span<std::int32_t> out_k) const;
+  bool use_proposal_budgets() const { return config_.adaptive || config_.dcut; }
   int proposal_budget(int k_max, int k_min, float ema_p, int steps) const;
   static void observe(int k, int accepted, float& ema_p, int& steps);
 
  private:
+  int verification_width(int k_max, int k_min, const float* confidence, float ema_p, int steps) const;
   int minimum_width(int k_max, int k_min, float ema_p, int steps) const;
+  int dcut_minimum_width(int k_max, int k_min) const;
 
+  BatchSpecConfig config_;
   int n_;
   bool use_threshold_;
   bool calibrate_;
   float theta_;
+  float dcut_theta_;
 };
 
 struct BatchEngineOptions {
@@ -54,8 +109,7 @@ struct BatchEngineOptions {
   int ctx = 4096;                  // positions per slot
   int prefill_chunk = 512;         // prompt tokens per Prefiller call
   int spec = 0;                    // DSpark drafts verified per step and sequence (1..7, at most); 0: plain decoding
-  // > 0: per sequence, the leading drafts whose estimated acceptance (the product of the drafter's confidences)
-  // exceeds spec_threshold x (running sequences / slots), but at least spec_min; 0: always spec drafts
+  // Base cutoff for D-cut's concurrency scaling. The legacy policy uses fixed widths when spec_threshold is 0.
   float spec_threshold = 0.f;
   int spec_min = 0;
   bool kv_fp8 = false;             // FP8 E4M3 full-attention caches
@@ -125,7 +179,8 @@ class BatchEngine final : public BatchBackend {
   std::unique_ptr<BatchDecoder> dec_;  // 8 rows per sequence at most (admissions, verify steps)
   std::string batch_draft_type_;
   int dflash2_max_ctx_ = 6144;
-  bool adaptive_batch_spec_ = false;
+  BatchSpecConfig batch_spec_config_;
+  BatchDraftSupport draft_support_;
   std::unique_ptr<BatchDrafter> drafter_;
   std::vector<DeviceBuffer> dflash2_head_storage_;
   std::unique_ptr<BatchDFlash2Head> dflash2_head_;
@@ -149,6 +204,7 @@ class BatchEngine final : public BatchBackend {
   std::FILE* trace_ = nullptr;
   std::vector<std::int32_t> tok_, slot_, keep_, rows_host_, anchor_;
   std::vector<std::int32_t> m_, off_;  // the step's rows per sequence and their offsets [n + 1]
+  std::vector<BatchSpecCost::Slot> spec_slots_;
   std::vector<std::int64_t> pos_, next_pos_;
   std::vector<float> temp_;
 

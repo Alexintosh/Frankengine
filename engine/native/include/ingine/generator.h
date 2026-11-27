@@ -181,6 +181,13 @@ struct BatchSlotStep {
   BatchSampling* sampling;
 };
 
+struct BatchPrefillSlot {
+  int slot;
+  std::span<const int32_t> prompt;
+  int offset;
+  BatchSampling* sampling;
+};
+
 struct PrefillChunkResult {
   int offset;
   int reused_tokens;
@@ -211,6 +218,11 @@ class Generator {
   virtual int reusable_prefix(int, std::span<const int32_t>) const { return 0; }
   virtual PrefillChunkResult prefill_slot_chunk(int, std::span<const int32_t>, int, BatchSampling&, int /*stop_at*/ = 0) {
     throw std::logic_error("batch prefill unavailable");
+  }
+  virtual bool supports_batch_short_prefill() const { return false; }
+  // Results follow input slot order. A max_steps of 0 runs until all prompts finish.
+  virtual std::vector<PrefillChunkResult> prefill_batch_short(std::span<const BatchPrefillSlot>, int /*max_steps*/ = 0) {
+    throw std::logic_error("short batch prefill unavailable");
   }
   // Clone a batch slot KV/conv/drafter prefix state into dst_slot (shared-prefix forking).
   virtual bool clone_slot(int /*src_slot*/, int /*dst_slot*/) { return false; }

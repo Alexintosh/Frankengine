@@ -347,6 +347,197 @@ void test_batch_head(cudaStream_t stream, bool escapes) {
   }
 }
 
+void test_batch_head_rejection(cudaStream_t stream) {
+  constexpr int N = 259, max_rows = 33, K = batch::RejectSpec::kSupport, samples = 8192;
+  constexpr float temperature = 0.9f;
+  constexpr std::array peak_ids{128, 0, 1, 256, 258};
+  constexpr std::array support{128, 0, 1, 2, 3, 7, 8, 15, 16, 121, 127, 129, 153, 191, 244, 255};
+  constexpr std::array<float, K> proposal{0.25f, 0.625f, 0.03125f, 0.0078125f, 0.0078125f, 0.0078125f,
+                                         0.0078125f, 0.0078125f, 0.0078125f, 0.0078125f, 0.0078125f, 0.0078125f,
+                                         0.0078125f, 0.0078125f, 0.0078125f, 0.f};
+  std::array<float, N> scores;
+  std::array<double, N> target;
+  std::array<int, N> bins;
+  std::vector<uint16_t> bits(N * H);
+  std::vector<uint8_t> codes(N * (H / 2));
+  for (int v = 0; v < N; ++v) {
+    bins[v] = int(peak_ids.size()) + v % 3;
+    for (int i = 0; i < int(peak_ids.size()); ++i)
+      if (v == peak_ids[i]) bins[v] = i;
+    // One nonzero input makes the dot exactly representable for all three weight formats.
+    constexpr std::array dots{4.f, 3.f, 2.f, 3.f, 2.f, -2.f, -3.f, -4.f};
+    constexpr std::array<uint8_t, 8> fp4{6, 5, 4, 5, 4, 12, 13, 14};
+    const float dot = dots[bins[v]];
+    bits[v * H] = std::bit_cast<uint16_t>(float_to_bf16(dot));
+    codes[v * (H / 2)] = fp4[bins[v]];
+    scores[v] = 30.f * std::tanh(dot / 30.f);
+    target[v] = std::exp(double(scores[v]) / temperature);
+  }
+  const double total = std::accumulate(target.begin(), target.end(), 0.0);
+  std::array<double, peak_ids.size() + 3> bin_target{};
+  for (int v = 0; v < N; ++v) {
+    target[v] /= total;
+    bin_target[bins[v]] += target[v];
+  }
+  INGINE_CHECK(target[support[0]] > proposal[0]);
+  INGINE_CHECK(target[support[1]] < proposal[1]);
+  INGINE_CHECK(target[support[2]] > proposal[2]);  // A support token has positive residual mass.
+
+  const Weights weights(bits, N, H);
+  const DeviceArray<uint8_t> nvfp4_codes(codes), nvfp4_scales(std::vector<uint8_t>(N * (H / 16), 0x38));
+  const ingine::kernels::head::Nvfp4Matrix nvfp4{nvfp4_codes.get(), nvfp4_scales.get(), 1.f, N, 0};
+  std::vector<__nv_bfloat16> input(max_rows * H, float_to_bf16(0.f));
+  for (int row = 0; row < max_rows; ++row) input[row * H] = float_to_bf16(1.f);
+  const DeviceArray<__nv_bfloat16> x(input);
+  auto check = [&](const char* name, bool use_nvfp4, bool packed, int M, int runs) {
+    std::vector<float> temperatures(M, temperature);
+    temperatures[1] = 0.85f;
+    temperatures[3] = 0.f;
+    std::vector<uint8_t> active(M);
+    active[0] = active[1] = active[3] = active[4] = 1;
+    std::vector<int32_t> support_ids(M * K, -1), picked(M, -1);
+    std::vector<float> probabilities(M * K, 0.f);
+    std::copy(support.begin(), support.end(), support_ids.begin());
+    std::copy(proposal.begin(), proposal.end(), probabilities.begin());
+    std::copy_n(support.begin(), 3, support_ids.begin() + K);
+    probabilities[K] = 0.25f;
+    probabilities[K + 1] = 0.625f;
+    probabilities[K + 2] = 0.125f;
+    // The final vocab tile is entirely inside this row's support.
+    std::iota(support_ids.begin() + 4 * K, support_ids.begin() + 5 * K - 3, 0);
+    std::iota(support_ids.begin() + 5 * K - 3, support_ids.begin() + 5 * K, N - 3);
+    probabilities[4 * K] = 1.f;
+    picked[0] = picked[1] = picked[4] = 0;
+    const DeviceArray<float> d_temps(temperatures), d_probs(probabilities);
+    const DeviceArray<uint8_t> d_active(active);
+    const DeviceArray<int32_t> d_ids(support_ids), d_picked(picked);
+    const DeviceArray<uint64_t> d_seed(std::vector<uint64_t>{0});
+    const size_t tiled_partials = batch::head_partials(M, N);
+    const size_t n_partials = use_nvfp4 ? batch::head_partials_nvfp4(M, N) : tiled_partials;
+    const size_t ntiles = (use_nvfp4 && M <= 8 ? n_partials : tiled_partials) / M;
+    constexpr float sentinel = -123.f;
+    DeviceArray<float> target_scores(std::vector<float>(M * K, sentinel)), partial_lse(2 * n_partials);
+    DeviceArray<int2> partials(n_partials), candidates(M);
+    DeviceArray<int32_t> out(M);
+    const batch::RejectSpec reject{d_active.get(), d_ids.get(), d_probs.get(), d_picked.get(),
+                                   target_scores.get(), partial_lse.get()};
+    const auto w = weights.matrix(packed);
+    auto launch = [&](const batch::RejectSpec* spec, void* cand = nullptr) {
+      if (use_nvfp4) {
+        batch::head_sample_nvfp4(x.get(), H, nvfp4, M, d_temps.get(), 0, nullptr, 0, partials.get(), out.get(),
+                                 stream, cand, d_seed.get(), spec);
+      } else {
+        batch::head_sample(x.get(), H, w.w, H, M, N, H, d_temps.get(), 0, nullptr, 0, partials.get(), out.get(),
+                           stream, 0, cand, d_seed.get(), w.pico12, spec);
+      }
+    };
+    launch(nullptr);
+    INGINE_TEST_CUDA(cudaStreamSynchronize(stream));
+    const auto legacy = out.download();
+    const batch::RejectSpec unused{};
+    launch(&unused, candidates.get());
+    INGINE_TEST_CUDA(cudaStreamSynchronize(stream));
+    INGINE_CHECK(out.download() == legacy);
+    launch(&reject);
+    INGINE_TEST_CUDA(cudaStreamSynchronize(stream));
+    const auto initial = out.download();
+    INGINE_CHECK(initial[0] == support[0] && initial[1] == support[0]);
+    INGINE_CHECK(initial[2] == legacy[2] && initial[3] == legacy[3]);
+    const auto captured_scores = target_scores.download();
+    for (int row = 0; row < M; ++row)
+      for (int j = 0; j < K; ++j) {
+        const int idx = row * K + j, v = support_ids[idx];
+        if (active[row] && temperatures[row] > 0.f && v >= 0)
+          INGINE_CHECK(std::abs(captured_scores[idx] - scores[v]) < 1e-6f);
+        else
+          INGINE_CHECK(captured_scores[idx] == sentinel);
+      }
+    const auto outside = partial_lse.download();
+    INGINE_CHECK(outside[2 * (5 * ntiles - 1)] == -INFINITY && outside[2 * (5 * ntiles - 1) + 1] == 0.f);
+
+    cudaGraph_t graph;
+    cudaGraphExec_t exec;
+    INGINE_TEST_CUDA(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
+    launch(&reject);
+    INGINE_TEST_CUDA(cudaStreamEndCapture(stream, &graph));
+    size_t nodes = 0;
+    INGINE_TEST_CUDA(cudaGraphGetNodes(graph, nullptr, &nodes));
+    INGINE_CHECK(nodes == 2);  // One head pass and one row reduction.
+    INGINE_TEST_CUDA(cudaGraphInstantiate(&exec, graph, 0));
+    Rng seeds(817), drafts(9103);
+    std::vector<uint64_t> seed_values(runs);
+    std::vector<int32_t> draft_indices(runs);
+    for (int i = 0; i < runs; ++i) {
+      seed_values[i] = seeds.next();
+      double u = drafts.uniform();
+      int j = 0;
+      while (u >= proposal[j]) u -= proposal[j++];
+      draft_indices[i] = j;
+    }
+    const DeviceArray<uint64_t> replay_seeds(seed_values);
+    const DeviceArray<int32_t> replay_drafts(draft_indices);
+    DeviceArray<int32_t> outputs(2 * runs);
+    for (int i = 0; i < runs; ++i) {
+      INGINE_TEST_CUDA(cudaMemcpyAsync(d_seed.get(), replay_seeds.get() + i, sizeof(uint64_t),
+                                       cudaMemcpyDeviceToDevice, stream));
+      INGINE_TEST_CUDA(cudaMemcpyAsync(d_picked.get(), replay_drafts.get() + i, sizeof(int32_t),
+                                       cudaMemcpyDeviceToDevice, stream));
+      INGINE_TEST_CUDA(cudaGraphLaunch(exec, stream));
+      INGINE_TEST_CUDA(cudaMemcpyAsync(outputs.get() + 2 * i, out.get(), 2 * sizeof(int32_t),
+                                       cudaMemcpyDeviceToDevice, stream));
+    }
+    INGINE_TEST_CUDA(cudaStreamSynchronize(stream));
+    const auto draws = outputs.download();
+    // Replay a prior seed and proposal to check that the graph reads current seed contents deterministically.
+    INGINE_TEST_CUDA(cudaMemcpyAsync(d_seed.get(), replay_seeds.get(), sizeof(uint64_t), cudaMemcpyDeviceToDevice, stream));
+    INGINE_TEST_CUDA(cudaMemcpyAsync(d_picked.get(), replay_drafts.get(), sizeof(int32_t), cudaMemcpyDeviceToDevice, stream));
+    INGINE_TEST_CUDA(cudaGraphLaunch(exec, stream));
+    INGINE_TEST_CUDA(cudaStreamSynchronize(stream));
+    INGINE_CHECK(out.download()[0] == draws[0]);
+    INGINE_TEST_CUDA(cudaGraphExecDestroy(exec));
+    INGINE_TEST_CUDA(cudaGraphDestroy(graph));
+
+    std::array<int, N> counts{};
+    std::array<int, bin_target.size()> bin_counts{};
+    int support_residual_draws = 0;
+    for (int i = 0; i < runs; ++i) {
+      const int v = draws[2 * i], j = draft_indices[i];
+      INGINE_CHECK(v >= 0 && v < N);
+      if (target[support[j]] >= proposal[j]) INGINE_CHECK(v == support[j]);
+      Rng row_key_rng(seed_values[i] ^ 0x9E3779B97F4A7C15ull);
+      Rng acceptance_rng(row_key_rng.next());  // Row zero, draw zero.
+      const double u1 = (acceptance_rng.next() >> 40) * 0x1p-24;
+      const double decision = u1 * proposal[j] - target[support[j]];
+      if (std::abs(decision) > 1e-6) INGINE_CHECK((v == support[j]) == (decision < 0.0));
+      if (decision > 1e-6 && v == support[2]) ++support_residual_draws;
+      INGINE_CHECK(draws[2 * i + 1] == support[0]);
+      ++counts[v];
+      ++bin_counts[bins[v]];
+    }
+    INGINE_CHECK(counts[256] > 0 && counts[0] < runs);
+    if (runs == samples) {
+      INGINE_CHECK(support_residual_draws > 0);
+      auto within_four_sigma = [&](const char* kind, int index, int observed, double p) {
+        const double expected = runs * p, sigma = std::sqrt(expected * (1.0 - p));
+        if (std::abs(observed - expected) > 4.0 * sigma)
+          std::fprintf(stderr, "%s rejection %s %d: observed %d, expected %.2f (sigma %.2f)\n",
+                       name, kind, index, observed, expected, sigma);
+        INGINE_CHECK(std::abs(observed - expected) <= 4.0 * sigma);
+      };
+      for (int v = 0; v < N; ++v) within_four_sigma("token", v, counts[v], target[v]);
+      for (int b = 0; b < int(bin_target.size()); ++b) within_four_sigma("bin", b, bin_counts[b], bin_target[b]);
+    }
+    std::printf("PASS %s rejection sampling (M=%d, %d graph replays)\n", name, M, runs);
+  };
+  check("BF16", false, false, 5, 64);
+  check("BF16", false, false, max_rows, samples);
+  check("PICO12", false, true, 5, 64);
+  check("PICO12", false, true, max_rows, samples);
+  check("NVFP4 small", true, false, 8, 64);
+  check("NVFP4 tiled", true, false, 9, 64);
+  check("NVFP4 tiled", true, false, max_rows, samples);
+}
+
 void test_gemv_family(cudaStream_t stream, bool escapes, bool exact) {
   constexpr int rows = 53;
   // Uniform tiles, a mixed tile with equal endpoint inputs and an interior hole, and a partial tail.
@@ -527,6 +718,148 @@ std::vector<uint16_t> make_bench_weights(int rows, int cols, bool escapes, unsig
   return input;
 }
 
+void test_batch_pico12_gemm(cudaStream_t stream, bool escapes, int rows, int K) {
+  const Weights w(escapes ? make_bench_weights(rows, K, true) : make_weights(rows, K, false), rows, K);
+  INGINE_CHECK(w.packed.layout.escapes == escapes);
+  if (escapes)
+    INGINE_CHECK(pico12::device_view(w.packed.layout, w.packed.data.get()).row_ptr[rows] ==
+                 size_t(rows) * K / kBenchOutlierStride);
+  DeviceArray<__nv_bfloat16> unpacked(size_t(rows) * K);
+  dense::unpack_pico12_rows(w.matrix(true), rows, unpacked.get(), stream);
+  batch::TunedGemm gemm;
+  gemm.set_capturing(true);  // Use the heuristic's algorithm for the numerical reference.
+  const int lda = K + 8;
+  const DeviceArray<__nv_bfloat16> a(activations(192, lda));
+  auto check = [&]<class T>(int M, int first, int N) {
+    constexpr bool fp32 = std::is_same_v<T, float>;
+    const int ldc = N + 8;
+    const std::vector<T> initial(size_t(M) * ldc, T(-29.f));
+    DeviceArray<T> ref(initial), got(initial);
+    gemm.run(a.get(), lda, unpacked.get() + size_t(first) * K, K, ref.get(), ldc, fp32, M, N, K, stream);
+    batch::pico12_gemm(a.get(), lda, w.blob.get(), w.packed.layout, first, got.get(), ldc, fp32, M, N, K, stream);
+    compare(fp32 ? "batch PICO12 GEMM FP32" : "batch PICO12 GEMM BF16", M, w, ref, got, stream,
+            fp32 ? Parity::fp32 : Parity::bf16);
+  };
+  for (const int M : {1, 16, 64, 96, 128, 192}) {
+    auto check_slice = [&](int first, int count) {
+      check.template operator()<float>(M, first, count);
+      check.template operator()<__nv_bfloat16>(M, first, count);
+    };
+    check_slice(0, rows);
+    if (K == H) {
+      check_slice(6553, 1024);  // Offset by one from the K segment to exercise a crossing row-mask lookup.
+      check_slice(rows - 32, 32);
+    }
+  }
+}
+
+void test_batch_pico12_exact_graph(cudaStream_t stream, int K) {
+  constexpr int rows = 38, first = 3, N = 34, M = 17, ldc = N + 5;
+  const int lda = K + 1;
+  auto bits = make_band_weights(rows, K);
+  for (int row = 0; row < rows; row += 3) {
+    bits[size_t(row) * K + 7] = (108 << 7) | 5;
+    bits[size_t(row) * K + K - 1] = (124 << 7) | 0x801d;
+  }
+  const Weights w(bits, rows, K);
+  INGINE_CHECK(w.packed.layout.escapes);
+  const std::array columns{0, 7, 8, 15, 16, 31, 32, K - 1};
+  std::vector<__nv_bfloat16> input(size_t(M) * lda + 1, float_to_bf16(0.f));
+  for (int m = 0; m < M; ++m) input[1 + size_t(m) * lda + columns[m % columns.size()]] = float_to_bf16(1.f);
+  const DeviceArray<__nv_bfloat16> a(input);
+  auto check = [&]<class T>(T sentinel, const pico12::Layout& layout) {
+    constexpr bool fp32 = std::is_same_v<T, float>;
+    DeviceArray<T> out(std::vector<T>(size_t(M) * ldc + 1, sentinel));
+    cudaGraph_t graph;
+    cudaGraphExec_t exec;
+    INGINE_TEST_CUDA(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
+    batch::pico12_gemm(a.get() + 1, lda, w.blob.get(), layout, first, out.get() + 1, ldc, fp32, M, N, K, stream);
+    INGINE_TEST_CUDA(cudaStreamEndCapture(stream, &graph));
+    size_t nodes = 0;
+    INGINE_TEST_CUDA(cudaGraphGetNodes(graph, nullptr, &nodes));
+    INGINE_CHECK(nodes == 1);
+    INGINE_TEST_CUDA(cudaGraphInstantiate(&exec, graph, 0));
+    INGINE_TEST_CUDA(cudaGraphLaunch(exec, stream));
+    INGINE_TEST_CUDA(cudaStreamSynchronize(stream));
+    const auto actual = out.download();
+    INGINE_CHECK(std::memcmp(actual.data(), &sentinel, sizeof(T)) == 0);
+    for (int m = 0; m < M; ++m) {
+      for (int n = 0; n < ldc; ++n) {
+        T expected = sentinel;
+        if (n < N) {
+          const uint16_t raw = bits[size_t(first + n) * K + columns[m % columns.size()]];
+          if constexpr (fp32) expected = std::bit_cast<float>(uint32_t(raw) << 16);
+          else std::memcpy(&expected, &raw, sizeof(raw));
+        }
+        INGINE_CHECK(std::memcmp(&actual[1 + size_t(m) * ldc + n], &expected, sizeof(T)) == 0);
+      }
+    }
+    INGINE_TEST_CUDA(cudaGraphExecDestroy(exec));
+    INGINE_TEST_CUDA(cudaGraphDestroy(graph));
+  };
+  check(-29.f, w.packed.layout);
+  check(float_to_bf16(-29.f), fused_layout(w.packed.layout));  // CSR without a row mask.
+}
+
+void benchmark_batch_pico12(cudaStream_t stream, const char* name, int N, int K) {
+  constexpr int copies = 8, rounds = 12;
+  const auto weights = make_bench_weights(N, K, true);
+  const auto packed = pico12::pack_pico12_host(weights.data(), N, K);
+  const size_t stride = (packed.bytes + 15) / 16 * 16;
+  DeviceArray<uint8_t> blobs(copies * stride);
+  DeviceArray<__nv_bfloat16> unpacked(size_t(N) * K);
+  INGINE_TEST_CUDA(cudaMemcpyAsync(blobs.get(), packed.data.get(), packed.bytes, cudaMemcpyHostToDevice, stream));
+  for (int i = 1; i < copies; ++i)
+    INGINE_TEST_CUDA(cudaMemcpyAsync(blobs.get() + i * stride, blobs.get(), packed.bytes, cudaMemcpyDeviceToDevice,
+                                   stream));
+  batch::TunedGemm gemm;
+  cudaEvent_t first, last;
+  INGINE_TEST_CUDA(cudaEventCreate(&first));
+  INGINE_TEST_CUDA(cudaEventCreate(&last));
+  std::printf("batch %s %d x %d, %d rotating PICO12 blobs, BF16 output\n", name, N, K, copies);
+  for (const int M : {64, 96, 128, 192}) {
+    const DeviceArray<__nv_bfloat16> a(activations(M, K));
+    DeviceArray<__nv_bfloat16> c(size_t(M) * N);
+    auto fused = [&](int i) {
+      batch::pico12_gemm(a.get(), K, blobs.get() + i * stride, packed.layout, 0, c.get(), N, false, M, N, K, stream);
+    };
+    auto baseline = [&](int i) {
+      dense::unpack_pico12_rows({blobs.get() + i * stride, nullptr, N, K, &packed.layout}, N, unpacked.get(), stream);
+      gemm.run(a.get(), K, unpacked.get(), K, c.get(), N, false, M, N, K, stream);
+    };
+    gemm.set_capturing(false);
+    for (int step = 0; step < batch::TunedGemm::kWarmSteps + batch::TunedGemm::kSamples * (batch::TunedGemm::kCandidates + 4);
+         ++step) {
+      baseline(step % copies);
+      gemm.collect();
+    }
+    gemm.set_capturing(true);
+    auto time = [&](auto run) {
+      cudaGraph_t graph;
+      cudaGraphExec_t exec;
+      INGINE_TEST_CUDA(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
+      for (int i = 0; i < copies; ++i) run(i);
+      INGINE_TEST_CUDA(cudaStreamEndCapture(stream, &graph));
+      INGINE_TEST_CUDA(cudaGraphInstantiate(&exec, graph, 0));
+      INGINE_TEST_CUDA(cudaGraphLaunch(exec, stream));
+      INGINE_TEST_CUDA(cudaEventRecord(first, stream));
+      for (int i = 0; i < rounds; ++i) INGINE_TEST_CUDA(cudaGraphLaunch(exec, stream));
+      INGINE_TEST_CUDA(cudaEventRecord(last, stream));
+      INGINE_TEST_CUDA(cudaEventSynchronize(last));
+      float ms = 0;
+      INGINE_TEST_CUDA(cudaEventElapsedTime(&ms, first, last));
+      INGINE_TEST_CUDA(cudaGraphExecDestroy(exec));
+      INGINE_TEST_CUDA(cudaGraphDestroy(graph));
+      return ms * 1000.f / (rounds * copies);
+    };
+    const float baseline_us = time(baseline), fused_us = time(fused);
+    std::printf("M=%d  unpack + tuned cuBLASLt %.2f us  fused %.2f us  %.2fx\n",
+                M, baseline_us, fused_us, baseline_us / fused_us);
+  }
+  INGINE_TEST_CUDA(cudaEventDestroy(first));
+  INGINE_TEST_CUDA(cudaEventDestroy(last));
+}
+
 void benchmark(cudaStream_t stream, bool escapes, BenchOp op, const char* name, int rows, int cols) {
   constexpr int iterations = 24;
   const auto input = make_bench_weights(rows, cols, escapes);
@@ -660,8 +993,9 @@ void benchmark_cold_wproj(cudaStream_t stream, bool escapes) {
 
 int main(int argc, char** argv) {
   const std::string_view mode = argc == 2 ? argv[1] : "";
-  if (argc > 2 || (argc == 2 && mode != "--host-only" && mode != "--bench" && mode != "--bench-cold-wproj")) {
-    std::fprintf(stderr, "usage: %s [--host-only | --bench | --bench-cold-wproj]\n", argv[0]);
+  if (argc > 2 || (argc == 2 && mode != "--host-only" && mode != "--bench" && mode != "--bench-cold-wproj" &&
+                   mode != "--bench-batch-pico12")) {
+    std::fprintf(stderr, "usage: %s [--host-only | --bench | --bench-cold-wproj | --bench-batch-pico12]\n", argv[0]);
     return 1;
   }
   if (mode == "--host-only") {
@@ -671,6 +1005,12 @@ int main(int argc, char** argv) {
   if (skip_without_gpu()) return kSkip;
   cudaStream_t stream;
   INGINE_TEST_CUDA(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+  if (mode == "--bench-batch-pico12") {
+    benchmark_batch_pico12(stream, "wproj", 8664, H);
+    benchmark_batch_pico12(stream, "wo", H, 3072);
+    INGINE_TEST_CUDA(cudaStreamDestroy(stream));
+    return 0;
+  }
   for (const bool escapes : {false, true}) {
     if (mode == "--bench") {
       benchmark(stream, escapes, BenchOp::head, "head", 201024, H);
@@ -683,6 +1023,8 @@ int main(int argc, char** argv) {
       if (escapes) test_device_roundtrip(stream, true, 4, pico12::kCompactCols + pico12::kTile);
       test_fp32_ulp(stream, escapes);
       test_batch_head(stream, escapes);
+      test_batch_pico12_gemm(stream, escapes, 8664, H);
+      test_batch_pico12_gemm(stream, escapes, H, 3072);
       for (const bool exact : {false, true}) {
         test_gemv_family(stream, escapes, exact);
         test_convolution(stream, escapes, exact);
@@ -690,9 +1032,11 @@ int main(int argc, char** argv) {
     }
   }
   if (mode.empty()) {
+    test_batch_head_rejection(stream);
     test_gemv_all_patterns(stream);
     test_sparse_graph(stream);
-    std::puts("PASS PICO12 GPU bit-exact BF16 reconstruction and GEMV parity");
+    for (const int K : {64, 1536, pico12::kCompactCols + 64}) test_batch_pico12_exact_graph(stream, K);
+    std::puts("PASS PICO12 GPU bit-exact BF16 reconstruction, GEMV parity and batch GEMM parity");
   }
   INGINE_TEST_CUDA(cudaStreamDestroy(stream));
 }

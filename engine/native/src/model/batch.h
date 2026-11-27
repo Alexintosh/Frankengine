@@ -6,6 +6,7 @@
 #include "core/decode_graph.h"
 #include "core/host_memory.h"
 #include "kernels/batch/batch.h"
+#include "kernels/batch/dense.h"
 #include "model/model_data.h"
 #include "model/tp_runtime.h"
 
@@ -16,11 +17,8 @@
 #include <map>
 #include <memory>
 #include <span>
+#include <tuple>
 #include <vector>
-
-namespace ingine::kernels::batch {
-class TunedGemm;
-}
 
 namespace ingine::model {
 
@@ -57,11 +55,19 @@ BatchState make_batch_state(int slots, int ctx, bool kv_fp8, const TpLayout& lay
 // model.State.reset for one slot: ring positions -1, conv states 0. Stream-ordered.
 void reset_slot(BatchState& st, int s, cudaStream_t stream);
 
+// Host arrays in the same flattened row order as BatchDecoder::step.
+struct BatchRejectInputs {
+  const std::uint8_t* active = nullptr;  // [T], 1 for rows verifying a sampled draft
+  const std::int32_t* ids = nullptr;    // [T, RejectSpec::kSupport]
+  const float* probs = nullptr;         // [T, RejectSpec::kSupport]
+  const std::int32_t* picked = nullptr;  // [T], index into the row's support
+};
+
 // One decode step for n sequences of M consecutive rows each (M = 1: plain decoding; M > 1: a speculative verify
 // of the anchor and M - 1 drafts): rows b*M .. b*M+M-1 are tokens at positions pos[b] .. pos[b]+M-1 of slot
 // slots[b]. The visit sequence is the Prefiller's with n*M rows (fast.FastDecoder.decode's block-state wiring, the
-// mix and message-gate kernels, GEMMs over the dense rows (BF16, or FP8 rows dequantized per visit; algorithms
-// measured in place, kernels::batch::TunedGemm), the grouped MoE GEMMs); the attention is the decode attention
+// mix and message-gate kernels, native FP8 dense GEMMs or BF16 GEMMs measured in place (kernels::batch::TunedGemm),
+// and the grouped MoE GEMMs); the attention is the decode attention
 // kernel over each sequence's slot (attn::DecodeArgs::batch, M rows causal), the short convolutions continue each
 // slot's conv state. Then the head over every row and one token per row (kernels::batch::sample).
 //
@@ -82,10 +88,10 @@ class BatchDecoder {
   // - 1 of slot slots[b] (distinct slots; positions below ctx); tokens [sum m] hold the sequences' rows back to back.
   // m, tokens, slots, pos and temperature [n] are host arrays; temperature <= 0: greedy. Returns the sampled tokens,
   // one per row (row r's token follows row r; host memory owned by the decoder, valid until the next step);
-  // synchronises the stream.
+  // synchronises the stream. Optional reject inputs provide the proposal distribution for active rows.
   std::span<const std::int32_t> step(int n, const std::int32_t* m, const std::int32_t* tokens,
                                      const std::int32_t* slots, const std::int64_t* pos, const float* temperature,
-                                     std::uint64_t seed);
+                                     std::uint64_t seed, const BatchRejectInputs* reject = nullptr);
   // every sequence with M rows
   std::span<const std::int32_t> step(int n, int M, const std::int32_t* tokens, const std::int32_t* slots,
                                      const std::int64_t* pos, const float* temperature, std::uint64_t seed) {
@@ -110,6 +116,7 @@ class BatchDecoder {
 
   int max_seqs() const { return max_seqs_; }
   int max_m() const { return max_m_; }
+  bool reject_enabled() const { return reject_enabled_; }
   std::size_t device_bytes() const;
   // With BF16 head rows the step picks its tokens in the head GEMM (kernels::batch::head_sample) and stores the
   // logits only after keep_logits(true) (allocates them: rows x kLogitsLd fp32); FP8 head rows always store them.
@@ -122,7 +129,8 @@ class BatchDecoder {
 
  private:
   const float* const* block_table(const std::vector<const float*>& blocks);
-  void run_body(int n, int T, int M, bool verify, std::uint64_t seed);
+  void run_body(int n, int T, int M, bool verify, std::uint64_t seed,
+                const kernels::batch::RejectSpec* reject);
   kernels::batch::ConvStates conv_states() const;  // slot 0's conv states and the slot strides
 
   const Weights& w_;
@@ -140,10 +148,14 @@ class BatchDecoder {
   std::map<std::vector<const float*>, DeviceBuffer> tables_;
   DeviceBuffer attn_ws_;
   bool use_nvfp4_head_ = false;
+  bool batch_fp8_dense_ = false;
+  bool batch_pico12_gemm_ = false;
+  bool batch_gate_fuse_ = false;
   bool graph_enabled_ = true;
+  int graph_warmup_ = 1;
   int graph_max_seqs_ = 32;
   int graph_max_tokens_ = 256;
-  using GraphKey = std::tuple<int, int, int, bool>;
+  using GraphKey = std::tuple<int, int, int, bool, bool>;
   std::map<GraphKey, int> graph_seen_;
   std::map<GraphKey, DecodeGraphExecutable> graphs_;
   MappedHostBuffer pin_tokens_, pin_slots_, pin_pos_, pin_rows_, pin_temps_, pin_seed_, pin_sampled_;
@@ -159,10 +171,13 @@ class BatchDecoder {
   std::uint64_t* d_seed_ = nullptr;
   float *B0_, *B1_, *B2_[PASSES], *E_[PASSES], *hid_, *part_, *y_, *y2_;
   __nv_bfloat16 *xin_, *xm_, *xf_;
-  float *mixf_, *msgs_, *mixm_;
+  std::uint8_t *xin_fp8_q_ = nullptr, *attn_fp8_q_ = nullptr;
+  float *xin_fp8_s_ = nullptr, *attn_fp8_s_ = nullptr;
+  float *mixf_ = nullptr, *msgs_ = nullptr, *mixm_ = nullptr;
+  __nv_bfloat16 *mixf_bf16_ = nullptr, *msgs_bf16_ = nullptr, *mixm_bf16_ = nullptr;
   __nv_bfloat16 *proj16_, *attn_out_, *wo_out_;
   __nv_bfloat16 *gin_, *g16_;
-  float* fg_;  // the gates' forget | gain products, fp32 [3, rows, 2H]
+  float* fg_ = nullptr;  // the unfused gates' forget | gain products, fp32 [3, rows, 2H]
   // per layer (loop layers): the gates' forget16 | gain16 rows, bf16 [G, 2H, GATE_RANK] (G = 3 qkv, 1 mlp)
   std::array<const __nv_bfloat16*, LAYERS> fg_qkv_{}, fg_mlp_{};
   float *router_logits_, *wts_;
@@ -174,6 +189,12 @@ class BatchDecoder {
   bool keep_logits_ = false;
   DeviceBuffer logits_buf_;  // logits_ when kept (BF16 head rows)
   int2* head_partials_ = nullptr;
+  bool reject_enabled_ = false;
+  MappedHostBuffer pin_reject_active_, pin_reject_ids_, pin_reject_probs_, pin_reject_picked_;
+  std::uint8_t* reject_active_ = nullptr;
+  std::int32_t *reject_ids_ = nullptr, *reject_picked_ = nullptr;
+  float* reject_probs_ = nullptr;
+  kernels::batch::RejectSpec reject_spec_;
   float* partial_ = nullptr;
   float* down_partial_ = nullptr;
   kernels::head::Candidate* local_cand_ = nullptr;

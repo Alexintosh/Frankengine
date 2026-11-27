@@ -9,17 +9,21 @@
 #include "model/runtime.h"
 
 #include <algorithm>
+#include <charconv>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <type_traits>
 
 namespace ingine::model {
 namespace {
 
 constexpr int G = BatchDrafter::GAMMA;
+static_assert(G == BatchDFlash2::GAMMA);
+constexpr int kSupport = kernels::batch::RejectSpec::kSupport;
 constexpr int TAP_ROW = NUM_TAPS * HIDDEN;  // bf16 per row of taps
 
 // the Gumbel noise of sampling call `draw`
@@ -45,33 +49,162 @@ std::filesystem::path resolve_dflash2_dir(const BatchEngineOptions& o) {
   throw std::invalid_argument("BatchEngine: DFlash2 requires --dflash2-dir or INKLING_DFLASH2_DIR");
 }
 
-}  // namespace
-
-bool batch_spec_adaptive(TpRuntime* tp, cudaStream_t stream) {
-  const bool root = !tp || tp->layout.tp_rank == 0;
-  int enabled = 1;
-  if (root) {
-    if (const char* env = std::getenv("INGINE_BATCH_SPEC_ADAPTIVE"); env && std::string_view(env) == "0")
-      enabled = 0;
-  }
-  if (tp) {
-    DeviceBuffer device(sizeof(enabled));
-    if (root)
-      CUDA_CHECK(cudaMemcpyAsync(device.p, &enabled, sizeof(enabled), cudaMemcpyHostToDevice, stream));
-    tp->broadcast_proposal(device.p, sizeof(enabled), stream);
-    CUDA_CHECK(cudaMemcpyAsync(&enabled, device.p, sizeof(enabled), cudaMemcpyDeviceToHost, stream));
-    tp->wait(stream);
-  }
-  return enabled != 0;
+int batch_spec_env_int(const char* name, int fallback, int minimum) {
+  const char* env = std::getenv(name);
+  if (!env) return fallback;
+  const char* end = env + std::string_view(env).size();
+  int value = 0;
+  const auto [ptr, ec] = std::from_chars(env, end, value);
+  return ec == std::errc{} && ptr == end && value >= minimum ? value : fallback;
 }
 
-BatchSpecCost::BatchSpecCost(bool adaptive, int n, int slots, float threshold)
-    : n_(n),
+}  // namespace
+
+BatchSpecConfig batch_spec_config(TpRuntime* tp, cudaStream_t stream) {
+  static_assert(std::is_trivially_copyable_v<BatchSpecConfig>);
+  const bool root = !tp || tp->layout.tp_rank == 0;
+  BatchSpecConfig config;
+  if (root) {
+    if (const char* env = std::getenv("INGINE_BATCH_SPEC_ADAPTIVE"); env && std::string_view(env) == "0")
+      config.adaptive = 0;
+    config.dcut = batch_spec_env_int("INGINE_BATCH_DCUT", config.dcut, 0) != 0;
+    if (const char* env = std::getenv("INGINE_BATCH_DCUT_THETA")) {
+      char* end = nullptr;
+      const float theta = std::strtof(env, &end);
+      if (*end == '\0' && theta > 0.f && theta < 1.f) config.dcut_theta = theta;
+    }
+    config.dcut_min_k = batch_spec_env_int("INGINE_BATCH_DCUT_MIN_K", config.dcut_min_k, -1);
+    config.dcut_max_t = batch_spec_env_int("INGINE_BATCH_DCUT_MAX_T", config.dcut_max_t, 0);
+    config.dcut_bucket = batch_spec_env_int("INGINE_BATCH_DCUT_BUCKET", config.dcut_bucket, 0);
+    if (const char* env = std::getenv("INGINE_BATCH_DCUT_REJECT_EMA_WEIGHT")) {
+      char* end = nullptr;
+      const float weight = std::strtof(env, &end);
+      if (end != env && *end == '\0' && weight >= 0.f && weight <= 1.f)
+        config.dcut_reject_ema_weight = weight;
+    }
+  }
+  if (tp) {
+    DeviceBuffer device(sizeof(config));
+    if (root)
+      CUDA_CHECK(cudaMemcpyAsync(device.p, &config, sizeof(config), cudaMemcpyHostToDevice, stream));
+    tp->broadcast_proposal(device.p, sizeof(config), stream);
+    CUDA_CHECK(cudaMemcpyAsync(&config, device.p, sizeof(config), cudaMemcpyDeviceToHost, stream));
+    tp->wait(stream);
+  }
+  return config;
+}
+
+BatchDraftSupport::BatchDraftSupport(int slots)
+    : slot_temps_(slots), slot_has_support_(slots),
+      slot_ids_(std::size_t(slots) * G * kSupport), slot_picked_(std::size_t(slots) * G),
+      slot_probs_(slot_ids_.size()), download_ids_(slot_ids_.size()), download_picked_(slot_picked_.size()),
+      download_probs_(slot_ids_.size()), row_active_(std::size_t(slots) * (G + 1)),
+      row_ids_(row_active_.size() * kSupport), row_picked_(row_active_.size()), row_probs_(row_ids_.size()) {}
+
+void BatchDraftSupport::reset(int slot) {
+  if (slot_temps_.empty()) return;
+  slot_temps_[slot] = 0.f;
+  slot_has_support_[slot] = false;
+}
+
+void BatchDraftSupport::set_temperature(int slot, float temperature) {
+  if (slot_temps_.empty()) return;
+  if (slot_temps_[slot] != temperature) slot_has_support_[slot] = false;
+  slot_temps_[slot] = temperature;
+}
+
+void BatchDraftSupport::clear_support(int slot) {
+  if (!slot_has_support_.empty()) slot_has_support_[slot] = false;
+}
+
+bool BatchDraftSupport::has_support(int slot, float temperature) const {
+  return !slot_has_support_.empty() && slot_has_support_[slot] && temperature > 0.f &&
+         slot_temps_[slot] == temperature;
+}
+
+std::vector<float> BatchDraftSupport::proposal_temperatures(std::span<const std::int32_t> slots) const {
+  if (slot_temps_.empty() ||
+      std::none_of(slots.begin(), slots.end(), [&](int slot) { return slot_temps_[slot] > 0.f; }))
+    return {};
+  std::vector<float> temperatures;
+  temperatures.reserve(slots.size());
+  for (const int slot : slots) temperatures.push_back(slot_temps_[slot]);
+  return temperatures;
+}
+
+void BatchDraftSupport::download(const BatchDFlash2::Drafts& drafts, std::size_t sequences, cudaStream_t stream) {
+  const std::size_t count = sequences * G;
+  CUDA_CHECK(cudaMemcpyAsync(download_ids_.data(), drafts.support_ids, count * kSupport * sizeof(std::int32_t),
+                             cudaMemcpyDeviceToHost, stream));
+  CUDA_CHECK(cudaMemcpyAsync(download_probs_.data(), drafts.support_probs, count * kSupport * sizeof(float),
+                             cudaMemcpyDeviceToHost, stream));
+  CUDA_CHECK(cudaMemcpyAsync(download_picked_.data(), drafts.support_picked, count * sizeof(std::int32_t),
+                             cudaMemcpyDeviceToHost, stream));
+}
+
+void BatchDraftSupport::store(std::span<const std::int32_t> slots) {
+  for (std::size_t i = 0; i < slots.size(); ++i) {
+    const int slot = slots[i];
+    slot_has_support_[slot] = slot_temps_[slot] > 0.f;
+    if (!slot_has_support_[slot]) continue;
+    const std::size_t src = i * G, dst = std::size_t(slot) * G;
+    std::copy_n(download_ids_.data() + src * kSupport, G * kSupport, slot_ids_.data() + dst * kSupport);
+    std::copy_n(download_probs_.data() + src * kSupport, G * kSupport, slot_probs_.data() + dst * kSupport);
+    std::copy_n(download_picked_.data() + src, G, slot_picked_.data() + dst);
+  }
+}
+
+const BatchRejectInputs* BatchDraftSupport::verification_inputs(std::span<const std::int32_t> slots,
+                                                                std::span<const std::int32_t> widths,
+                                                                std::span<const std::int32_t> tokens,
+                                                                std::span<const float> temperatures) {
+  if (slot_temps_.empty()) return nullptr;
+  bool any = false;
+  std::size_t off = 0;
+  for (std::size_t i = 0; i < slots.size(); ++i) {
+    const int slot = slots[i];
+    if (has_support(slot, temperatures[i])) {
+      // The anchor predicts draft zero. The final row predicts a bonus token and stays inactive.
+      for (int d = 0; d < widths[i] - 1; ++d) {
+        const std::size_t draft = std::size_t(slot) * G + d;
+        const std::size_t r = off + d;
+        const auto* ids = slot_ids_.data() + draft * kSupport;
+        const auto* probs = slot_probs_.data() + draft * kSupport;
+        const int picked = slot_picked_[draft];
+        if (picked < 0 || picked >= kSupport || ids[picked] != tokens[r + 1] || !(probs[picked] > 0.f)) break;
+        if (!any) {
+          std::fill_n(row_active_.data(), tokens.size(), std::uint8_t(0));
+          any = true;
+        }
+        row_active_[r] = 1;
+        std::copy_n(ids, kSupport, row_ids_.data() + r * kSupport);
+        std::copy_n(probs, kSupport, row_probs_.data() + r * kSupport);
+        row_picked_[r] = picked;
+      }
+    }
+    off += widths[i];
+  }
+  if (!any) return nullptr;
+  inputs_ = {row_active_.data(), row_ids_.data(), row_probs_.data(), row_picked_.data()};
+  return &inputs_;
+}
+
+BatchSpecCost::BatchSpecCost(BatchSpecConfig config, int n, int slots, float threshold)
+    : config_(config),
+      n_(n),
       use_threshold_(threshold > 0.f),
-      calibrate_(adaptive && n >= 5 && use_threshold_),
-      theta_(std::max(0.05f, threshold * float(n) / float(slots))) {
+      calibrate_(config.adaptive && n >= 5 && use_threshold_),
+      theta_(std::max(0.05f, threshold * float(n) / float(slots))),
+      dcut_theta_(config.dcut_theta) {
   if (calibrate_)
     theta_ = std::max(theta_, threshold * std::pow(float(n) / float(slots), 0.75f));
+  if (config_.dcut && dcut_theta_ == 0.f) {
+    // GB10 measurements with rejection sampling favored a 0.15 cutoff at high concurrency.
+    const float target = 0.15f;
+    const float base = std::min(theta_, target);
+    const float ramp = std::clamp(float(n - 4) / 16.f, 0.f, 1.f);
+    dcut_theta_ = std::lerp(base, target, ramp);
+  }
 }
 
 int BatchSpecCost::minimum_width(int k_max, int k_min, float ema_p, int steps) const {
@@ -94,7 +227,104 @@ int BatchSpecCost::verification_width(int k_max, int k_min, const float* confide
   return k;
 }
 
+int BatchSpecCost::dcut_minimum_width(int k_max, int k_min) const {
+  const int minimum = config_.dcut_min_k >= 0 ? config_.dcut_min_k : (n_ < 8 ? k_min : 0);
+  return std::min(minimum, k_max);
+}
+
+void BatchSpecCost::allocate_widths(std::span<const Slot> slots, int k_min, std::span<std::int32_t> out_k) const {
+  if (!config_.dcut) {
+    for (std::size_t i = 0; i < slots.size(); ++i) {
+      const Slot& slot = slots[i];
+      out_k[i] = verification_width(slot.k_max, k_min, slot.confidence, slot.ema_p, slot.steps);
+    }
+    return;
+  }
+
+  struct Candidate {
+    float gain;
+    int slot;
+    int depth;
+    bool required;
+  };
+  const int n = int(slots.size());
+  std::vector<Candidate> candidates;
+  candidates.reserve(slots.size() * G);
+  int min_drafts = 0;
+  int selected = 0;
+  for (int i = 0; i < n; ++i) {
+    const Slot& slot = slots[i];
+    const int minimum = dcut_minimum_width(slot.k_max, k_min);
+    min_drafts += minimum;
+    const bool sampled = slot.temperature > 0.f;
+    const float initial_scale = sampled && !slot.reject && slot.steps == 0
+                                    ? 1.f / (1.f + 0.5f * slot.temperature)
+                                    : 1.f;
+    const float ema_weight = sampled ? 0.40f : 0.25f;
+    float gain = 1.f;
+    for (int k = 0; k < slot.k_max; ++k) {
+      const float confidence = std::isfinite(slot.confidence[k]) ? std::clamp(slot.confidence[k], 0.f, 1.f) : 0.f;
+      float p_step;
+      if (slot.reject && config_.dcut_reject_ema_weight > 0.f) {
+        // Optional unclamped EMA blend for experimentation (INGINE_BATCH_DCUT_REJECT_EMA_WEIGHT > 0).
+        const float target = slot.steps == 0 ? 0.78f : slot.ema_p;
+        const float weight = slot.steps == 0 ? 0.50f : config_.dcut_reject_ema_weight;
+        p_step = std::clamp(std::lerp(confidence, target, weight), 0.f, 1.f);
+      } else {
+        p_step = slot.steps == 0 ? confidence * initial_scale
+                                 : std::min(confidence, std::lerp(confidence, slot.ema_p, ema_weight));
+      }
+      gain *= p_step;
+      const bool required = k < minimum;
+      candidates.push_back({gain, i, k, required});
+      if (required || gain >= dcut_theta_) ++selected;
+    }
+  }
+
+  const int available = int(candidates.size());
+  const int limit = config_.dcut_max_t > 0 ? std::min(available, std::max(0, config_.dcut_max_t - n)) : available;
+  // When the cap binds, spend the budget on the strongest prefixes across the entire batch.
+  const bool cap_binds = selected > limit;
+  if (cap_binds) min_drafts = 0;
+  selected = std::min(selected, limit);
+  std::fill(out_k.begin(), out_k.end(), 0);
+  if (selected == 0) return;
+  // Both required rows and cumulative gains are prefix-ordered within a slot. Break ties by depth and slot
+  // so any prefix of the sorted candidates gives valid widths and identical selections on both ranks.
+  std::sort(candidates.begin(), candidates.end(), [cap_binds](const Candidate& a, const Candidate& b) {
+    if (!cap_binds && a.required != b.required) return a.required > b.required;
+    if (a.gain != b.gain) return a.gain > b.gain;
+    if (a.depth != b.depth) return a.depth < b.depth;
+    return a.slot < b.slot;
+  });
+
+  const int bucket = config_.dcut_bucket;
+  if (bucket > 1 && n >= 4) {
+    const int remainder = (n + selected) % bucket;
+    if (remainder != 0) {
+      const int lo = std::max(0, selected - remainder);
+      const int added = std::min(limit - selected, bucket - remainder);
+      float added_gain = 0.f;
+      for (int j = 0; j < added; ++j) added_gain += candidates[selected + j].gain;
+      if (lo < min_drafts || added <= bucket / 2 || added_gain >= float(added) * 0.70f * dcut_theta_)
+        selected += added;
+      else
+        selected = lo;
+    }
+  }
+
+  for (int j = 0; j < selected; ++j) ++out_k[candidates[j].slot];
+}
+
 int BatchSpecCost::proposal_budget(int k_max, int k_min, float ema_p, int steps) const {
+  if (config_.dcut) {
+    const float p = std::sqrt(std::clamp(steps == 0 ? initial_p : ema_p, 0.15f, 0.95f));
+    const int floor = std::min(k_max, std::max(2, dcut_minimum_width(k_max, k_min) + 1));
+    int k = 0;
+    for (float gain = p; k < k_max && gain >= dcut_theta_; gain *= p) ++k;
+    // Leave one proposal beyond the predicted cutoff so improving slots can recover.
+    return std::clamp(k + 1, floor, k_max);
+  }
   if (!calibrate_ || steps < 2 || ema_p >= 0.65f) return k_max;
   const float cal = std::clamp(ema_p, 0.15f, 0.95f);
   const int est = int(std::ceil(std::log(std::max(1e-4f, theta_)) / std::log(std::sqrt(cal))));
@@ -154,7 +384,7 @@ BatchEngine::BatchEngine(const BatchEngineOptions& o)
   if (!(spec_threshold_ >= 0.f && spec_threshold_ < 1.f))
     throw std::invalid_argument("BatchEngine: spec_threshold must be in [0, 1)");
   if (spec_ > 0) {
-    adaptive_batch_spec_ = batch_spec_adaptive(tp_.get(), stream_.s);
+    batch_spec_config_ = batch_spec_config(tp_.get(), stream_.s);
     batch_draft_type_ = resolve_batch_draft_type(o);
     const bool hybrid = batch_draft_type_ == "hybrid";
     if (hybrid) dflash2_max_ctx_ = batch_dflash2_max_ctx(std::max(1, o.dflash2_max_ctx), tp_.get(), stream_.s);
@@ -192,6 +422,7 @@ BatchEngine::BatchEngine(const BatchEngineOptions& o)
                                                   head_ovr, dflash2_head_.get());
       }
     }
+    if (dflash2_ && dec_->reject_enabled()) draft_support_ = BatchDraftSupport(o.slots);
     taps_chunk_ = DeviceBuffer(std::size_t(prefill_chunk_) * TAP_ROW * 2);
     gathered_ = DeviceBuffer(std::size_t(o.slots) * 8 * TAP_ROW * 2);
     rows_ = DeviceBuffer(std::size_t(o.slots) * 8 * 4);
@@ -237,6 +468,8 @@ std::vector<std::int32_t> BatchEngine::admit(std::span<const Admission> requests
       batch_slot_ema_p_[a.slot] = BatchSpecCost::initial_p;
       batch_slot_spec_steps_[a.slot] = 0;
       batch_slot_draft_budget_[a.slot] = spec_;
+      draft_support_.reset(a.slot);
+      draft_support_.set_temperature(a.slot, a.temperature);
     }
     if (drafter_) drafter_->reset_slot(a.slot);
     if (dflash2_) dflash2_->reset_slot(a.slot);
@@ -405,8 +638,8 @@ void BatchEngine::draft(int n) {
     const int ndf = int(df_idx.size());
     std::vector<std::int32_t> df_max_drafts;
     int total_rows = ndf * G;
-    if (adaptive_batch_spec_) {
-      const BatchSpecCost cost(true, n, st_.slots, spec_threshold_);
+    const BatchSpecCost cost(batch_spec_config_, n, st_.slots, spec_threshold_);
+    if (cost.use_proposal_budgets()) {
       df_max_drafts.reserve(df_idx.size());
       total_rows = 0;
       for (const int i : df_idx) {
@@ -422,9 +655,14 @@ void BatchEngine::draft(int n) {
       std::vector<std::int32_t> sl, an;
       std::vector<std::int64_t> np;
       gather_sub(df_idx, sl, an, np);
-      const BatchDFlash2::Drafts d =
-          dflash2_->propose(ndf, sl.data(), an.data(), np.data(), df_max_drafts.empty() ? nullptr : df_max_drafts.data());
+      const auto temps = draft_support_.proposal_temperatures(sl);
+      const bool sampled = !temps.empty();
+      const BatchDFlash2::Drafts d = dflash2_->propose(
+          ndf, sl.data(), an.data(), np.data(), df_max_drafts.empty() ? nullptr : df_max_drafts.data(),
+          sampled ? temps.data() : nullptr, sampled ? seed_of(++draws_) : 0);
+      if (sampled) draft_support_.download(d, sl.size(), stream_.s);
       scatter_sync(df_idx, d.tokens, d.conf);
+      if (sampled) draft_support_.store(sl);
     } else if (tp_) {
       if (dflash2_head_) dflash2_head_->run_rows(total_rows);
       scatter_sync(df_idx, nullptr, nullptr);
@@ -433,7 +671,10 @@ void BatchEngine::draft(int n) {
 
   if (!ds_idx.empty()) {
     const int nds = int(ds_idx.size());
-    for (const int i : ds_idx) batch_slot_draft_budget_[slot_[i]] = spec_;
+    for (const int i : ds_idx) {
+      batch_slot_draft_budget_[slot_[i]] = spec_;
+      draft_support_.clear_support(slot_[i]);
+    }
     if (drafter_) {
       std::vector<std::int32_t> sl, an;
       std::vector<std::int64_t> np;
@@ -455,16 +696,19 @@ void BatchEngine::step(std::span<Seq> seqs, std::vector<std::vector<std::int32_t
   emitted.resize(std::size_t(n));
   if (n == 0) return;
   m_.resize(std::size_t(n));
-  const BatchSpecCost cost(adaptive_batch_spec_, n, st_.slots, spec_threshold_);
-  for (int i = 0; i < n; ++i) {
-    int k = 0;
-    if (spec_ > 0) {
+  if (spec_ > 0) {
+    const BatchSpecCost cost(batch_spec_config_, n, st_.slots, spec_threshold_);
+    spec_slots_.resize(std::size_t(n));
+    for (int i = 0; i < n; ++i) {
       const int slot = seqs[i].slot;
-      const float* c = conf_.data() + std::size_t(slot) * G;
-      k = cost.verification_width(batch_slot_draft_budget_[slot], spec_min_, c,
-                                  batch_slot_ema_p_[slot], batch_slot_spec_steps_[slot]);
+      spec_slots_[i] = {batch_slot_draft_budget_[slot], conf_.data() + std::size_t(slot) * G,
+                        batch_slot_ema_p_[slot], batch_slot_spec_steps_[slot], seqs[i].temperature,
+                        draft_support_.has_support(slot, seqs[i].temperature)};
     }
-    m_[std::size_t(i)] = k + 1;
+    cost.allocate_widths(spec_slots_, spec_min_, m_);
+    for (auto& m : m_) ++m;
+  } else {
+    std::fill(m_.begin(), m_.end(), 1);
   }
   tok_.clear(), slot_.resize(std::size_t(n)), pos_.resize(std::size_t(n)), temp_.resize(std::size_t(n));
   for (int i = 0; i < n; ++i) {
@@ -473,9 +717,10 @@ void BatchEngine::step(std::span<Seq> seqs, std::vector<std::vector<std::int32_t
     for (int k = 1; k < m_[std::size_t(i)]; ++k) tok_.push_back(drafts_[std::size_t(q.slot) * G + std::size_t(k - 1)]);
     slot_[i] = q.slot, pos_[i] = q.pos, temp_[i] = q.temperature;
   }
+  const auto* reject = draft_support_.verification_inputs(slot_, m_, tok_, temp_);
   const auto tv0 = std::chrono::steady_clock::now();
   const auto got =
-      dec_->step(n, m_.data(), tok_.data(), slot_.data(), pos_.data(), temp_.data(), seed_of(++draws_));
+      dec_->step(n, m_.data(), tok_.data(), slot_.data(), pos_.data(), temp_.data(), seed_of(++draws_), reject);
   verify_seconds_ += std::chrono::duration<double>(std::chrono::steady_clock::now() - tv0).count();
   offsets(n);
   if (spec_ == 0) {
@@ -504,6 +749,7 @@ void BatchEngine::step(std::span<Seq> seqs, std::vector<std::vector<std::int32_t
       std::fprintf(trace_, "%d %d %d %.4f %.4f %.4f %.4f %.4f %.4f %.4f\n", slot_[i], K, a, c[0], c[1], c[2], c[3], c[4],
                    c[5], c[6]);
     }
+    draft_support_.set_temperature(slot_[i], temp_[i]);
     seqs[i].pending = anchor_[i] = out[a];
     seqs[i].pos = next_pos_[i] = pos_[i] + a + 1;
   }

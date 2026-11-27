@@ -29,6 +29,17 @@ struct Strided {
   std::int64_t a = 0, b = 0, c = 0;
 };
 
+// Host launch descriptor containing device pointers. Only used for an unsharded head without cand_out.
+struct RejectSpec {
+  static constexpr int kSupport = 16;
+  const std::uint8_t* active = nullptr;  // [M]: enable rejection sampling at positive temperature
+  const std::int32_t* ids = nullptr;     // [M, kSupport]: distinct global IDs, padded with -1
+  const float* probs = nullptr;          // [M, kSupport]: draft probabilities, summing to 1 for each active row
+  const std::int32_t* picked = nullptr;  // [M]: index of the drafted token in ids
+  float* target_scores = nullptr;       // [M, kSupport]: softcapped, unscaled target scores
+  float* partial_lse = nullptr;         // Two floats per partial: (max, relative sum) outside support
+};
+
 // The head with kernels::batch::sample's token choice fused (raw logits): L[M, N] = A[M, K] . B[N, K]^T (BF16,
 // mma.m16n8k16, FP32 accumulation; CTA tiles of 64 or, up to 32 rows, 32 rows of A x 128 rows of B, K in 64-element
 // stages, the first weight stages loaded before the wait for the previous kernel: programmatic dependent launch),
@@ -36,19 +47,22 @@ struct Strided {
 // key_v = s_v = 30 tanh(bf16(L[r, v]) / 30) where temps[r] <= 0, else s_v / temps[r] + G(seed, r, v) as sample
 // computes it: the same token as sample over the stored logits. Each CTA writes its rows' best (key, v) to
 // partials (head_partials(M, N) elements), a second kernel picks per row. temps: device fp32 [M]; out: device int32
-// [M]. With packed metadata, B is a PICO12 blob decoded into BF16 tiles. Requires K % 64 == 0, lda and ldb multiples of 8, N (and ldc) even, A, B 16-byte and logits 8-byte aligned.
+// [M]. With a RejectSpec, active rows sample using the draft proposal and its target residual.
+// With packed metadata, B is a PICO12 blob decoded into BF16 tiles. Requires K % 64 == 0, lda and ldb multiples of 8, N (and ldc) even, A, B 16-byte and logits 8-byte aligned.
 std::size_t head_partials(int M, int N);
 void head_sample(const __nv_bfloat16* A, int lda, const void* B, int ldb, int M, int N, int K,
                  const float* temps, std::uint64_t seed, float* logits, int ldc, int2* partials, std::int32_t* out,
                  cudaStream_t stream, int v_begin = 0, void* cand_out = nullptr,
-                 const std::uint64_t* d_seed = nullptr, const pico12::Layout* packed = nullptr);
+                 const std::uint64_t* d_seed = nullptr, const pico12::Layout* packed = nullptr,
+                 const RejectSpec* reject = nullptr);
 
 // NVFP4 unembedding head with kernels::batch::sample fused: reads NVFP4 weights (3.56x smaller than BF16) with
 // exact nvfp4::decode arithmetic, supporting any M >= 1, greedy or Gumbel-max sampling, and CUDA-graph capture via d_seed.
 std::size_t head_partials_nvfp4(int M, int N);
 void head_sample_nvfp4(const __nv_bfloat16* A, int lda, kernels::head::Nvfp4Matrix w, int M, const float* temps,
                        std::uint64_t seed, float* logits, int ldc, int2* partials, std::int32_t* out,
-                       cudaStream_t stream, void* cand_out = nullptr, const std::uint64_t* d_seed = nullptr);
+                       cudaStream_t stream, void* cand_out = nullptr, const std::uint64_t* d_seed = nullptr,
+                       const RejectSpec* reject = nullptr);
 
 // Fused NVFP4 head + exact top-16 candidate selection per row (raw logits before softcap, tie-break by lowest global id).
 // Supports arbitrary M >= 1 (K = 2304). ws must hold head_topk16_nvfp4_workspace_bytes(M, w.rows) bytes.
@@ -56,6 +70,12 @@ void head_sample_nvfp4(const __nv_bfloat16* A, int lda, kernels::head::Nvfp4Matr
 std::size_t head_topk16_nvfp4_workspace_bytes(int M, int rows);
 void head_topk16_nvfp4(const __nv_bfloat16* A, int lda, kernels::head::Nvfp4Matrix w, int M, void* ws,
                        float* out_vals, std::int32_t* out_ids, cudaStream_t stream);
+
+// Fused PICO12/BF16 MMA: row-major C[M, N] = A[M, K] . B[row_offset:row_offset+N, K]^T.
+// Accumulates in FP32, then adds the original BF16 CSR outliers before BF16 rounding or FP32 storage.
+// Requires K % 64 == 0, N even and a 16-byte-aligned device blob. lda and ldc are in elements.
+void pico12_gemm(const __nv_bfloat16* A, int lda, const void* B_blob, const pico12::Layout& layout,
+                 int row_offset, void* C, int ldc, bool c_fp32, int M, int N, int K, cudaStream_t stream);
 
 // BF16 GEMM, the arithmetic of prefill::Gemm: C[M, N] (row-major, ldc) = A[M, K] (bf16, lda) . B[N, K]^T (bf16,
 // ldb), FP32 accumulation, split-K partials reduced in FP32 only; C is bf16 (rounded once) or fp32.

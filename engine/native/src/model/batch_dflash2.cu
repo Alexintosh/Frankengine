@@ -2,6 +2,7 @@
 #include "model/tp_runtime.h"
 
 #include "core/arena.h"
+#include "core/decode_graph.h"
 #include "core/device.h"
 #include "core/host_memory.h"
 #include "core/safetensors.h"
@@ -19,12 +20,16 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <compare>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace ingine::model {
@@ -529,6 +534,7 @@ __global__ void batch_score_edges(const std::int32_t* __restrict__ ids, const fl
 
   const int predecessor = (edge == 0) ? anchors[seq] : ids[(row - 1) * 16 + previous];
   const int candidate = ids[row * 16 + next];
+  if (unsigned(predecessor) >= Vocabulary || unsigned(candidate) >= Vocabulary) return;
   float dot = 0.f;
   const Bf* pred_row = predecessors + std::size_t(predecessor) * Rank;
   const Bf* succ_row = successors + std::size_t(candidate) * Rank;
@@ -544,33 +550,92 @@ __global__ void batch_score_edges(const std::int32_t* __restrict__ ids, const fl
   }
 }
 
+__device__ __forceinline__ float draft_uniform(std::uint64_t seed, int seq, int edge) {
+  constexpr std::uint64_t increment = 0x9E3779B97F4A7C15ull;
+  std::uint64_t h = seed ^ (std::uint64_t(seq) << 32) ^ (std::uint64_t(edge) * increment);
+  h += increment;
+  h = (h ^ (h >> 30)) * 0xBF58476D1CE4E5B9ull;
+  h = (h ^ (h >> 27)) * 0x94D049BB133111EBull;
+  h ^= h >> 31;
+  return float(h >> 40) * 0x1p-24f;
+}
+
 __global__ void batch_walk(const std::int32_t* __restrict__ ids, const float* __restrict__ lattice,
                            const std::int32_t* __restrict__ prop_off, const std::int32_t* __restrict__ prop_cnt,
-                           std::int32_t* __restrict__ tokens, float* __restrict__ confidence, bool cumulative) {
+                           const float* __restrict__ temps, const std::uint64_t* __restrict__ d_seed, bool cumulative,
+                           std::int32_t* __restrict__ tokens, float* __restrict__ confidence,
+                           std::int32_t* __restrict__ support_ids, float* __restrict__ support_probs,
+                           std::int32_t* __restrict__ support_picked) {
   const int seq = blockIdx.x;
   const int start = prop_off[seq];
   const int count = prop_cnt[seq];
   const int output = seq * Proposals;
+  const float temperature = temps[seq];
+  const std::uint64_t seed = *d_seed;
   int previous = 0;
   float prod = 1.f;
-  for (int edge = 0; edge < count; ++edge) {
+  int edge = 0;
+  for (; edge < count; ++edge) {
     const int row = start + edge;
+    const int out = output + edge;
+    const std::int32_t* row_ids = ids + row * 16;
+    bool valid = true;
+    for (int next = 0; next < 16; ++next) {
+      valid &= unsigned(row_ids[next]) < Vocabulary;
+      support_ids[out * 16 + next] = row_ids[next];
+    }
+    // A row with a missing candidate invalidates the remaining suffix.
+    if (!valid) break;
+
     const float* scores = lattice + (row * 16 + previous) * 16;
     int best = 0;
     for (int next = 1; next < 16; ++next) {
       if (scores[next] > scores[best]) best = next;
     }
-    tokens[output + edge] = ids[row * 16 + best];
     float mass = 0.f;
     for (int next = 0; next < 16; ++next) mass += expf(scores[next] - scores[best]);
     const float c = 1.f / mass;
     prod *= c;
-    confidence[output + edge] = cumulative ? prod : c;
-    previous = best;
+    confidence[out] = cumulative ? prod : c;
+
+    int picked = best;
+    if (temperature > 0.f) {
+      float q[16], sum = 0.f;
+      for (int next = 0; next < 16; ++next) {
+        // Center before scaling so the maximum stays finite at very small temperatures.
+        q[next] = expf((scores[next] - scores[best]) / temperature);
+        sum += q[next];
+      }
+      const float inv_sum = 1.f / sum;
+      for (int next = 0; next < 16; ++next) {
+        q[next] *= inv_sum;
+        support_probs[out * 16 + next] = q[next];
+      }
+
+      const float u = draft_uniform(seed, seq, edge);
+      float cdf = 0.f;
+      for (int next = 0; next < 16; ++next) {
+        // If rounding leaves a gap at the end, pick the last entry with positive mass.
+        if (q[next] > 0.f) picked = next;
+        cdf += q[next];
+        if (u < cdf) break;
+      }
+    } else {
+      for (int next = 0; next < 16; ++next) support_probs[out * 16 + next] = next == picked ? 1.f : 0.f;
+    }
+    tokens[out] = row_ids[picked];
+    support_picked[out] = picked;
+    previous = picked;
   }
-  for (int edge = count; edge < Proposals; ++edge) {
-    tokens[output + edge] = 0;
-    confidence[output + edge] = 0.f;
+  for (; edge < Proposals; ++edge) {
+    const int out = output + edge;
+    tokens[out] = 0;
+    confidence[out] = 0.f;
+    support_picked[out] = 0;
+    for (int next = 0; next < 16; ++next) {
+      support_ids[out * 16 + next] = -1;
+      support_probs[out * 16 + next] = 0.f;
+    }
   }
 }
 
@@ -695,6 +760,12 @@ std::size_t BatchDFlash2Head::device_bytes() const { return impl_->bytes + impl_
 // =================================================================================================
 
 struct BatchDFlash2::Impl {
+  struct ProposeGraphKey {
+    int n, total_rows, chunks, chunk_keys;
+    auto operator<=>(const ProposeGraphKey&) const = default;
+  };
+  static constexpr std::size_t MaxProposeGraphs = 128;
+
   cudaStream_t s;
   int slots, max_seqs;
   Precision precision;
@@ -733,7 +804,9 @@ struct BatchDFlash2::Impl {
   // Slot, anchor, position, valid bounds, proposal offset/count, then (sequence, step) per compacted row.
   static constexpr int ProposeFields = 7;
   std::int32_t* d_propose_params = nullptr;
-  MappedHostBuffer pin_propose_params;
+  float* d_temps_ = nullptr;
+  std::uint64_t* d_seed_ = nullptr;
+  MappedHostBuffer pin_propose_params, pin_temps, pin_seed_;
   cudaEvent_t propose_params_copied = nullptr;
   std::int64_t* ids = nullptr;
   float* embed_f32 = nullptr;
@@ -746,6 +819,12 @@ struct BatchDFlash2::Impl {
   void* head_ws = nullptr;
   float *top_vals = nullptr, *lattice = nullptr, *conf = nullptr;
   std::int32_t *top_ids = nullptr, *tokens = nullptr;
+  std::int32_t *support_ids_ = nullptr, *support_picked_ = nullptr;
+  float* support_probs_ = nullptr;
+
+  bool propose_graph_enabled = false;
+  std::map<ProposeGraphKey, DecodeGraphExecutable> propose_graphs;
+  std::set<ProposeGraphKey> warmed_propose_shapes;
 
   template <typename T = std::byte>
   T* alloc(std::size_t n) {
@@ -800,6 +879,10 @@ struct BatchDFlash2::Impl {
     if (slots < 1 || max_seqs < 1 || max_seqs > slots)
       throw std::invalid_argument("BatchDFlash2: invalid slots or max_seqs");
     if (!embed || !embed_norm) throw std::invalid_argument("BatchDFlash2: missing target embeddings");
+    const char* graph_env = std::getenv("INGINE_BATCH_DFLASH2_GRAPH");
+    // Opt-in via INGINE_BATCH_DFLASH2_GRAPH=1 (short contexts churn chunk_keys; eager beats graph at <=512 tok).
+    propose_graph_enabled = !sharded_head && s && s != cudaStreamLegacy &&
+                            (graph_env && *graph_env && std::strcmp(graph_env, "0") != 0);
     if (!sharded_head) {
       head::Nvfp4Matrix target_head;
       if (head_override && head_override->codes && head_override->scales) {
@@ -923,6 +1006,10 @@ struct BatchDFlash2::Impl {
     const std::size_t propose_ints = std::size_t(ProposeFields) * max_seqs + std::size_t(2) * MH;
     d_propose_params = alloc<std::int32_t>(propose_ints);
     pin_propose_params = MappedHostBuffer(propose_ints * sizeof(std::int32_t));
+    d_temps_ = alloc<float>(max_seqs);
+    pin_temps = MappedHostBuffer(std::size_t(max_seqs) * sizeof(float));
+    d_seed_ = alloc<std::uint64_t>(1);
+    pin_seed_ = MappedHostBuffer(sizeof(std::uint64_t));
     ids = alloc<std::int64_t>(M);
     embed_f32 = alloc<float>(std::size_t(M) * H);
     x = alloc<Bf>(std::size_t(M) * H);
@@ -962,12 +1049,17 @@ struct BatchDFlash2::Impl {
     lattice = alloc<float>(std::size_t(MH) * 16 * 16);
     tokens = alloc<std::int32_t>(MH);
     conf = alloc<float>(MH);
+    support_ids_ = alloc<std::int32_t>(std::size_t(MH) * 16);
+    support_probs_ = alloc<float>(std::size_t(MH) * 16);
+    support_picked_ = alloc<std::int32_t>(MH);
     CUDA_CHECK(cudaStreamSynchronize(s));
     CUDA_CHECK(cudaEventCreateWithFlags(&propose_params_copied, cudaEventDisableTiming));
   }
 
   ~Impl() {
     cudaEventSynchronize(propose_params_copied);
+    if (!propose_graphs.empty()) cudaStreamSynchronize(s);
+    propose_graphs.clear();
     cudaEventDestroy(propose_params_copied);
   }
 
@@ -1090,9 +1182,9 @@ struct BatchDFlash2::Impl {
   }
 
   Drafts propose(int n, const std::int32_t* slot_ids, const std::int32_t* anchors, const std::int64_t* pos,
-                 const std::int32_t* max_drafts) {
+                 const std::int32_t* max_drafts, const float* temps, std::uint64_t seed) {
     if (n < 1 || n > max_seqs) throw std::invalid_argument("BatchDFlash2::propose: n out of range");
-    // Callers may enqueue back-to-back proposals with different row maps.
+    // Wait for the previous step's copies before overwriting the pinned inputs.
     CUDA_CHECK(cudaEventSynchronize(propose_params_copied));
     auto* p = static_cast<std::int32_t*>(pin_propose_params.data());
     auto* row_map = p + ProposeFields * n;
@@ -1122,8 +1214,51 @@ struct BatchDFlash2::Impl {
       total_rows += count;
     }
     const std::size_t param_bytes = std::size_t(ProposeFields * n + 2 * total_rows) * sizeof(std::int32_t);
+    const std::size_t temp_bytes = std::size_t(n) * sizeof(float);
+    auto* staged_temps = static_cast<float*>(pin_temps.data());
+    if (temps) {
+      std::memcpy(staged_temps, temps, temp_bytes);
+    } else {
+      std::fill_n(staged_temps, n, 0.f);
+    }
+    std::memcpy(pin_seed_.data(), &seed, sizeof(seed));
     CUDA_CHECK(cudaMemcpyAsync(d_propose_params, p, param_bytes, cudaMemcpyHostToDevice, s));
+    CUDA_CHECK(cudaMemcpyAsync(d_temps_, staged_temps, temp_bytes, cudaMemcpyHostToDevice, s));
+    CUDA_CHECK(cudaMemcpyAsync(d_seed_, pin_seed_.data(), sizeof(seed), cudaMemcpyHostToDevice, s));
+    // Keep the staging event on the stream even when the proposal body is captured.
     CUDA_CHECK(cudaEventRecord(propose_params_copied, s));
+
+    const int target = chunk_target(n);
+    const int chunk_keys = std::max(GqaTile, ((max_keys + target - 1) / target + GqaTile - 1) / GqaTile * GqaTile);
+    const int chunks = (max_keys + chunk_keys - 1) / chunk_keys;
+    const ProposeGraphKey key{n, total_rows, chunks, chunk_keys};
+    const Drafts drafts{tokens, conf, support_ids_, support_probs_, support_picked_};
+    if (propose_graph_enabled) {
+      if (auto it = propose_graphs.find(key); it != propose_graphs.end()) {
+        it->second.launch(s);
+        return drafts;
+      }
+      if (propose_graphs.size() < MaxProposeGraphs && warmed_propose_shapes.contains(key)) {
+        DecodeGraphDefinition definition;
+        definition.capture(s, [&] { run_propose(key); });
+        DecodeGraphExecutable executable;
+        executable.instantiate(definition);
+        auto it = propose_graphs.emplace(key, std::move(executable)).first;
+        warmed_propose_shapes.erase(key);
+        if (propose_graphs.size() == MaxProposeGraphs) warmed_propose_shapes.clear();
+        it->second.launch(s);
+        return drafts;
+      }
+    }
+
+    // The first eager visit initializes the GEMM plans and head kernel attributes.
+    run_propose(key);
+    if (propose_graph_enabled && propose_graphs.size() < MaxProposeGraphs) warmed_propose_shapes.insert(key);
+    return drafts;
+  }
+
+  void run_propose(const ProposeGraphKey& key) {
+    const auto [n, total_rows, chunks, chunk_keys] = key;
     const std::int32_t* d_slots = d_propose_params;
     const std::int32_t* d_anchors = d_propose_params + n;
     const std::int32_t* d_pos = d_propose_params + 2 * n;
@@ -1139,11 +1274,6 @@ struct BatchDFlash2::Impl {
     build_block_ids<<<n, Block, 0, s>>>(d_anchors, ids);
     kernels::dense::embed(ids, M, embed, embed_norm, embed_f32, false, s);
     f32_to_bf16<<<(M * H + 4 * Threads - 1) / (4 * Threads), Threads, 0, s>>>(embed_f32, x, M * H);
-
-    // Attention chunking
-    const int target = chunk_target(n);
-    const int chunk_keys = std::max(GqaTile, ((max_keys + target - 1) / target + GqaTile - 1) / GqaTile * GqaTile);
-    const int chunks = (max_keys + chunk_keys - 1) / chunk_keys;
 
     // 2. Five DFlash2 layers batched across all M = n * 8 rows
     const dim3 conv_grid((H + Threads - 1) / Threads, M);
@@ -1210,9 +1340,9 @@ struct BatchDFlash2::Impl {
     gemm.run(hidden_props, total_rows, selector_w, Rank, H, projected, s);
     batch_score_edges<<<dim3(total_rows, 16, 16), 32, 0, s>>>(
         cand_ids, cand_vals, projected, pred, succ, d_anchors, d_row_map, lattice);
-    batch_walk<<<n, 1, 0, s>>>(cand_ids, lattice, d_prop_off, d_prop_cnt, tokens, conf, cumulative);
+    batch_walk<<<n, 1, 0, s>>>(cand_ids, lattice, d_prop_off, d_prop_cnt, d_temps_, d_seed_, cumulative,
+                              tokens, conf, support_ids_, support_probs_, support_picked_);
     CUDA_CHECK(cudaGetLastError());
-    return {tokens, conf};
   }
 };
 
@@ -1231,8 +1361,9 @@ void BatchDFlash2::commit(int n, const std::int32_t* slots, const std::int64_t* 
   impl_->commit(n, slots, start, count, taps);
 }
 BatchDFlash2::Drafts BatchDFlash2::propose(int n, const std::int32_t* slots, const std::int32_t* anchors,
-                                           const std::int64_t* pos, const std::int32_t* max_drafts) {
-  return impl_->propose(n, slots, anchors, pos, max_drafts);
+                                         const std::int64_t* pos, const std::int32_t* max_drafts,
+                                         const float* temps, std::uint64_t seed) {
+  return impl_->propose(n, slots, anchors, pos, max_drafts, temps, seed);
 }
 int BatchDFlash2::slots() const { return impl_->slots; }
 int BatchDFlash2::max_seqs() const { return impl_->max_seqs; }

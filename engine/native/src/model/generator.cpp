@@ -154,7 +154,7 @@ class EngineGenerator final : public Generator {
         throw std::invalid_argument("batch_ctx must be in [1024, max_ctx]");
       const TpLayout layout = rt_.tp() ? rt_.tp()->layout : TpLayout{};
       const cudaStream_t stream = rt_.stream();
-      adaptive_batch_spec_ = batch_spec_adaptive(rt_.tp(), stream);
+      batch_spec_config_ = batch_spec_config(rt_.tp(), stream);
       if (!rt_.weights().unembed_nvfp4.codes && (!rt_.weights().unembed.w.data || rt_.weights().unembed.fp8())) {
         batch_unembed_ = load_head(options.model_dir, /*dense_fp8=*/false, /*head_nvfp4=*/false, stream,
                                    batch_head_storage_, layout).dense;
@@ -218,6 +218,8 @@ class EngineGenerator final : public Generator {
               head_ovr, batch_dflash2_head_.get());
         }
       }
+      if (batch_dflash2_ && batch_dec_->reject_enabled())
+        batch_draft_support_ = BatchDraftSupport(options.max_batch);
       constexpr int G = BatchDrafter::GAMMA;
       constexpr int TAP_ROW = NUM_TAPS * HIDDEN;
       batch_gathered_ = DeviceBuffer(std::size_t(options.max_batch) * 8 * TAP_ROW * 2);
@@ -473,22 +475,8 @@ class EngineGenerator final : public Generator {
     if (options_.batch_spec > 0) {
       State view = batch_state_.view(slot);
       auto& history = batch_spec_histories_.at(std::size_t(slot));
-      int reused = 0;
-      if (offset == 0) {
-        reset_batch_spec_cost(slot);
-        if (!options_.cold_prefill && !history.empty() && history.size() < prompt.size() &&
-            std::equal(history.begin(), history.end(), prompt.begin())) {
-          reused = int(history.size());
-        }
-        if (tp && !tp->agree(reused, stream)) reused = 0;
-        offset = reused;
-        if (!offset) {
-          reset_slot(batch_state_, slot, stream);
-          if (batch_drafter_) batch_drafter_->reset_slot(slot);
-          if (batch_dflash2_) batch_dflash2_->reset_slot(slot);
-          history.clear();
-        }
-      }
+      const int reused = offset == 0 ? prepare_batch_prefill(slot, prompt) : 0;
+      offset += reused;
       if (stop_at > 0 && offset == stop_at && stop_at < int(prompt.size())) {
         return PrefillChunkResult{offset, reused, std::nullopt};
       }
@@ -525,6 +513,7 @@ class EngineGenerator final : public Generator {
         }
         const std::int32_t slot32 = slot;
         const std::int64_t pos64 = std::int64_t(prompt.size());
+        batch_draft_support_.set_temperature(slot, sampling.params.temperature);
         batch_draft_slots(1, &slot32, &first_tok, &pos64);
       }
       return result;
@@ -568,6 +557,94 @@ class EngineGenerator final : public Generator {
     return result;
   }
 
+  bool supports_batch_short_prefill() const override {
+    const char* enabled = std::getenv("INGINE_BATCH_SHORT_PREFILL");
+    return options_.batch_spec > 0 && batch_dec_ && !rt_.tp() &&
+           (!enabled || std::string_view(enabled) != "0");
+  }
+
+  std::vector<PrefillChunkResult> prefill_batch_short(std::span<const BatchPrefillSlot> slots,
+                                                     int max_steps = 0) override {
+    if (!supports_batch_short_prefill()) throw std::logic_error("short batch prefill unavailable");
+    if (max_steps < 0 || slots.size() > batch_spec_histories_.size())
+      throw std::invalid_argument("invalid short batch prefill dimensions");
+    std::vector<bool> seen(batch_spec_histories_.size());
+    for (const auto& input : slots) {
+      if (input.slot < 0 || std::size_t(input.slot) >= seen.size() || seen[input.slot] ||
+          !input.sampling || input.offset < 0 || std::size_t(input.offset) >= input.prompt.size() ||
+          input.prompt.size() > std::size_t(options_.batch_ctx - 8) ||
+          input.sampling->params.top_k != 0 || !(input.sampling->params.top_p >= 1.0f) ||
+          std::any_of(input.prompt.begin(), input.prompt.end(), [](int32_t token) {
+            return token < 0 || token >= UNPADDED_VOCAB;
+          }))
+        throw std::invalid_argument("invalid short batch prompt");
+      if (input.offset > 0 && batch_spec_histories_[input.slot].size() != std::size_t(input.offset))
+        throw std::invalid_argument("short batch prefill offset does not match slot history");
+      seen[input.slot] = true;
+    }
+    std::vector<PrefillChunkResult> results;
+    results.reserve(slots.size());
+    std::vector<std::size_t> members;
+    std::vector<std::int32_t> m, tok, slot_ids, off, finished_slots, anchors;
+    std::vector<std::int64_t> pos, finished_pos;
+    std::vector<float> temp;
+    try {
+      for (const auto& input : slots) {
+        const int reused = input.offset == 0 ? prepare_batch_prefill(input.slot, input.prompt) : 0;
+        results.push_back({input.offset + reused, reused, std::nullopt});
+      }
+      for (int step = 0; max_steps == 0 || step < max_steps; ++step) {
+        members.clear();
+        m.clear();
+        tok.clear();
+        slot_ids.clear();
+        off.assign(1, 0);
+        pos.clear();
+        temp.clear();
+        for (std::size_t j = 0; j < slots.size(); ++j) {
+          const auto& input = slots[j];
+          const int offset = results[j].offset;
+          const int count = std::min(8, int(input.prompt.size()) - offset);
+          if (count == 0) continue;
+          members.push_back(j);
+          m.push_back(count);
+          tok.insert(tok.end(), input.prompt.begin() + offset, input.prompt.begin() + offset + count);
+          slot_ids.push_back(input.slot);
+          off.push_back(int(tok.size()));
+          pos.push_back(offset);
+          temp.push_back(input.sampling->params.temperature);
+        }
+        if (members.empty()) break;
+        const auto got = batch_dec_->step(int(members.size()), m.data(), tok.data(), slot_ids.data(), pos.data(),
+                                          temp.data(), batch_seed(++batch_draws_), nullptr);
+        // A multi-row step defers conv updates for every lane, including one-row lanes.
+        batch_dec_->accept(m.data());
+        commit_batch_taps(slot_ids, pos, m, off);
+        for (std::size_t i = 0; i < members.size(); ++i) {
+          const std::size_t j = members[i];
+          auto& history = batch_spec_histories_[slot_ids[i]];
+          history.insert(history.end(), tok.begin() + off[i], tok.begin() + off[i + 1]);
+          auto& result = results[j];
+          result.offset += m[i];
+          if (result.offset == int(slots[j].prompt.size())) {
+            result.token = got[off[i + 1] - 1];
+            batch_draft_support_.set_temperature(slot_ids[i], temp[i]);
+            finished_slots.push_back(slot_ids[i]);
+            anchors.push_back(*result.token);
+            finished_pos.push_back(result.offset);
+          }
+        }
+      }
+      if (finished_slots.empty()) CUDA_CHECK(cudaStreamSynchronize(rt_.stream()));
+      else batch_draft_slots(int(finished_slots.size()), finished_slots.data(), anchors.data(), finished_pos.data());
+    } catch (...) {
+      // A failed step may have written part of a slot's state. Force a cold restart on reuse.
+      for (const auto& input : slots) batch_spec_histories_[input.slot].clear();
+      throw;
+    }
+    return results;
+  }
+
   std::vector<std::vector<int32_t>> decode_batch_step_multi(std::span<const BatchSlotStep> slots) override {
     if (options_.batch_spec == 0) return Generator::decode_batch_step_multi(slots);
     const int n = int(slots.size());
@@ -575,28 +652,35 @@ class EngineGenerator final : public Generator {
     std::vector<std::vector<int32_t>> emitted(ns);
     if (n == 0) return emitted;
     constexpr int G = BatchDrafter::GAMMA;
-    const BatchSpecCost cost(adaptive_batch_spec_, n, options_.max_batch, options_.batch_spec_threshold);
+    const BatchSpecCost cost(batch_spec_config_, n, options_.max_batch, options_.batch_spec_threshold);
     std::vector<std::int32_t> m(ns), slot_ids(ns), tok;
     std::vector<std::int64_t> pos(ns);
     std::vector<float> temp(ns);
-    tok.reserve(std::size_t(n) * std::size_t(options_.batch_spec + 1));
-    for (int i = 0; i < n; ++i) {
-      const int s = slots[std::size_t(i)].slot;
+    std::vector<BatchSpecCost::Slot> spec_slots(ns);
+    for (std::size_t i = 0; i < ns; ++i) {
+      const int s = slots[i].slot;
       const int p_cur = int(batch_spec_histories_.at(std::size_t(s)).size());
       const int avail = std::max(0, options_.batch_ctx - 1 - p_cur);
       const int k_max = std::min(batch_slot_draft_budget_[s], std::max(0, avail - 1));
-      const float* c = batch_conf_.data() + std::size_t(s) * G;
-      const int k = cost.verification_width(k_max, options_.batch_spec_min, c, batch_slot_ema_p_[s],
-                                            batch_slot_spec_steps_[s]);
-      m[std::size_t(i)] = k + 1;
-      slot_ids[std::size_t(i)] = s;
-      pos[std::size_t(i)] = p_cur;
-      temp[std::size_t(i)] = slots[std::size_t(i)].sampling->params.temperature;
-      tok.push_back(slots[std::size_t(i)].token);
+      slot_ids[i] = s;
+      pos[i] = p_cur;
+      temp[i] = slots[i].sampling->params.temperature;
+      spec_slots[i] = {k_max, batch_conf_.data() + std::size_t(s) * G,
+                      batch_slot_ema_p_[s], batch_slot_spec_steps_[s], temp[i],
+                      batch_draft_support_.has_support(s, temp[i])};
+    }
+    cost.allocate_widths(spec_slots, options_.batch_spec_min, m);
+    tok.reserve(ns * std::size_t(options_.batch_spec + 1));
+    for (std::size_t i = 0; i < ns; ++i) {
+      const int s = slot_ids[i];
+      const int k = m[i];
+      m[i] = k + 1;
+      tok.push_back(slots[i].token);
       for (int d = 0; d < k; ++d) tok.push_back(batch_drafts_[std::size_t(s) * G + std::size_t(d)]);
     }
+    const auto* reject = batch_draft_support_.verification_inputs(slot_ids, m, tok, temp);
     const auto got = batch_dec_->step(n, m.data(), tok.data(), slot_ids.data(), pos.data(), temp.data(),
-                                      batch_seed(++batch_draws_));
+                                      batch_seed(++batch_draws_), reject);
     std::vector<std::int32_t> off(ns + 1, 0), keep(ns);
     for (int i = 0; i < n; ++i) off[std::size_t(i) + 1] = off[std::size_t(i)] + m[std::size_t(i)];
     std::vector<std::int32_t> d_slots, d_anchors;
@@ -610,6 +694,7 @@ class EngineGenerator final : public Generator {
       while (a < K && row[1 + a] == out[a]) ++a;
       const int slot = slot_ids[std::size_t(i)];
       BatchSpecCost::observe(K, a, batch_slot_ema_p_[slot], batch_slot_spec_steps_[slot]);
+      batch_draft_support_.set_temperature(slot, temp[std::size_t(i)]);
       emitted[std::size_t(i)].assign(row + 1, row + 1 + a);
       emitted[std::size_t(i)].push_back(out[a]);
       keep[std::size_t(i)] = a + 1;
@@ -623,19 +708,7 @@ class EngineGenerator final : public Generator {
       }
     }
     batch_dec_->accept(keep.data());
-    if (batch_drafter_ || batch_dflash2_) {
-      constexpr int TAP_ROW = NUM_TAPS * HIDDEN;
-      std::vector<std::int32_t> rows_h;
-      rows_h.reserve(tok.size());
-      for (int i = 0; i < n; ++i)
-        for (int r = 0; r < keep[std::size_t(i)]; ++r) rows_h.push_back(off[std::size_t(i)] + r);
-      CUDA_CHECK(cudaMemcpyAsync(batch_rows_.p, rows_h.data(), rows_h.size() * 4, cudaMemcpyHostToDevice, rt_.stream()));
-      kernels::batch::gather_rows(batch_dec_->taps(), TAP_ROW, static_cast<const std::int32_t*>(batch_rows_.p),
-                                  int(rows_h.size()), static_cast<__nv_bfloat16*>(batch_gathered_.p), rt_.stream());
-      const auto* gptr = static_cast<const __nv_bfloat16*>(batch_gathered_.p);
-      if (batch_drafter_) batch_drafter_->commit(n, slot_ids.data(), pos.data(), keep.data(), gptr);
-      if (batch_dflash2_) batch_dflash2_->commit(n, slot_ids.data(), pos.data(), keep.data(), gptr);
-    }
+    commit_batch_taps(slot_ids, pos, keep, off);
     if (!d_slots.empty()) batch_draft_slots(int(d_slots.size()), d_slots.data(), d_anchors.data(), d_pos.data());
     else if (rt_.tp()) rt_.tp()->wait(rt_.stream());
     else CUDA_CHECK(cudaStreamSynchronize(rt_.stream()));
@@ -1308,10 +1381,48 @@ class EngineGenerator final : public Generator {
     return token;
   }
 
+  int prepare_batch_prefill(int slot, std::span<const int32_t> prompt) {
+    auto& history = batch_spec_histories_.at(std::size_t(slot));
+    reset_batch_spec_cost(slot);
+    int reused = 0;
+    if (!options_.cold_prefill && !history.empty() && history.size() < prompt.size() &&
+        std::equal(history.begin(), history.end(), prompt.begin())) {
+      reused = int(history.size());
+    }
+    const auto stream = rt_.stream();
+    if (auto* tp = rt_.tp(); tp && !tp->agree(reused, stream)) reused = 0;
+    if (reused == 0) {
+      reset_slot(batch_state_, slot, stream);
+      if (batch_drafter_) batch_drafter_->reset_slot(slot);
+      if (batch_dflash2_) batch_dflash2_->reset_slot(slot);
+      history.clear();
+    }
+    return reused;
+  }
+
+  void commit_batch_taps(std::span<const std::int32_t> slots, std::span<const std::int64_t> pos,
+                         std::span<const std::int32_t> keep, std::span<const std::int32_t> off) {
+    if (!batch_drafter_ && !batch_dflash2_) return;
+    constexpr int TAP_ROW = NUM_TAPS * HIDDEN;
+    const auto stream = rt_.stream();
+    std::vector<std::int32_t> rows;
+    rows.reserve(off.back());
+    for (std::size_t i = 0; i < slots.size(); ++i)
+      for (int r = 0; r < keep[i]; ++r) rows.push_back(off[i] + r);
+    CUDA_CHECK(cudaMemcpyAsync(batch_rows_.p, rows.data(), rows.size() * sizeof(rows[0]), cudaMemcpyHostToDevice, stream));
+    kernels::batch::gather_rows(batch_dec_->taps(), TAP_ROW, static_cast<const std::int32_t*>(batch_rows_.p),
+                                int(rows.size()), static_cast<__nv_bfloat16*>(batch_gathered_.p), stream);
+    const auto* taps = static_cast<const __nv_bfloat16*>(batch_gathered_.p);
+    const int n = int(slots.size());
+    if (batch_drafter_) batch_drafter_->commit(n, slots.data(), pos.data(), keep.data(), taps);
+    if (batch_dflash2_) batch_dflash2_->commit(n, slots.data(), pos.data(), keep.data(), taps);
+  }
+
   void reset_batch_spec_cost(int slot) {
     batch_slot_ema_p_[slot] = BatchSpecCost::initial_p;
     batch_slot_spec_steps_[slot] = 0;
     batch_slot_draft_budget_[slot] = options_.batch_spec;
+    batch_draft_support_.reset(slot);
   }
 
   void batch_draft_slots(int n, const std::int32_t* slots, const std::int32_t* anchors, const std::int64_t* next_pos) {
@@ -1370,8 +1481,8 @@ class EngineGenerator final : public Generator {
       const int ndf = int(df_idx.size());
       std::vector<std::int32_t> df_max_drafts;
       int total_rows = ndf * G;
-      if (adaptive_batch_spec_) {
-        const BatchSpecCost cost(true, n, options_.max_batch, options_.batch_spec_threshold);
+      const BatchSpecCost cost(batch_spec_config_, n, options_.max_batch, options_.batch_spec_threshold);
+      if (cost.use_proposal_budgets()) {
         df_max_drafts.reserve(df_idx.size());
         total_rows = 0;
         for (const int i : df_idx) {
@@ -1387,9 +1498,14 @@ class EngineGenerator final : public Generator {
         std::vector<std::int32_t> sl, an;
         std::vector<std::int64_t> np;
         gather_sub(df_idx, sl, an, np);
+        const auto temps = batch_draft_support_.proposal_temperatures(sl);
+        const bool sampled = !temps.empty();
         const BatchDFlash2::Drafts d = batch_dflash2_->propose(
-            ndf, sl.data(), an.data(), np.data(), df_max_drafts.empty() ? nullptr : df_max_drafts.data());
+            ndf, sl.data(), an.data(), np.data(), df_max_drafts.empty() ? nullptr : df_max_drafts.data(),
+            sampled ? temps.data() : nullptr, sampled ? batch_seed(++batch_draws_) : 0);
+        if (sampled) batch_draft_support_.download(d, sl.size(), stream);
         scatter_sync(df_idx, d.tokens, d.conf);
+        if (sampled) batch_draft_support_.store(sl);
       } else if (rt_.tp()) {
         if (batch_dflash2_head_) batch_dflash2_head_->run_rows(total_rows);
         scatter_sync(df_idx, nullptr, nullptr);
@@ -1397,7 +1513,10 @@ class EngineGenerator final : public Generator {
     }
     if (!ds_idx.empty()) {
       const int nds = int(ds_idx.size());
-      for (const int i : ds_idx) batch_slot_draft_budget_[slots[i]] = options_.batch_spec;
+      for (const int i : ds_idx) {
+        batch_slot_draft_budget_[slots[i]] = options_.batch_spec;
+        batch_draft_support_.clear_support(slots[i]);
+      }
       if (batch_drafter_) {
         std::vector<std::int32_t> sl, an;
         std::vector<std::int64_t> np;
@@ -1420,7 +1539,8 @@ class EngineGenerator final : public Generator {
   BatchState batch_state_;
   std::string batch_draft_type_;
   int batch_dflash2_max_ctx_ = 0;
-  bool adaptive_batch_spec_ = false;
+  BatchSpecConfig batch_spec_config_;
+  BatchDraftSupport batch_draft_support_;
   std::unique_ptr<BatchDecoder> batch_dec_;
   std::unique_ptr<BatchDrafter> batch_drafter_;
   std::vector<DeviceBuffer> batch_dflash2_head_storage_;

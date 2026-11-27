@@ -69,12 +69,16 @@ class BatchDFlash2 {
               const __nv_bfloat16* taps);
 
   struct Drafts {
-    const std::int32_t* tokens;  // device int32 [n, 7]
-    const float* conf;           // device fp32 [n, 7]
+    const std::int32_t* tokens;          // device int32 [n, 7]
+    const float* conf;                  // device fp32 [n, 7]
+    const std::int32_t* support_ids;     // device int32 [n, 7, 16], top-16 vocabulary IDs
+    const float* support_probs;         // device fp32 [n, 7, 16], temperature-scaled or greedy one-hot
+    const std::int32_t* support_picked;  // device int32 [n, 7], index of the draft in its support
   };
-  // Optional per-sequence budgets are clamped to [1, GAMMA]. Unused output entries are zero.
+  // Optional host budgets are clamped to [1, GAMMA]. Positive host temperatures enable seeded sampling.
+  // Unused output entries are zero, with support IDs set to -1.
   Drafts propose(int n, const std::int32_t* slots, const std::int32_t* anchors, const std::int64_t* pos,
-                 const std::int32_t* max_drafts = nullptr);
+                 const std::int32_t* max_drafts = nullptr, const float* temps = nullptr, std::uint64_t seed = 0);
 
   int slots() const;
   int max_seqs() const;

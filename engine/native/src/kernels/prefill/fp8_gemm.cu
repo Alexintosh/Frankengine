@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <stdexcept>
 
 namespace ingine::kernels::prefill {
@@ -372,6 +373,136 @@ fp8_gemm_64x64_kernel(const uint8_t* __restrict__ A, const float* __restrict__ a
   }
 }
 
+// Each warp owns up to 16 output columns and one or two m16 fragments.
+template <int BM, int BN, bool C_FP32>
+__global__ void __launch_bounds__(((BN + 15) / 16) * 32, 8)
+fp8_gemm_small_kernel(const uint8_t* __restrict__ A, const float* __restrict__ a_scale, int lda,
+                      const uint8_t* __restrict__ B, const float* __restrict__ b_scale, int ldb,
+                      void* __restrict__ C, int ldc, int M, int N, int K) {
+  constexpr int BK = 64, STAGES = 3, THREADS = ((BN + 15) / 16) * 32;
+  constexpr int M_FRAGMENTS = BM / 16, N_FRAGMENTS = BN == 8 ? 1 : 2;
+  __shared__ __align__(128) uint8_t sA[STAGES][BM * BK];
+  __shared__ __align__(128) uint8_t sB[STAGES][BN * BK];
+
+  const int m0 = blockIdx.y * BM;
+  const int n0 = blockIdx.x * BN;
+  const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+  const int n_warp = warp * 16;
+  const int n_stages = K / BK;
+  float acc[M_FRAGMENTS][N_FRAGMENTS][4] = {};
+
+  auto load_stage = [&](int stage, int ks) {
+    const int k_off = ks * BK;
+#pragma unroll
+    for (int u = 0; u < BM * BK / (16 * THREADS); ++u) {
+      const int idx = tid + u * THREADS;
+      const int r = idx >> 2, c16 = idx & 3;
+      const bool valid = m0 + r < M;
+      cp_async_16_z(&sA[stage][swz64(r, c16)], valid ? A + size_t(m0 + r) * lda + k_off + c16 * 16 : A, valid);
+    }
+#pragma unroll
+    for (int u = 0; u < BN * BK / (16 * THREADS); ++u) {
+      const int idx = tid + u * THREADS;
+      const int r = idx >> 2, c16 = idx & 3;
+      const bool valid = n0 + r < N;
+      cp_async_16_z(&sB[stage][swz64(r, c16)], valid ? B + size_t(n0 + r) * ldb + k_off + c16 * 16 : B, valid);
+    }
+    asm volatile("cp.async.commit_group;\n");
+  };
+
+  const int preload = min(STAGES - 1, n_stages);
+  for (int s = 0; s < preload; ++s) load_stage(s, s);
+
+  for (int ks = 0; ks < n_stages; ++ks) {
+    const int rem_in_flight = min(preload, n_stages - ks) - 1;
+    if (rem_in_flight == 1) asm volatile("cp.async.wait_group 1;\n");
+    else asm volatile("cp.async.wait_group 0;\n");
+    if constexpr (THREADS == 32) __syncwarp();
+    else __syncthreads();
+
+    if (ks + preload < n_stages) load_stage((ks + preload) % STAGES, ks + preload);
+
+    const uint8_t* sa = sA[ks % STAGES];
+    const uint8_t* sb = sB[ks % STAGES];
+#pragma unroll
+    for (int kk = 0; kk < 2; ++kk) {
+      const int c16 = kk * 2 + (lane >> 4);
+      uint32_t b_reg[2 * N_FRAGMENTS];
+      if constexpr (BN == 8) {
+        // The first 16 lanes supply eight row addresses per half of K=32.
+        const unsigned addr = smem_addr(sb + swz64(lane & 7, kk * 2 + ((lane >> 3) & 1)));
+        asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];\n"
+                     : "=r"(b_reg[0]), "=r"(b_reg[1]) : "r"(addr));
+      } else {
+        ldmatrix_x4(b_reg[0], b_reg[1], b_reg[2], b_reg[3],
+                    smem_addr(sb + swz64(n_warp + (lane & 15), c16)));
+      }
+#pragma unroll
+      for (int mi = 0; mi < M_FRAGMENTS; ++mi) {
+        uint32_t a_reg[4];
+        ldmatrix_x4(a_reg[0], a_reg[1], a_reg[2], a_reg[3],
+                    smem_addr(sa + swz64(mi * 16 + (lane & 15), c16)));
+#pragma unroll
+        for (int ni = 0; ni < N_FRAGMENTS; ++ni) {
+          mma_fp8_m16n8k32(acc[mi][ni], a_reg, b_reg[ni], b_reg[N_FRAGMENTS + ni]);
+        }
+      }
+    }
+  }
+
+#pragma unroll
+  for (int mi = 0; mi < M_FRAGMENTS; ++mi) {
+    const int r0 = m0 + mi * 16 + (lane >> 2);
+    const int r1 = r0 + 8;
+    const float sa0 = r0 < M ? a_scale[r0] : 0.f;
+    const float sa1 = r1 < M ? a_scale[r1] : 0.f;
+#pragma unroll
+    for (int ni = 0; ni < N_FRAGMENTS; ++ni) {
+      const int c0 = n0 + n_warp + ni * 8 + (lane & 3) * 2;
+      if (c0 < N) {
+        const float sb0 = b_scale[c0];
+        const float sb1 = c0 + 1 < N ? b_scale[c0 + 1] : 0.f;
+        if (r0 < M) store_pair<C_FP32>(C, ldc, r0, c0, N, acc[mi][ni][0] * sa0 * sb0, acc[mi][ni][1] * sa0 * sb1);
+        if (r1 < M) store_pair<C_FP32>(C, ldc, r1, c0, N, acc[mi][ni][2] * sa1 * sb0, acc[mi][ni][3] * sa1 * sb1);
+      }
+    }
+  }
+}
+
+template <bool C_FP32>
+void launch_fp8_dense_gemm(const uint8_t* A, const float* a_scale, int lda,
+                           const uint8_t* B, const float* b_scale, int ldb,
+                           void* C, int ldc, int M, int N, int K, cudaStream_t stream, bool legacy) {
+  constexpr int GB10_SMS = 48;
+  const bool keep_legacy_tiles = legacy || M >= 512 || M < 16 || N <= 64;
+  const int tiles_128 = ((M + 127) / 128) * ((N + 127) / 128);
+  if (keep_legacy_tiles ? (M > 64 && N > 64) : (tiles_128 >= GB10_SMS)) {
+    fp8_gemm_128x128_kernel<C_FP32><<<tiles_128, 256, 0, stream>>>(A, a_scale, lda, B, b_scale, ldb, C, ldc, M, N, K);
+    return;
+  }
+
+  const dim3 grid64((N + 63) / 64, (M + 63) / 64);
+  if (keep_legacy_tiles || grid64.x * grid64.y >= GB10_SMS) {
+    fp8_gemm_64x64_kernel<C_FP32><<<grid64, 128, 0, stream>>>(A, a_scale, lda, B, b_scale, ldb, C, ldc, M, N, K);
+    return;
+  }
+
+  // Use the largest tile that fills a wave, so fewer CTAs reload the same weights.
+  const dim3 grid32((N + 31) / 32, (M + 31) / 32);
+  const dim3 grid16x32(grid32.x, (M + 15) / 16);
+  const dim3 grid16((N + 15) / 16, grid16x32.y);
+  if (grid32.x * grid32.y >= GB10_SMS) {
+    fp8_gemm_small_kernel<32, 32, C_FP32><<<grid32, 64, 0, stream>>>(A, a_scale, lda, B, b_scale, ldb, C, ldc, M, N, K);
+  } else if (grid16x32.x * grid16x32.y >= GB10_SMS) {
+    fp8_gemm_small_kernel<16, 32, C_FP32><<<grid16x32, 64, 0, stream>>>(A, a_scale, lda, B, b_scale, ldb, C, ldc, M, N, K);
+  } else if (grid16.x * grid16.y >= GB10_SMS) {
+    fp8_gemm_small_kernel<16, 16, C_FP32><<<grid16, 32, 0, stream>>>(A, a_scale, lda, B, b_scale, ldb, C, ldc, M, N, K);
+  } else {
+    const dim3 grid16x8((N + 7) / 8, grid16x32.y);
+    fp8_gemm_small_kernel<16, 8, C_FP32><<<grid16x8, 32, 0, stream>>>(A, a_scale, lda, B, b_scale, ldb, C, ldc, M, N, K);
+  }
+}
+
 }  // namespace
 
 void quantize_fp8_rows(const __nv_bfloat16* x, int ldx, int M, int K, uint8_t* q, float* scale, cudaStream_t stream) {
@@ -389,20 +520,15 @@ void fp8_dense_gemm(const uint8_t* A_q, const float* a_scale, int lda,
                     void* C, int ldc, bool c_fp32, int M, int N, int K, cudaStream_t stream) {
   if (M <= 0 || N <= 0 || K <= 0 || K % 64 != 0 || lda % 16 != 0 || ldb % 16 != 0)
     throw std::invalid_argument("fp8_dense_gemm: unsupported shape or alignment");
+  static const bool legacy = [] {
+    const char* value = std::getenv("INGINE_FP8_GEMM_LEGACY");
+    return value && value[0] == '1' && value[1] == '\0';
+  }();
   const auto* b = static_cast<const uint8_t*>(B_q);
-  if (M > 64 && N > 64) {
-    const int tiles = ((M + 127) / 128) * ((N + 127) / 128);
-    if (c_fp32)
-      fp8_gemm_128x128_kernel<true><<<tiles, 256, 0, stream>>>(A_q, a_scale, lda, b, b_scale, ldb, C, ldc, M, N, K);
-    else
-      fp8_gemm_128x128_kernel<false><<<tiles, 256, 0, stream>>>(A_q, a_scale, lda, b, b_scale, ldb, C, ldc, M, N, K);
-  } else {
-    const dim3 grid((N + 63) / 64, (M + 63) / 64);
-    if (c_fp32)
-      fp8_gemm_64x64_kernel<true><<<grid, 128, 0, stream>>>(A_q, a_scale, lda, b, b_scale, ldb, C, ldc, M, N, K);
-    else
-      fp8_gemm_64x64_kernel<false><<<grid, 128, 0, stream>>>(A_q, a_scale, lda, b, b_scale, ldb, C, ldc, M, N, K);
-  }
+  if (c_fp32)
+    launch_fp8_dense_gemm<true>(A_q, a_scale, lda, b, b_scale, ldb, C, ldc, M, N, K, stream, legacy);
+  else
+    launch_fp8_dense_gemm<false>(A_q, a_scale, lda, b, b_scale, ldb, C, ldc, M, N, K, stream, legacy);
 }
 
 }  // namespace ingine::kernels::prefill
