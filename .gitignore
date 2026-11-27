@@ -15,6 +15,7 @@ __pycache__/
 scripts/local.sh
 state/
 logs/
+colab-g4-results/
 
 # Model weights & large local dumps
 models/
