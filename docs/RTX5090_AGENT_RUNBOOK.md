@@ -131,7 +131,10 @@ Frankengine supports two single-GPU Blackwell production presets (both with **Vi
   - **CERT_HEAD** uses an NVFP4 proxy (`~259 MB`) plus outward-rounded Cauchy-Schwarz row error bounds to discard provably suboptimal rows and verify all remaining candidates with exact PICO12/BF16 arithmetic — guaranteeing 100% bit-exact greedy (`T=0`) token parity while saving `~2.3–2.5 ms/step` on GB10.
 - **Speculative Decoding:** `--spec --spec-widths fine2 --spec-threshold 0.65 --draft-type hybrid --dflash2-adaptive --dflash2-threshold 0.50 --dflash2-max-ctx 6144`
   - Uses eager-captured `FP8` CUDA-graph `DFlash 2` on short/medium prompts (`≤6,144` tokens) and global `DSpark` on longer contexts and sampled (`temperature > 0`) requests.
-- **Batched Speculation & Prefix Caching:** when `BATCH_SPEC=7` (`BATCH_SPEC_THRESHOLD=0.30`, `BATCH_SPEC_MIN=2`) is active, `ingine-serve` auto-selects `BatchDFlash2` (`hybrid`) + `c=32` CUDA Graphs + automatic GPU `clone_slot` + zero-VRAM Persistent Prefix Anchors (`<|end_message|>` / `<|im_end|>` boundary detection) and exposes live `GET /v1/telemetry` & `GET /metrics`.
+- **Batched Speculation, Exact Rejection Sampling & Prefix Caching:** when `BATCH_SPEC=7` (`BATCH_SPEC_THRESHOLD=0.30`, `BATCH_SPEC_MIN=2`) is active, `ingine-serve` auto-selects `BatchDFlash2` (`hybrid`) with:
+  - **Zero-logit-buffer single-pass exact Leviathan rejection sampling** (`INGINE_BATCH_REJECTION_SAMPLE=1`, default ON for TP=1) fused into the `BF16`, `PICO12`, and `NVFP4` heads (`avg_accept_len` `2.86 → 3.74` at `T=0.8`, 100% exact target distribution).
+  - **AngelSpec-inspired `D-cut` adaptive verification + 16-row CUDA Graph bucketing** (`INGINE_BATCH_DCUT=1`, default auto `theta=0.15`), native small-grid FP8 dense GEMMs (`INGINE_BATCH_FP8_DENSE=1`), fused PICO12 tiled MMA GEMM (`INGINE_BATCH_PICO12_GEMM=1`), and fused BF16 gates (`INGINE_BATCH_GATE_FUSE=1`).
+  - **Batched short-prompt prefill** (`INGINE_BATCH_SHORT_PREFILL=1`, default ON) + automatic GPU `clone_slot` (`>=32` net shared tokens) + zero-VRAM Persistent Prefix Anchors (`<|end_message|>` / `<|im_end|>` boundary detection) and live `GET /v1/telemetry` & `GET /metrics`.
 - **Context & Prefill Chunk:** `PREFILL_CHUNK=8192` is now the default (`+30%..+41%` prefill throughput). Use `MAX_CTX=262144` (256K) if `≥27.5 GiB` VRAM is free; otherwise set `MAX_CTX=131072 PARK_MB=512`. On 32 GB RTX 5090 in 100% lossless BF16-KV mode, use `MAX_CTX=131072 MAX_BATCH=1 BATCH_SPEC=0 PARK_MB=0` (or `VISION=0`) to leave comfortable KV headroom.
 
 Start the server in the background and log to `/tmp/frankengine_serve.log`:
@@ -316,14 +319,16 @@ Package and share back **all three files** (e.g., `tar -czf bench_results_rtx509
 
 | Workload | `1× DGX Spark` (`TP=1` FP8) | `1× DGX Spark` (`TP=1` Lossless `PICO12+CERT_HEAD`) | `2× DGX Spark` (`TP=2` Promoted) | Expected `1× RTX 5090` (`1,792 GB/s`) |
 |---|---:|---:|---:|---:|
-| **`speedbench full` ALL 73 (`c=1`, reasoning on)** | **`82.4 tok/s`** *(prose `78.7`, code `96.5`)* | **`77.2 tok/s`** *(prose `70.0`, code `85.0`)* | — | `~450–620 tok/s` |
+| **`speedbench full` ALL 73 (`c=1`, reasoning on)** | **`82.1 tok/s`** *(prose `78.8`, code `96.3`)* | **`76.7 tok/s`** *(prose `69.7`, code `84.8`)* | — | `~450–620 tok/s` |
+| **Thinking Workload (`c=24`, `48×4096`, `T=0.8`)** | **`522.7 tok/s`** *(TTFT `0.69 s`, `26.6/req`)* | **`449.3 tok/s`** *(TTFT `0.76 s`, `22.9/req`)* | — | `~3,000–3,800 tok/s` |
+| **Thinking Workload (`c=8`, `16×4096`, `T=0.8`)** | **`269.9 tok/s`** *(TTFT `0.36 s`, `40.1/req`)* | **`218.6 tok/s`** *(TTFT `0.55 s`, `33.1/req`)* | — | `~1,500–2,000 tok/s` |
 | **Short Code Greedy (`36t`, `DFlash 2`)** | `155.4 tok/s` | — | **`257.5 tok/s`** warm (`247.9` cold) | `~850–1,100 tok/s` |
 | **File-Edit / Refactor (`1.5K`, `320t`)** | — | — | **`263.9 tok/s`** | `~900–1,150 tok/s` |
 | **8-Category Mean Decode (`256t`, `T=0`)** | — | — | **`159.6 tok/s`** | `~600–750 tok/s` |
-| **Cold Prefill (`8K / 32K / 128K`, `PREFILL_CHUNK=8192`)** | **`4,810 / 4,811 / 3,936 tok/s`** | **`4,423 / 4,294 / 3,143 tok/s`** | `3,761 (4K) / 3,579 (32K)` | `~22,000–32,000 tok/s` |
-| **Long-Context Decode (`32K / 128K` warm)** | **`90.9 / 58.5 tok/s`** | **`72.7 / 43.1 tok/s`** | `143.6–199.9 tok/s (32K)` | `~550–720 tok/s (32K)` |
-| **Startup Time (`Vision ON`)** | **`7 s`** | **`10 s`** | `~12 s` | `~5–8 s` |
-| **Quality (`inkqc`, 3-seed `/295`)** | `286.0 / 295` | **`286.3 / 295`** | — | `~286 / 295` |
+| **Cold Prefill (`8K / 32K / 128K`, `PREFILL_CHUNK=8192`)** | **`4,787 / 4,811 / 3,930 tok/s`** | **`4,442 / 4,295 / 3,146 tok/s`** | `3,761 (4K) / 3,579 (32K)` | `~22,000–32,000 tok/s` |
+| **Long-Context Decode (`32K / 128K` warm)** | **`89.1 / 60.6 tok/s`** | **`70.2 / 42.8 tok/s`** | `143.6–199.9 tok/s (32K)` | `~550–720 tok/s (32K)` |
+| **Startup Time (`Vision ON`)** | **`8 s`** | **`10 s`** | `~12 s` | `~5–8 s` |
+| **Quality (`inkqc`, 3-seed `/295`)** | `285.7 / 295` | **`286.0 / 295`** | — | `~286 / 295` |
 | **Peak Memory @ `256K` Context (`c=1`)** | `26.1 GiB` (`1` GPU) | `~38 GiB` (`BF16 KV`, `256K`)* | `31.3 GiB` (`32×32K` + `256K` solo) | `~26–27 GiB` (FP8 `c=1`) |
 | **Batched `BatchDFlash2` `c=32` (`spec=7`)** | **`493.1 tok/s`** (`1K` ctx) | — | **`585.1` wall / `846.4` sum** (`live SSE`) | `~2,800–3,600 tok/s` |
 | **Batched Spec `c=64` (`ctx=640`, `spec=4`)** | `600.8 tok/s` | — | `820.5 tok/s` (`1,132` SS) | `~4,100–4,500 tok/s` |
