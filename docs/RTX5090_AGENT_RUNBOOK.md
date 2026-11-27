@@ -120,12 +120,19 @@ ls -lh "engine/native/build-${ARCH}/apps/serve/ingine-serve" \
 
 ## 4. Launch the Live `TP=1` OpenAI Server
 
-Frankengine's production single-GPU settings:
-- **Precision & Blackwell Kernels:** `--dense-fp8 --kv-fp8 --head-nvfp4 --draft-nvfp4` (native `mxf4nvf4`/`mxf8f6f4` prefill MoE, custom FP8 dense prefill `OUTER_VEC_32F` MMA, BF16 MMA `rel_logits`, and zero-copy NVFP4 LM head reused by DFlash 2)
+Frankengine supports two single-GPU Blackwell production presets (both with **Vision ON** by default via `VISION=1`, `--image-max-tokens 4096 --max-images 16 --max-image-tokens 32768`; set `VISION=0` to pass `--no-vision`):
+
+- **Fast FP8 Preset (Default — max throughput & 128K prefill):**
+  - `--dense-fp8 --kv-fp8 --head-nvfp4 --draft-nvfp4 --prefill-chunk 8192`
+  - Uses native `mxf4nvf4`/`mxf8f6f4` prefill MoE, custom FP8 dense prefill `OUTER_VEC_32F` MMA, BF16 MMA `rel_logits`, `BR64_BK64` `ldmatrix.b8.trans` FP8 global prefill attention (default `INGINE_PREFILL_FP8_ATTN=2`), fused BF16 `gate_fg_apply`, and zero-copy NVFP4 LM head reused by DFlash 2.
+- **100% Bit-Exact Lossless Preset (`PICO12 + CERT_HEAD` — zero quantization loss, beats FP16/BF16 SGLang on GB10):**
+  - `DENSE_FP8=0 KV_FP8=0 HEAD_NVFP4=0 DENSE_PICO12=1 CERT_HEAD=1` (`--dense-pico12 --cert-head --prefill-chunk 8192`)
+  - **PICO12** packs dense projections (`wproj`, `wo`, unembed) bit-exactly at 12 bits/weight (75.1% of BF16 bytes with exact per-row CSR outliers and 7-op BF16-native decode, 0 bits error).
+  - **CERT_HEAD** uses an NVFP4 proxy (`~259 MB`) plus outward-rounded Cauchy-Schwarz row error bounds to discard provably suboptimal rows and verify all remaining candidates with exact PICO12/BF16 arithmetic — guaranteeing 100% bit-exact greedy (`T=0`) token parity while saving `~2.3–2.5 ms/step` on GB10.
 - **Speculative Decoding:** `--spec --spec-widths fine2 --spec-threshold 0.65 --draft-type hybrid --dflash2-adaptive --dflash2-threshold 0.50 --dflash2-max-ctx 6144`
   - Uses eager-captured `FP8` CUDA-graph `DFlash 2` on short/medium prompts (`≤6,144` tokens) and global `DSpark` on longer contexts and sampled (`temperature > 0`) requests.
 - **Batched Speculation & Prefix Caching:** when `BATCH_SPEC=7` (`BATCH_SPEC_THRESHOLD=0.30`, `BATCH_SPEC_MIN=2`) is active, `ingine-serve` auto-selects `BatchDFlash2` (`hybrid`) + `c=32` CUDA Graphs + automatic GPU `clone_slot` + zero-VRAM Persistent Prefix Anchors (`<|end_message|>` / `<|im_end|>` boundary detection) and exposes live `GET /v1/telemetry` & `GET /metrics`.
-- **Context:** `MAX_CTX=262144` (256K) if `≥27.5 GiB` VRAM is free; otherwise set `MAX_CTX=131072 PARK_MB=512`.
+- **Context & Prefill Chunk:** `PREFILL_CHUNK=8192` is now the default (`+30%..+41%` prefill throughput). Use `MAX_CTX=262144` (256K) if `≥27.5 GiB` VRAM is free; otherwise set `MAX_CTX=131072 PARK_MB=512`. On 32 GB RTX 5090 in 100% lossless BF16-KV mode, use `MAX_CTX=131072 MAX_BATCH=1 BATCH_SPEC=0 PARK_MB=0` (or `VISION=0`) to leave comfortable KV headroom.
 
 Start the server in the background and log to `/tmp/frankengine_serve.log`:
 
@@ -136,6 +143,14 @@ export DFLASH2_DIR="$(pwd)/models/Inkling-2-Mini-DFlash2"
 export HOST=127.0.0.1
 export PORT=8834
 export SERVED_NAME=inkling-2-mini
+export PREFILL_CHUNK=8192
+
+# Optional: uncomment the next 5 lines for 100% bit-exact lossless mode (PICO12 + CERT_HEAD, BF16 KV):
+# export DENSE_FP8=0
+# export KV_FP8=0
+# export HEAD_NVFP4=0
+# export DENSE_PICO12=1
+# export CERT_HEAD=1
 
 # Auto-size solo context & BatchDFlash2 speculative pool for free VRAM on GPU 0:
 # (Note: scripts/config.sh defaults to Dual-Spark/96GB 32x32K spec=7; override on 32 GB GPUs to avoid OOM!)
@@ -299,16 +314,21 @@ Package and share back **all three files** (e.g., `tar -czf bench_results_rtx509
 
 ## Reference Baselines for Comparison (NVIDIA DGX Spark GB10, `231 GB/s` DRAM BW, Promoted `main`)
 
-| Workload | `1× DGX Spark` (`TP=1`) | `2× DGX Spark` (`TP=2` Promoted) | Expected `1× RTX 5090` (`1,792 GB/s`) |
-|---|---:|---:|---:|
-| **Short Code Greedy (`36t`, `DFlash 2`)** | `155.4 tok/s` | **`257.5 tok/s`** warm (`247.9` cold) | `~850–1,100 tok/s` |
-| **File-Edit / Refactor (`1.5K`, `320t`)** | — | **`263.9 tok/s`** | `~900–1,150 tok/s` |
-| **8-Category Mean Decode (`256t`, `T=0`)** | — | **`159.6 tok/s`** | `~600–750 tok/s` |
-| **Cold Prefill (`2K–32K`, native FP8/NVFP4)** | `3,619` (`2K` FP8) / `2,770` (`32K`) | **`3,761` (`4K`) / `3,732` (`11K`) / `3,579` (`32K`)** | `~18,000–28,000 tok/s` |
-| **32K Context Sampled Code (`T=0.7`, warm)** | `~77–95 tok/s` | **`143.6–199.9 tok/s`** (`9–99 ms` TTFT) | `~550–720 tok/s` |
-| **Peak Memory @ `256K` Context (`c=1`)** | `26.1 GiB` (`1` GPU) | `31.3 GiB` (`32×32K` + `256K` solo) | `~26–27 GiB` (`c=1`) |
-| **Batched `BatchDFlash2` `c=32` (`spec=7`)** | **`493.1 tok/s`** (`1K` ctx) | **`585.1` wall / `846.4` sum** (`live SSE`) | `~2,800–3,600 tok/s` |
-| **Batched Spec `c=64` (`ctx=640`, `spec=4`)** | `600.8 tok/s` | `820.5 tok/s` (`1,132` SS) | `~4,100–4,500 tok/s` |
-| **Batched Spec `c=128` (`ctx=640` / `32K`)** | — | `1,187 / 1,228 tok/s` (`1,614 / 1,504` SS) | `~5,000–6,500 tok/s` (PRO 6000 96 GB) |
-| **6K Persistent Prefix Follow-Up (`c=1`)** | — | **`86 ms` TTFT** (`19.9×` vs `1.71s`) | `~15–25 ms` TTFT |
-| **`16K` / `65K` / `122K` Exact Needles** | `PASS` | **`PASS`** (`157 / 182 / 129 tok/s`) | `PASS` |
+| Workload | `1× DGX Spark` (`TP=1` FP8) | `1× DGX Spark` (`TP=1` Lossless `PICO12+CERT_HEAD`) | `2× DGX Spark` (`TP=2` Promoted) | Expected `1× RTX 5090` (`1,792 GB/s`) |
+|---|---:|---:|---:|---:|
+| **`speedbench full` ALL 73 (`c=1`, reasoning on)** | **`82.4 tok/s`** *(prose `78.7`, code `96.5`)* | **`77.2 tok/s`** *(prose `70.0`, code `85.0`)* | — | `~450–620 tok/s` |
+| **Short Code Greedy (`36t`, `DFlash 2`)** | `155.4 tok/s` | — | **`257.5 tok/s`** warm (`247.9` cold) | `~850–1,100 tok/s` |
+| **File-Edit / Refactor (`1.5K`, `320t`)** | — | — | **`263.9 tok/s`** | `~900–1,150 tok/s` |
+| **8-Category Mean Decode (`256t`, `T=0`)** | — | — | **`159.6 tok/s`** | `~600–750 tok/s` |
+| **Cold Prefill (`8K / 32K / 128K`, `PREFILL_CHUNK=8192`)** | **`4,810 / 4,811 / 3,936 tok/s`** | **`4,423 / 4,294 / 3,143 tok/s`** | `3,761 (4K) / 3,579 (32K)` | `~22,000–32,000 tok/s` |
+| **Long-Context Decode (`32K / 128K` warm)** | **`90.9 / 58.5 tok/s`** | **`72.7 / 43.1 tok/s`** | `143.6–199.9 tok/s (32K)` | `~550–720 tok/s (32K)` |
+| **Startup Time (`Vision ON`)** | **`7 s`** | **`10 s`** | `~12 s` | `~5–8 s` |
+| **Quality (`inkqc`, 3-seed `/295`)** | `286.0 / 295` | **`286.3 / 295`** | — | `~286 / 295` |
+| **Peak Memory @ `256K` Context (`c=1`)** | `26.1 GiB` (`1` GPU) | `~38 GiB` (`BF16 KV`, `256K`)* | `31.3 GiB` (`32×32K` + `256K` solo) | `~26–27 GiB` (FP8 `c=1`) |
+| **Batched `BatchDFlash2` `c=32` (`spec=7`)** | **`493.1 tok/s`** (`1K` ctx) | — | **`585.1` wall / `846.4` sum** (`live SSE`) | `~2,800–3,600 tok/s` |
+| **Batched Spec `c=64` (`ctx=640`, `spec=4`)** | `600.8 tok/s` | — | `820.5 tok/s` (`1,132` SS) | `~4,100–4,500 tok/s` |
+| **Batched Spec `c=128` (`ctx=640` / `32K`)** | — | — | `1,187 / 1,228 tok/s` (`1,614 / 1,504` SS) | `~5,000–6,500 tok/s` (PRO 6000 96 GB) |
+| **6K Persistent Prefix Follow-Up (`c=1`)** | — | — | **`86 ms` TTFT** (`19.9×` vs `1.71s`) | `~15–25 ms` TTFT |
+| **`128K` / `240K` Exact Passkey Needles** | **`PASS`** (`34.2 / 74.1 s`) | **`PASS`** (`39.5 / 100.6 s`) | **`PASS`** | **`PASS`** |
+
+*\*On 32 GB RTX 5090, use `MAX_CTX=131072` in 100% lossless BF16-KV mode (`DENSE_PICO12=1 CERT_HEAD=1 KV_FP8=0`) or keep the default FP8 KV (`KV_FP8=1`) for full `262K` context.*

@@ -3,6 +3,8 @@
 // reference operation by operation (separately rounded products/sums where torch runs separate kernels;
 // divisions by Python scalars as multiplications by the FP32 reciprocal, as torch does).
 #include "kernels/prefill/common.cuh"
+#include "kernels/common/kv12.cuh"
+#include "kernels/common/pico12.cuh"
 #include "kernels/common/q4_g64.cuh"
 #include "kernels/prefill/prefill.h"
 
@@ -39,7 +41,7 @@ __device__ __forceinline__ void store_bf16x4(uint16_t* p, const float (&f)[4]) {
 
 // ---- attn_prep: one CTA (8 warps) per token
 
-template <int KvHeads, bool WriteRing, bool Q4 = false>
+template <int KvHeads, bool WriteRing, bool Q4 = false, bool KV12 = false>
 __global__ void __launch_bounds__(256) attn_prep_kernel(const AttnPrepParams p) {
   constexpr int Heads = KvHeads * (kHeads / kKvHeads), KvDim = KvHeads * kHeadDim;
   constexpr int OffRel = 2 * Heads * kHeadDim, OffK = OffRel + Heads * (kRel + 1);
@@ -141,7 +143,12 @@ __global__ void __launch_bounds__(256) attn_prep_kernel(const AttnPrepParams p) 
       for (int q = 0; q < 4; ++q) y[q] = round_bf16(y[q] * r);
     }
     void* dst = kv == 0 ? p.k_out : p.v_out;
-    if constexpr (Q4) {
+    if constexpr (KV12) {
+      const size_t head = size_t(t) * KvHeads + warp;
+      const uint2 bits = make_uint2(pack_bf16x2(y[0], y[1]), pack_bf16x2(y[2], y[3]));
+      void* side = kv == 0 ? p.k_scale_out : p.v_scale_out;
+      kv12::pack4(bits, static_cast<kv12::Head*>(dst)[head], static_cast<kv12::Spill*>(side)[head]);
+    } else if constexpr (Q4) {
       const size_t head = size_t(t) * KvHeads + warp;
       __half scale;
       const uint16_t bits = q4_g64::pack4(y, scale);
@@ -156,7 +163,10 @@ __global__ void __launch_bounds__(256) attn_prep_kernel(const AttnPrepParams p) 
       *reinterpret_cast<uint32_t*>(static_cast<uint8_t*>(dst) + size_t(t) * KvDim + c) = b;
     } else {
       const uint2 packed = make_uint2(pack_bf16x2(y[0], y[1]), pack_bf16x2(y[2], y[3]));
-      *reinterpret_cast<uint2*>(static_cast<uint16_t*>(dst) + size_t(t) * KvDim + c) = packed;
+      const uint2 transient = kv == 1 && p.v_fp16
+                                  ? make_uint2(pack_half2(y[0], y[1]), pack_half2(y[2], y[3]))
+                                  : packed;
+      *reinterpret_cast<uint2*>(static_cast<uint16_t*>(dst) + size_t(t) * KvDim + c) = transient;
       if (publish) {
         auto* ring = reinterpret_cast<uint16_t*>(kv == 0 ? p.k_ring : p.v_ring);
         *reinterpret_cast<uint2*>(ring + size_t(slot) * KvDim + c) = packed;
@@ -374,28 +384,188 @@ __device__ __forceinline__ void block_sum(float (&v)[N]) {
   }
 }
 
-__device__ __forceinline__ float dot4(float4 a, float4 b) { return a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w; }
-
-__global__ void __launch_bounds__(ROW_T) gate_inputs_kernel(const GateRows rows, int T, uint16_t* __restrict__ gin) {
+template <bool InBf16, class RowsT>
+__global__ void __launch_bounds__(ROW_T) gate_inputs_kernel(const RowsT rows, int T, uint16_t* __restrict__ gin) {
   const int t = blockIdx.x, g = blockIdx.y, c = threadIdx.x * 4;
-  const float4 h = *reinterpret_cast<const float4*>(rows.h[g] + size_t(t) * H + c);
-  const float4 m = *reinterpret_cast<const float4*>(rows.msg[g] + size_t(t) * H + c);
-  float ss[2] = {dot4(h, h), dot4(m, m)};
+  float hv[4], mv[4];
+  if constexpr (InBf16) {
+    load_bf16x4(reinterpret_cast<const uint16_t*>(rows.h[g]) + size_t(t) * H + c, hv);
+    load_bf16x4(reinterpret_cast<const uint16_t*>(rows.msg[g]) + size_t(t) * H + c, mv);
+  } else {
+    const float4 h = *reinterpret_cast<const float4*>(rows.h[g] + size_t(t) * H + c);
+    const float4 m = *reinterpret_cast<const float4*>(rows.msg[g] + size_t(t) * H + c);
+    hv[0] = h.x, hv[1] = h.y, hv[2] = h.z, hv[3] = h.w;
+    mv[0] = m.x, mv[1] = m.y, mv[2] = m.z, mv[3] = m.w;
+  }
+  float ss[2] = {hv[0] * hv[0] + hv[1] * hv[1] + hv[2] * hv[2] + hv[3] * hv[3],
+                 mv[0] * mv[0] + mv[1] * mv[1] + mv[2] * mv[2] + mv[3] * mv[3]};
   block_sum(ss);
   const float rh = rsqrtf(ss[0] * (1.f / H) + kEps), rm = rsqrtf(ss[1] * (1.f / H) + kEps);
   uint16_t* o = gin + (size_t(g) * T + t) * 2 * H;
-  store_bf16x4(o + c, {h.x * rh, h.y * rh, h.z * rh, h.w * rh});
-  store_bf16x4(o + H + c, {m.x * rm, m.y * rm, m.z * rm, m.w * rm});
+  store_bf16x4(o + c, {hv[0] * rh, hv[1] * rh, hv[2] * rh, hv[3] * rh});
+  store_bf16x4(o + H + c, {mv[0] * rm, mv[1] * rm, mv[2] * rm, mv[3] * rm});
 }
 
+// Fused BF16 Tensor Core forget/gain projection + tanh gate + RMSNorm.
+// Eliminates both [T, 64] x [H, 64]^T cuBLAS GEMMs and the 2x[T, H] fpre/gpre DRAM round-trip.
+struct GateFgSmem {
+  alignas(128) uint16_t sA[16][64];     // 2 KB: g16[t0..t0+15, 0..63]
+  alignas(128) uint16_t sB[8][16][64];  // 16 KB: per-warp weight tile [16, 64]
+  alignas(128) uint16_t sY[16][H];      // 72 KB: gated output y before RMSNorm
+  alignas(16) float sRed[8][16];        // 512 B: per-warp row sum-of-squares
+  alignas(16) float sRinv[16];          // 64 B: row inverse RMS
+};
+static_assert(sizeof(GateFgSmem) <= 99 * 1024);
+
+__global__ void __launch_bounds__(256, 1)
+gate_fg_apply_bf16_kernel(const uint16_t* __restrict__ g16, const uint16_t* __restrict__ w_forget,
+                          const uint16_t* __restrict__ w_gain, const uint16_t* __restrict__ h,
+                          const uint16_t* __restrict__ msg, const float* __restrict__ norm_w, int T,
+                          uint16_t* __restrict__ out) {
+  extern __shared__ __align__(128) unsigned char smem_raw[];
+  auto& sm = *reinterpret_cast<GateFgSmem*>(smem_raw);
+  const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+  const int grp = lane >> 2, t4 = lane & 3;
+  const int t0 = blockIdx.x * 16;
+
+  // Load 16x64 BF16 g16 tile (128 uint4 loads -> first 128 threads).
+  if (tid < 128) {
+    const int r = tid >> 3, c8 = (tid & 7) * 8;
+    if (t0 + r < T)
+      *reinterpret_cast<uint4*>(&sm.sA[r][c8]) = *reinterpret_cast<const uint4*>(g16 + size_t(t0 + r) * 64 + c8);
+    else
+      *reinterpret_cast<uint4*>(&sm.sA[r][c8]) = make_uint4(0, 0, 0, 0);
+  }
+  __syncthreads();
+
+  // Keep all 4 K-slices of g16 [16, 64] in registers across the entire H=2304 sweep.
+  uint32_t a[4][4];
+#pragma unroll
+  for (int kk = 0; kk < 4; ++kk) {
+    ldmatrix_x4(a[kk][0], a[kk][1], a[kk][2], a[kk][3],
+                smem_addr(&sm.sA[lane & 15][kk * 16 + (lane >> 4) * 8]));
+  }
+
+  float ss0 = 0.f, ss1 = 0.f;
+  const int r0 = grp, r1 = grp + 8;
+  const bool v0 = (t0 + r0) < T, v1 = (t0 + r1) < T;
+  const size_t h_off0 = size_t(t0 + r0) * H, h_off1 = size_t(t0 + r1) * H;
+
+  // 8 warps x 16 cols = 128 cols/iter -> 18 iters cover H = 2304.
+#pragma unroll 1
+  for (int c_base = 0; c_base < H; c_base += 128) {
+    const int c0 = c_base + warp * 16;
+    float f0[4] = {0.f, 0.f, 0.f, 0.f}, f1[4] = {0.f, 0.f, 0.f, 0.f};
+    float g0[4] = {0.f, 0.f, 0.f, 0.f}, g1[4] = {0.f, 0.f, 0.f, 0.f};
+
+    // Load w_forget[c0..c0+15, 0..63] into warp-private sB[warp]
+#pragma unroll
+    for (int u = 0; u < 4; ++u) {
+      const int id = lane + u * 32;
+      const int br = id >> 3, bc8 = (id & 7) * 8;
+      *reinterpret_cast<uint4*>(&sm.sB[warp][br][bc8]) =
+          __ldg(reinterpret_cast<const uint4*>(w_forget + size_t(c0 + br) * 64 + bc8));
+    }
+    __syncwarp();
+#pragma unroll
+    for (int kk = 0; kk < 4; ++kk) {
+      uint32_t b0, b1, b2, b3;
+      ldmatrix_x4(b0, b1, b2, b3, smem_addr(&sm.sB[warp][lane & 15][kk * 16 + (lane >> 4) * 8]));
+      mma_bf16(f0, a[kk], b0, b2);
+      mma_bf16(f1, a[kk], b1, b3);
+    }
+
+    // Load w_gain[c0..c0+15, 0..63] into warp-private sB[warp]
+#pragma unroll
+    for (int u = 0; u < 4; ++u) {
+      const int id = lane + u * 32;
+      const int br = id >> 3, bc8 = (id & 7) * 8;
+      *reinterpret_cast<uint4*>(&sm.sB[warp][br][bc8]) =
+          __ldg(reinterpret_cast<const uint4*>(w_gain + size_t(c0 + br) * 64 + bc8));
+    }
+    __syncwarp();
+#pragma unroll
+    for (int kk = 0; kk < 4; ++kk) {
+      uint32_t b0, b1, b2, b3;
+      ldmatrix_x4(b0, b1, b2, b3, smem_addr(&sm.sB[warp][lane & 15][kk * 16 + (lane >> 4) * 8]));
+      mma_bf16(g0, a[kk], b0, b2);
+      mma_bf16(g1, a[kk], b1, b3);
+    }
+
+    // Apply gate: y = (1 - tanh(f)) * h + tanh(g) * msg, accumulate ss, stage y in sY
+    auto apply_pair = [&](int col, const float (&fv)[4], const float (&gv)[4]) {
+      if (v0) {
+        const uint32_t hu = *reinterpret_cast<const uint32_t*>(h + h_off0 + col);
+        const uint32_t mu = *reinterpret_cast<const uint32_t*>(msg + h_off0 + col);
+        const float y0 = __fadd_rn(__fmul_rn(__fsub_rn(1.f, tanhf(fv[0])), bf_lo(hu)), __fmul_rn(tanhf(gv[0]), bf_lo(mu)));
+        const float y1 = __fadd_rn(__fmul_rn(__fsub_rn(1.f, tanhf(fv[1])), bf_hi(hu)), __fmul_rn(tanhf(gv[1]), bf_hi(mu)));
+        ss0 += y0 * y0 + y1 * y1;
+        *reinterpret_cast<uint32_t*>(&sm.sY[r0][col]) = pack_bf16x2(y0, y1);
+      }
+      if (v1) {
+        const uint32_t hu = *reinterpret_cast<const uint32_t*>(h + h_off1 + col);
+        const uint32_t mu = *reinterpret_cast<const uint32_t*>(msg + h_off1 + col);
+        const float y2 = __fadd_rn(__fmul_rn(__fsub_rn(1.f, tanhf(fv[2])), bf_lo(hu)), __fmul_rn(tanhf(gv[2]), bf_lo(mu)));
+        const float y3 = __fadd_rn(__fmul_rn(__fsub_rn(1.f, tanhf(fv[3])), bf_hi(hu)), __fmul_rn(tanhf(gv[3]), bf_hi(mu)));
+        ss1 += y2 * y2 + y3 * y3;
+        *reinterpret_cast<uint32_t*>(&sm.sY[r1][col]) = pack_bf16x2(y2, y3);
+      }
+    };
+    apply_pair(c0 + t4 * 2, f0, g0);
+    apply_pair(c0 + 8 + t4 * 2, f1, g1);
+  }
+
+  // Reduce row sum-of-squares across the 4 lanes per row, then across the 8 warps.
+  ss0 += __shfl_xor_sync(0xffffffffu, ss0, 1);
+  ss0 += __shfl_xor_sync(0xffffffffu, ss0, 2);
+  ss1 += __shfl_xor_sync(0xffffffffu, ss1, 1);
+  ss1 += __shfl_xor_sync(0xffffffffu, ss1, 2);
+  if (t4 == 0) {
+    sm.sRed[warp][r0] = ss0;
+    sm.sRed[warp][r1] = ss1;
+  }
+  __syncthreads();
+  if (tid < 16) {
+    float s = 0.f;
+#pragma unroll
+    for (int w = 0; w < 8; ++w) s += sm.sRed[w][tid];
+    sm.sRinv[tid] = rsqrtf(s * (1.f / H) + kEps);
+  }
+  __syncthreads();
+
+  // Stream normalized output to DRAM with coalesced uint2 (4xBF16) stores.
+#pragma unroll
+  for (int r = warp; r < 16; r += 8) {
+    if (t0 + r >= T) continue;
+    const float rinv = sm.sRinv[r];
+    uint16_t* dst = out + size_t(t0 + r) * H;
+    for (int q = lane; q < H / 4; q += 32) {
+      const int c = q * 4;
+      float y[4];
+      load_bf16x4(&sm.sY[r][c], y);
+      const float4 w4 = __ldg(reinterpret_cast<const float4*>(norm_w + c));
+      store_bf16x4(dst + c, {y[0] * rinv * w4.x, y[1] * rinv * w4.y, y[2] * rinv * w4.z, y[3] * rinv * w4.w});
+    }
+  }
+}
+
+template <bool FgBf16>
 __global__ void __launch_bounds__(ROW_T) gate_apply_kernel(const float* __restrict__ h, const float* __restrict__ msg,
-                                                           const float* __restrict__ f, const float* __restrict__ gn,
+                                                           const void* __restrict__ f, const void* __restrict__ gn,
                                                            const float* __restrict__ norm_w, uint16_t* __restrict__ out) {
   const size_t off = size_t(blockIdx.x) * H + threadIdx.x * 4;
   const float4 h4 = *reinterpret_cast<const float4*>(h + off), m4 = *reinterpret_cast<const float4*>(msg + off);
-  const float4 f4 = *reinterpret_cast<const float4*>(f + off), g4 = *reinterpret_cast<const float4*>(gn + off);
   const float hv[4] = {h4.x, h4.y, h4.z, h4.w}, mv[4] = {m4.x, m4.y, m4.z, m4.w};
-  const float fv[4] = {f4.x, f4.y, f4.z, f4.w}, gv[4] = {g4.x, g4.y, g4.z, g4.w};
+  float fv[4], gv[4];
+  if constexpr (FgBf16) {
+    load_bf16x4(static_cast<const uint16_t*>(f) + off, fv);
+    load_bf16x4(static_cast<const uint16_t*>(gn) + off, gv);
+  } else {
+    const float4 f4 = *reinterpret_cast<const float4*>(static_cast<const float*>(f) + off);
+    const float4 g4 = *reinterpret_cast<const float4*>(static_cast<const float*>(gn) + off);
+    fv[0] = f4.x, fv[1] = f4.y, fv[2] = f4.z, fv[3] = f4.w;
+    gv[0] = g4.x, gv[1] = g4.y, gv[2] = g4.z, gv[3] = g4.w;
+  }
   float y[4];
   float ss[1] = {0.f};
 #pragma unroll
@@ -435,9 +605,10 @@ __global__ void __launch_bounds__(ROW_T) tap_kernel(const float* __restrict__ x,
 }
 
 // Warp per vocabulary row: dot in FP32 of bf16(w) (or bf16(fp8 * scale)) with x, BF16-rounded, softcapped.
-template <bool FP8>
+template <bool FP8, bool Packed = false, bool Escapes = false>
 __global__ void __launch_bounds__(256) head_kernel(const uint16_t* __restrict__ x, const void* __restrict__ w,
-                                                   const float* __restrict__ scale, int V, float* __restrict__ out) {
+                                                   const float* __restrict__ scale, int V, float* __restrict__ out,
+                                                   const __grid_constant__ pico12::DeviceView pico) {
   __shared__ float xs[H];
   for (int i = threadIdx.x; i < H; i += blockDim.x) xs[i] = bf2f(x[i]);
   __syncthreads();
@@ -460,9 +631,17 @@ __global__ void __launch_bounds__(256) head_kernel(const uint16_t* __restrict__ 
       }
     }
   } else {
-    const uint16_t* row = static_cast<const uint16_t*>(w) + size_t(v) * H;
+    constexpr size_t stride = Packed ? pico12::row_bytes(H) : H * sizeof(uint16_t);
+    const auto* row = static_cast<const uint8_t*>(w) + size_t(v) * stride;
     for (int k = lane * 8; k < H; k += 256) {
-      const uint4 u = __ldg(reinterpret_cast<const uint4*>(row + k));
+      uint4 u;
+      if constexpr (Packed) {
+        const auto chunk = pico12::load8<l2::Evict::none>(row, H, k, 0);
+        if constexpr (Escapes) u = pico12::restore8<false>(chunk, pico, v, k);
+        else u = pico12::decode8(chunk, pico);
+      } else {
+        u = __ldg(reinterpret_cast<const uint4*>(row + k * sizeof(uint16_t)));
+      }
       const uint32_t ws[4] = {u.x, u.y, u.z, u.w};
 #pragma unroll
       for (int q = 0; q < 4; ++q) {
@@ -481,12 +660,17 @@ void attn_prep(const AttnPrepParams& p, cudaStream_t stream) {
   if (p.T <= 0 || !p.proj || !p.q || !p.rel || !p.k_out || !p.v_out || !p.conv_k || !p.conv_v)
     throw std::invalid_argument("attn_prep: missing argument");
   const bool ring = p.k_ring || p.v_ring || p.ring_pos;
+  if (p.v_fp16 && (p.full || p.out_fp8 || p.out_q4 || p.out_kv12))
+    throw std::invalid_argument("attn_prep: FP16 values need transient sliding rows");
+  if (p.out_kv12 && (!p.full || p.out_fp8 || p.out_q4 || !p.k_scale_out || !p.v_scale_out))
+    throw std::invalid_argument("attn_prep: KV12 needs full-attention K/V overflow destinations");
   if (p.out_q4 && (!p.full || p.out_fp8 || !p.k_scale_out || !p.v_scale_out))
     throw std::invalid_argument("attn_prep: Q4 needs full-attention K/V scale destinations");
   if (ring && (p.full || p.out_fp8 || !p.k_ring || !p.v_ring || !p.ring_pos))
     throw std::invalid_argument("attn_prep: ring needs all BF16 sliding cache destinations");
   auto dispatch = [&]<int KvHeads>() {
-    if (p.out_q4) attn_prep_kernel<KvHeads, false, true><<<p.T, 256, 0, stream>>>(p);
+    if (p.out_kv12) attn_prep_kernel<KvHeads, false, false, true><<<p.T, 256, 0, stream>>>(p);
+    else if (p.out_q4) attn_prep_kernel<KvHeads, false, true><<<p.T, 256, 0, stream>>>(p);
     else if (ring) attn_prep_kernel<KvHeads, true><<<p.T, 256, 0, stream>>>(p);
     else attn_prep_kernel<KvHeads, false><<<p.T, 256, 0, stream>>>(p);
   };
@@ -542,12 +726,34 @@ void kv_conv_state_update(float* state_k, float* state_v, const __nv_bfloat16* x
 }
 
 void gate_inputs(const GateRows& rows, int G, int T, __nv_bfloat16* gin, cudaStream_t stream) {
-  gate_inputs_kernel<<<dim3(T, G), ROW_T, 0, stream>>>(rows, T, reinterpret_cast<uint16_t*>(gin));
+  gate_inputs_kernel<false><<<dim3(T, G), ROW_T, 0, stream>>>(rows, T, reinterpret_cast<uint16_t*>(gin));
+}
+
+void gate_inputs_bf16(const GateRowsBf16& rows, int G, int T, __nv_bfloat16* gin, cudaStream_t stream) {
+  gate_inputs_kernel<true><<<dim3(T, G), ROW_T, 0, stream>>>(rows, T, reinterpret_cast<uint16_t*>(gin));
 }
 
 void gate_apply(const float* h, const float* msg, const float* f, const float* g, const float* norm_w, int T,
                 __nv_bfloat16* out, cudaStream_t stream) {
-  gate_apply_kernel<<<T, ROW_T, 0, stream>>>(h, msg, f, g, norm_w, reinterpret_cast<uint16_t*>(out));
+  gate_apply_kernel<false><<<T, ROW_T, 0, stream>>>(h, msg, f, g, norm_w, reinterpret_cast<uint16_t*>(out));
+}
+
+void gate_apply_bf16(const float* h, const float* msg, const __nv_bfloat16* f, const __nv_bfloat16* g,
+                     const float* norm_w, int T, __nv_bfloat16* out, cudaStream_t stream) {
+  gate_apply_kernel<true><<<T, ROW_T, 0, stream>>>(h, msg, f, g, norm_w, reinterpret_cast<uint16_t*>(out));
+}
+
+void gate_fg_apply_bf16(const __nv_bfloat16* g16, const __nv_bfloat16* w_forget, const __nv_bfloat16* w_gain,
+                        const __nv_bfloat16* h, const __nv_bfloat16* msg, const float* norm_w, int T,
+                        __nv_bfloat16* out, cudaStream_t stream) {
+  constexpr int shared_bytes = sizeof(GateFgSmem);
+  static const cudaError_t attr =
+      cudaFuncSetAttribute(gate_fg_apply_bf16_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shared_bytes);
+  if (attr != cudaSuccess) throw std::runtime_error("gate_fg_apply_bf16: shared memory attribute failed");
+  gate_fg_apply_bf16_kernel<<<(T + 15) / 16, 256, shared_bytes, stream>>>(
+      reinterpret_cast<const uint16_t*>(g16), reinterpret_cast<const uint16_t*>(w_forget),
+      reinterpret_cast<const uint16_t*>(w_gain), reinterpret_cast<const uint16_t*>(h),
+      reinterpret_cast<const uint16_t*>(msg), norm_w, T, reinterpret_cast<uint16_t*>(out));
 }
 
 
@@ -566,10 +772,21 @@ void store_tap(const float* x, int T, __nv_bfloat16* out, int64_t out_stride, cu
   tap_kernel<<<T, ROW_T, 0, stream>>>(x, reinterpret_cast<uint16_t*>(out), out_stride);
 }
 
-void head_logits(const __nv_bfloat16* x, const void* w, const float* scale, int V, float* out, cudaStream_t stream) {
+void head_logits(const __nv_bfloat16* x, const void* w, const float* scale, int V, float* out, cudaStream_t stream,
+                  const pico12::Layout* packed) {
   const auto* xs = reinterpret_cast<const uint16_t*>(x);
-  if (scale) head_kernel<true><<<(V + 7) / 8, 256, 0, stream>>>(xs, w, scale, V, out);
-  else head_kernel<false><<<(V + 7) / 8, 256, 0, stream>>>(xs, w, scale, V, out);
+  const int blocks = (V + 7) / 8;
+  if (packed) {
+    if (scale || packed->rows != V || packed->cols != H)
+      throw std::invalid_argument("head_logits: invalid PICO12 matrix");
+    const auto view = pico12::device_view(*packed, static_cast<const uint8_t*>(w));
+    if (packed->escapes) head_kernel<false, true, true><<<blocks, 256, 0, stream>>>(xs, w, nullptr, V, out, view);
+    else head_kernel<false, true><<<blocks, 256, 0, stream>>>(xs, w, nullptr, V, out, view);
+  } else if (scale) {
+    head_kernel<true><<<blocks, 256, 0, stream>>>(xs, w, scale, V, out, pico12::DeviceView{});
+  } else {
+    head_kernel<false><<<blocks, 256, 0, stream>>>(xs, w, nullptr, V, out, pico12::DeviceView{});
+  }
 }
 
 }  // namespace ingine::kernels::prefill

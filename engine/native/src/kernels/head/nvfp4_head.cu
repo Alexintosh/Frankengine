@@ -88,7 +88,7 @@ __device__ __forceinline__ Candidate better(Candidate a, Candidate b) {
   return b.val > a.val || (b.val == a.val && b.global_id < a.global_id) ? b : a;
 }
 
-template<int K, int Split, bool Head>
+template<int K, int Split, bool Head, bool Raw = false>
 __global__ void __launch_bounds__(Split * 32)
 project(const __nv_bfloat16* x, int M, Nvfp4Matrix w, float* logits, Candidate* scratch) {
   __shared__ float partial[Split][32][4];
@@ -129,7 +129,8 @@ project(const __nv_bfloat16* x, int M, Nvfp4Matrix w, float* logits, Candidate* 
 #pragma unroll
         for (int j = 0; j < Split; ++j) dot += partial[j][lane][i];
         if constexpr (Head) {
-          const float score = r < w.rows ? 30.f * tanhf(__bfloat162float(__float2bfloat16_rn(dot)) / 30.f) : -CUDART_INF_F;
+          const float score = r >= w.rows ? -CUDART_INF_F : Raw ? dot :
+              30.f * tanhf(__bfloat162float(__float2bfloat16_rn(dot)) / 30.f);
           if (logits && r < w.rows) logits[size_t(m) * w.rows + r] = score;
           if (scratch) candidates[m][r % Tile] = {score, r < w.rows ? w.v_begin + r : INT32_MAX};
         } else if (r < w.rows) {
@@ -239,6 +240,15 @@ void head_nvfp4(const __nv_bfloat16* x, int M, Nvfp4Matrix w, float* logits, Can
   dense::launch_ex(project<HeadK, HeadSplit, true>, dim3(tiles), HeadSplit * 32, 0, 1, pdl, stream, x, M, w, logits,
                    candidates ? scratch : nullptr);
   if (candidates) dense::launch_ex(reduce_candidates, dim3(M), Threads, 0, 1, pdl, stream, scratch, candidates, tiles);
+}
+
+void head_nvfp4_raw(const __nv_bfloat16* x, int M, Nvfp4Matrix w, float* dots, Candidate* candidates,
+                    Candidate* scratch, cudaStream_t stream) {
+  const int tiles = (w.rows - 1) / Tile + 1;
+  dense::launch_ex(project<HeadK, HeadSplit, true, true>, dim3(tiles), HeadSplit * 32, 0, 1, false, stream,
+                   x, M, w, dots, scratch);
+  reduce_candidates<<<M, Threads, 0, stream>>>(scratch, candidates, tiles);
+  CUDA_CHECK(cudaGetLastError());
 }
 
 }  // namespace ingine::kernels::head

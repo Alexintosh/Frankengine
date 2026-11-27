@@ -5,6 +5,7 @@
 #include "kernels/attn/attn.h"
 #include "kernels/common/l2.cuh"
 #include "kernels/common/q4_g64.cuh"
+#include "kernels/common/kv12.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -32,7 +33,10 @@ inline void require(bool ok, const char* what) {
     if (!ok) throw std::invalid_argument(std::string("attn: ") + what);
 }
 
-inline void check_q4(const DecodeArgs& a, bool slot_table = false) {
+inline void check_packed_cache(const DecodeArgs& a, bool slot_table = false) {
+    require(!a.cache_kv12 || (!a.cache_q4 && !a.cache_fp8 && a.window == 0),
+            "KV12 requires full attention and excludes FP8 and Q4");
+    require(!a.cache_kv12 || slot_table || (a.k_scale && a.v_scale), "KV12 requires K/V overflow storage");
     require(!a.cache_q4 || (!a.cache_fp8 && a.window == 0), "Q4 requires full attention and excludes FP8");
     require(!a.cache_q4 || slot_table || (a.k_scale && a.v_scale), "Q4 requires K/V scales");
 }
@@ -48,10 +52,17 @@ inline void check_args(const DecodeArgs& a) {
                 a.k_cache && a.v_cache && a.pos && a.workspace && a.out,
             "null argument");
     require(full || !a.cache_fp8, "float8_e4m3fn caches are supported on full layers (window = 0) only");
-    check_q4(a);
+    check_packed_cache(a);
     require(!a.cache_q4 || (a.batch == 1 && !a.slots) || a.scale_stride > 0, "Q4 needs the slot scale stride");
     // device positions and loop bounds are int32; 2^30 leaves headroom for the tile strides
     require(a.cache_rows >= 1 && a.cache_rows <= (int64_t(1) << 30), "caches hold 1..2^30 positions");
+    if (a.cache_kv12 && (a.batch > 1 || a.slots)) {
+        require(a.hkv == 4 || a.hkv == 8, "hkv must be 8 or 4");
+        const auto heads = a.cache_rows * a.hkv;
+        require(a.cache_stride >= heads * std::int64_t(sizeof(kv12::Head)) && a.cache_stride % alignof(kv12::Head) == 0 &&
+                a.scale_stride >= heads * std::int64_t(sizeof(kv12::Spill)) && a.scale_stride % alignof(kv12::Spill) == 0,
+                "KV12 needs aligned, non-overlapping byte strides");
+    }
     if (!full) {
         require(a.cache_rows <= WIN, "sliding caches hold at most 1024 rows");
         require(a.kpos != nullptr, "sliding layers need kpos");

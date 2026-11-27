@@ -18,10 +18,6 @@ namespace attn = kernels::attn;
 
 namespace {
 
-dense::Matrix matrix(const Dense& d) {
-  return dense::Matrix{d.w.data, static_cast<const float*>(d.scale.data), d.rows(), d.cols()};
-}
-
 const float* f32p(const Tensor& t) { return static_cast<const float*>(t.data); }
 float* f32m(const Tensor& t) { return static_cast<float*>(t.data); }
 __nv_bfloat16* bf16m(const Tensor& t) { return static_cast<__nv_bfloat16*>(t.data); }
@@ -50,6 +46,8 @@ Decoder::Decoder(const Weights& w, const Ablation& abl, State& st, bool pdl, TpS
       pdl_(pdl && !simulation && (!tp || (tp->gb10_spec && !tp->profile))),
       simulation_(simulation), tp_(tp),
       down_workspace_(tp && tp->gb10_spec ? sizeof(float) * std::size_t(8) * TOP_K * HIDDEN : 0),
+      cert_head_ws_(!simulation && !tp && w.unembed_certified.bounds
+          ? kernels::head::cert_head_workspace(w.unembed.rows()) : 0),
       attn_ws_(simulation ? 0 : attn::workspace_bytes(8, tp ? tp->layout.hkv_local : KV_HEADS)) {
   if (simulation_) return;
   attn_ws_.fill(0);  // zeroed once; the kernel resets its counter itself
@@ -72,8 +70,9 @@ const std::int64_t* Decoder::block_table(const std::vector<const float*>& blocks
   return static_cast<const std::int64_t*>(it->second.p);
 }
 
-void Decoder::decode(Buffers& b, const std::int64_t* pos, bool history, cudaStream_t stream, TpReduction reduction) {
-  decode_impl(b, pos, history, stream, reduction, nullptr);
+void Decoder::decode(Buffers& b, const std::int64_t* pos, bool history, cudaStream_t stream,
+                     TpReduction reduction, bool greedy_only) {
+  decode_impl(b, pos, history, stream, reduction, nullptr, greedy_only);
 }
 
 void Decoder::allocate_batch_workspace(int max_batch) {
@@ -84,14 +83,14 @@ void Decoder::allocate_batch_workspace(int max_batch) {
   batch_attn_ws_.fill(0);
 }
 
-void Decoder::decode_batch(Buffers& b, const BatchSlotTable* slots, cudaStream_t stream) {
+void Decoder::decode_batch(Buffers& b, const BatchSlotTable* slots, cudaStream_t stream, bool greedy_only) {
   if (simulation_ || !slots || b.m < 1 || b.m > 8 || !batch_attn_ws_.p)
     throw std::invalid_argument("invalid batch decode configuration");
-  decode_impl(b, nullptr, false, stream, TpReduction::Reconstruct, slots);
+  decode_impl(b, nullptr, false, stream, TpReduction::Reconstruct, slots, greedy_only);
 }
 
 void Decoder::decode_impl(Buffers& b, const std::int64_t* pos, bool history, cudaStream_t stream,
-                          TpReduction reduction, const BatchSlotTable* slots) {
+                          TpReduction reduction, const BatchSlotTable* slots, bool greedy_only) {
   const bool profile = tp_ && tp_->profile;
   auto stage = [&](VerifyStage kind, int occurrence, bool end) {
     if (profile) tp_->mark_stage(kind, occurrence, end, stream);
@@ -219,7 +218,7 @@ void Decoder::decode_impl(Buffers& b, const std::int64_t* pos, bool history, cud
     } else {
       const DeviceBuffer& seg = layer.full ? full_segments_ : segments_[single ? 0 : 1];
       stage(VerifyStage::Wproj, v, false);
-      dense::proj(bf16m(b.xin), m, matrix(layer.wproj), static_cast<const int*>(seg.p), num_segs(layer.full),
+      dense::proj(bf16m(b.xin), m, layer.wproj.matrix(), static_cast<const int*>(seg.p), num_segs(layer.full),
                   f32m(proj_out), pdl, stream);
       stage(VerifyStage::Wproj, v, true);
       // b.hist_k/hist_v[v] (K and V segments of proj_out) are copied by the MLP-side mix below
@@ -245,7 +244,8 @@ void Decoder::decode_impl(Buffers& b, const std::int64_t* pos, bool history, cud
         a.v_cache = st.v_full_at(fi).data;
         a.cache_fp8 = st.kv_fp8;
         a.cache_q4 = st.kv_q4;
-        if (a.cache_q4) {
+        a.cache_kv12 = st.kv_12;
+        if (a.cache_q4 || a.cache_kv12) {
           a.k_scale = st.k_full_scale_at(fi).data;
           a.v_scale = st.v_full_scale_at(fi).data;
         }
@@ -275,11 +275,11 @@ void Decoder::decode_impl(Buffers& b, const std::int64_t* pos, bool history, cud
         float* raw = bf16 ? nullptr : f32m(b.y);
         auto* raw16 = bf16 ? bf16m(b.xf) : nullptr;
         stage(VerifyStage::Wo, v, false);
-        dense::proj_raw(bf16m(b.attn_out), m, matrix(layer.wo), raw, raw16, pdl, stream);
+        dense::proj_raw(bf16m(b.attn_out), m, layer.wo.matrix(), raw, raw16, pdl, stream);
         stage(VerifyStage::Wo, v, true);
         reduce_conv(raw, raw16, v, dense::ConvKind::Attention, layer.attn_conv, st.conv_attn_at(v), f32m(b.y), hist);
       } else {
-        dense::proj_conv(bf16m(b.attn_out), m, matrix(layer.wo), f32p(layer.attn_conv), st.conv_attn_at(v), f32m(b.y),
+        dense::proj_conv(bf16m(b.attn_out), m, layer.wo.matrix(), f32p(layer.attn_conv), st.conv_attn_at(v), f32m(b.y),
                          hist, pdl, stream);
       }
     }
@@ -354,10 +354,13 @@ void Decoder::decode_impl(Buffers& b, const std::int64_t* pos, bool history, cud
     simulation_->head(b, stream);
   else if (tp_)
     tp_->head(w, bf16m(b.xf), f32m(b.logits), ptr<int32_t>(b.greedy), m, TpSchedule::Decode, stream);
+  else if (greedy_only && w.unembed_certified.bounds)
+    kernels::head::cert_head(bf16m(b.xf), m, w.unembed.matrix(), w.unembed_certified, f32m(b.logits),
+                             cert_head_ws_.p, ptr<int32_t>(b.greedy), stream);
   else if (w.unembed_nvfp4.codes)
     kernels::head::head_nvfp4(bf16m(b.xf), m, w.unembed_nvfp4, f32m(b.logits), nullptr, nullptr, pdl, stream);
   else
-    dense::head(bf16m(b.xf), m, matrix(w.unembed), f32m(b.logits), pdl, stream);
+    dense::head(bf16m(b.xf), m, w.unembed.matrix(), f32m(b.logits), pdl, stream);
 }
 
 }  // namespace ingine::model

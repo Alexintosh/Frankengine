@@ -62,7 +62,7 @@ void copy_full_prefix(const State& src, const State& dst, int len, cudaStream_t 
   };
   copy(src.k_full, dst.k_full);
   copy(src.v_full, dst.v_full);
-  if (src.kv_q4) {
+  if (src.kv_q4 || src.kv_12) {
     copy(src.k_full_scale, dst.k_full_scale);
     copy(src.v_full_scale, dst.v_full_scale);
   }
@@ -138,7 +138,8 @@ class EngineGenerator final : public Generator {
       // unembedding when it already has that layout and retain a separate dense source otherwise.
       Dense head;
       if (rt_.tp() || options.head_nvfp4)
-        head = load_head(options.model_dir, options.dense_fp8, false, rt_.stream(), draft_head_storage_).dense;
+        head = load_head(options.model_dir, options.dense_fp8, false, rt_.stream(), draft_head_storage_,
+                         TpLayout{}, options.dense_pico12).dense;
       drafter_ = std::make_unique<Drafter>(options.model_dir, rt_.weights(), options.max_ctx, rt_.stream(),
                                            Drafter::SHORTLIST_ROWS, options.draft_nvfp4, head.w.data ? &head : nullptr,
                                            rt_.tp() && rt_.tp()->profile);
@@ -158,7 +159,7 @@ class EngineGenerator final : public Generator {
         batch_unembed_ = load_head(options.model_dir, /*dense_fp8=*/false, /*head_nvfp4=*/false, stream,
                                    batch_head_storage_, layout).dense;
       }
-      batch_state_ = make_batch_state(options.max_batch, options.batch_ctx, options.kv_fp8, layout, options.kv_q4);
+      batch_state_ = make_batch_state(options.max_batch, options.batch_ctx, options.kv_fp8, layout, options.kv_q4, options.kv_12);
       batch_dec_ = std::make_unique<BatchDecoder>(rt_.weights(), rt_.ablation(), batch_state_, options.max_batch,
                                                   stream, 8, rt_.tp(),
                                                   batch_unembed_.w.data ? &batch_unembed_ : nullptr);
@@ -643,27 +644,28 @@ class EngineGenerator final : public Generator {
 
   std::vector<int32_t> decode_batch_step(std::span<const BatchSlotStep> slots) override {
     std::vector<Runtime::BatchInput> rows;
-    bool sampled = false;
+    bool sampled = false, greedy_only = true;
     for (const auto& slot : slots) {
       rt_.state_slot(slot.slot).length = int(slot_history(slot.slot).size());
       rows.push_back({slot.slot, slot.token});
       sampled |= slot.sampling->params.temperature > 0;
+      greedy_only &= slot.sampling->params.temperature <= 0;
     }
     if (rows.size() == 1 && rows.front().slot == 0) {
       if (rt_.tp()) rt_.tp()->full_logits = sampled;
       const int32_t input = rows.front().token;
       rt_.set_inputs(std::span(&input, 1), int(tokens_in_state_.size()));
-      const float* logits = rt_.run_step(1);
+      const float* logits = rt_.run_step(1, greedy_only);
       tokens_in_state_.push_back(input);
       if (rt_.tp()) rt_.tp()->wait(rt_.stream());
       if (options_.tp.rank != 0) return {};
-      const bool greedy = rt_.tp() && !sampled;
+      const bool greedy = rt_.tp() ? !sampled : rt_.has_cert_head() && greedy_only;
       const void* output = greedy ? rt_.buffers(1).greedy.data : logits;
       return {batch_token(output, greedy, *slots.front().sampling)};
     }
-    auto& buffers = rt_.run_batch(rows, sampled);
+    auto& buffers = rt_.run_batch(rows, sampled, greedy_only);
     std::vector<int32_t> tokens;
-    const bool greedy_head = rt_.tp() && !sampled;
+    const bool greedy_head = rt_.tp() ? !sampled : rt_.has_cert_head() && greedy_only;
     for (std::size_t i = 0; i < slots.size(); ++i) {
       slot_history(slots[i].slot).push_back(slots[i].token);
       if (options_.tp.rank == 0) {
@@ -801,7 +803,6 @@ class EngineGenerator final : public Generator {
               std::chrono::steady_clock::time_point& t) {
     const cudaStream_t stream = rt_.stream();
     const head::SamplingParams params{sampling.temperature, sampling.top_k, sampling.top_p};
-    auto* sampled = static_cast<std::int32_t*>(token_.p);
     // forced replay: the forced tokens on the device; each sampled token is replaced by its forced one
     DeviceBuffer forced;
     if (!sampling.forced.empty()) {
@@ -811,14 +812,15 @@ class EngineGenerator final : public Generator {
     }
     // engine._sample of the logits into `sampled`, then the inputs of the step at `position`
     auto sample_for = [&](const float* logits, int position) {
-      head::sample(logits, 1, UNPADDED_VOCAB, UNPADDED_VOCAB, params, rng, sampled, stream);
+      auto* sampled = logits ? static_cast<int32_t*>(token_.p) : ptr<int32_t>(rt_.buffers(1).greedy);
+      if (logits) head::sample(logits, 1, UNPADDED_VOCAB, UNPADDED_VOCAB, params, rng, sampled, stream);
       if (forced.p)
         CUDA_CHECK(cudaMemcpyAsync(sampled, static_cast<const std::int32_t*>(forced.p) + (position - n),
                                    sizeof(std::int32_t), cudaMemcpyDeviceToDevice, stream));
       rt_.chain_advance(sampled, position);
     };
     // the step at `position` (its input token is on the device), then the next token
-    auto launch = [&](int position) { sample_for(rt_.run_step(1), position + 1); };
+    auto launch = [&](int position) { sample_for(rt_.run_step(1, params.temperature <= 0.f), position + 1); };
     auto is_stop = [&](std::int32_t tok) { return std::find(stop_ids.begin(), stop_ids.end(), tok) != stop_ids.end(); };
 
     sample_for(static_cast<const float*>(logits_.p), n);
@@ -964,7 +966,7 @@ class EngineGenerator final : public Generator {
       anchor_at = rt_.tp()->agree(boundary, stream) ? boundary : 0;
 
     st.length = int(start);  // decode steps advance the state without its host-side length
-    const std::size_t chunk = std::size_t(proceed ? std::min(2048, options_.prefill_chunk) : options_.prefill_chunk);
+    const std::size_t chunk = std::size_t(options_.prefill_chunk);
     struct Encoded {
       const PromptImage* image;
       DeviceBuffer rows;  // bf16 [>= tokens, HIDDEN]

@@ -73,9 +73,9 @@ class SpecLoop {
   DeviceBuffer width_;                 // int32: the verify width chosen on the device
   MappedHostBuffer record_;            // VerifyRecord of the last round
   MappedHostBuffer forced_window_;     // forced replay: int32 [8], the forced tokens after the round's anchor
-  GraphExec verify_, accept_;
+  GraphExec verify_, certified_verify_, accept_;
   struct AcceptKey {
-    bool greedy, forced;
+    bool greedy, forced, certified;
     float temperature, top_p;
     int top_k;
     bool operator==(const AcceptKey&) const = default;

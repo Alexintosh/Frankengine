@@ -24,13 +24,13 @@ struct DecodeArgs {
   float* conv_k_state = nullptr;    // fp32 [3, hkv*128]
   float* conv_v_state = nullptr;
   bool conv_write = true;
-  void* k_cache = nullptr;          // [rows, hkv, 128] BF16/FP8, or [rows, hkv, 64] packed Q4
+  void* k_cache = nullptr;          // [rows, hkv, 128] BF16/FP8, or packed U8 [rows, hkv, 64 (Q4) / 208 (KV12)]
   void* v_cache = nullptr;
   bool cache_fp8 = false;
   bool cache_q4 = false;
-  void* k_scale = nullptr;          // Q4: FP16 [rows, hkv, 2]
+  void* k_scale = nullptr;          // Q4: FP16 [rows, hkv, 2]. KV12: U8 [rows, hkv, 52] overflow.
   void* v_scale = nullptr;
-  std::int64_t scale_stride = 0;    // per slot, in FP16 elements
+  std::int64_t scale_stride = 0;    // per slot, in side tensor elements (FP16 for Q4, bytes for KV12)
   std::int64_t cache_rows = 0;      // 1024 (sliding) or max_ctx (full), at most 2^30
   std::int64_t* kpos = nullptr;     // sliding: int64 [1024] slot positions (-1 = empty); full: unused
   const std::int64_t* pos = nullptr;  // int64 device, pos[0] = position of the first token
@@ -44,6 +44,7 @@ struct DecodeArgs {
   const std::int32_t* slots = nullptr;
   std::int64_t cache_stride = 0, kpos_stride = 0, conv_stride = 0;
   const std::int32_t* rows = nullptr;
+  bool cache_kv12 = false;          // full attention only, exclusive with FP8 and Q4
 };
 
 // Bytes of workspace attn_decode needs for up to max_m tokens: a counter (zero the workspace once; the

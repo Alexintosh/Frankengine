@@ -3,15 +3,16 @@
 **High-throughput, strict-lossless C++/CUDA inference engine for `Inkling-2-Mini` (`30B-A3.6B` Looped MoE) on NVIDIA Blackwell GPUs (`GB10` DGX Spark `sm_121a`, `RTX 5090`/`RTX PRO 6000` `sm_120a`, and `B200`/`GB200` `sm_100a`).**
 
 Built on top of upstream [`ingine`](https://github.com/satellitedown/inkling-2-mini-abliterated-ingine) and [`ingine-batch`](https://github.com/satellitedown/ingine-batch), Frankengine combines:
-- **Native Blackwell Kernels:** `mxf4nvf4`/`mxf8f6f4` Tensor Core prefill MoE, custom `mma.sync.m16n8k32` FP8 dense prefill GEMM (`149.4 TFLOP/s`, fused `OUTER_VEC_32F` epilogue), BF16 MMA `rel_logits`, and fused `NVFP4` LM head (`head_sample_nvfp4` / `head_topk16_nvfp4`).
+- **Native Blackwell Kernels & Prefill v3:** `mxf4nvf4`/`mxf8f6f4` Tensor Core prefill MoE, custom `mma.sync.m16n8k32` FP8 dense prefill GEMM (`149.4 TFLOP/s`, fused `OUTER_VEC_32F` epilogue), `BR64_BK64` `ldmatrix.b8.trans` FP8 global prefill attention (`3,936 tok/s` cold 128K prefill on `1× DGX Spark`), fused BF16 `gate_fg_apply`, BF16 MMA `rel_logits`, and fused `NVFP4` LM head (`head_sample_nvfp4` / `head_topk16_nvfp4`).
+- **Bit-Exact 100% Lossless Mode (`PICO12` + `CERT_HEAD`):** Lossless 12-bit BF16-native dense weight packing (`--dense-pico12`, 75.1% of BF16 weight bytes with exact per-row CSR outliers and 7-op `decode4`, 0 bits error) paired with a mathematically certified Cauchy-Schwarz greedy LM head (`--cert-head`, NVFP4 proxy + exact dense verification of all suspect rows, 100% bit-exact greedy parity) — reaching **`77.2 tok/s` `all-73` lossless (`85.0` code, `70.0` prose)** on `1× DGX Spark`.
 - **Dual-Rail 200 GbE RoCEv2 UMA Backend (`tp_comm/`):** 48-CTA FP32/BF16 AllReduce, CUDA-Graph-safe `K=4` pipelined bulk RDMA (`>=8 MiB`), `bf16-moe` wire (`Wo` stays FP32 for conv1d precision), and `6.3×` 32-CTA sampled gather.
 - **50/50 `TP=2` Sharded Solo `DFlash 2` + Hybrid Speculation:** Megatron-sharded 5-layer FP8/NVFP4 `DFlash 2` backbone (`-22.9%` draft latency, broadcast-free in-graph sharded NVFP4 head) paired with global `DSpark` (`--draft-type hybrid --dflash2-max-ctx 6144`).
 - **`BatchDFlash2` (`GAMMA=7`) & `c=32` CUDA Graphs:** 5-layer batched block-diffusion drafter (`MXFP8` + `FP8` KV rings = `1.545 GB` for 32 slots, WMMA GQA, auto-selected when `--dflash2-dir` and `--batch-spec >= 5`), `32 × 32K` continuous batching, and automatic `256K` solo fallback.
 - **GPU `clone_slot` Forking + Zero-VRAM Persistent Prefix Cache:** Automatic intra-wave shared-prefix slot cloning plus an LRU Prefix Anchor pool (detecting `<|end_message|>` / `<|im_end|>` boundaries) that cuts repeated system-prompt TTFT by up to **`19.9×`**.
-- **Live Observability & Parallel Agent Fan-Out:** Lock-free `GET /v1/telemetry` (JSON) & `GET /metrics` (Prometheus) endpoints + bundled [`.omp/extensions/frankengine-parallel.ts`](.omp/extensions/frankengine-parallel.ts) for single-chat multi-lane coding fan-out.
+- **Vision ON (`TP=1`) + Live Observability & Parallel Agent Fan-Out:** Built-in ViT multimodal support enabled by default on `TP=1`, lock-free `GET /v1/telemetry` (JSON) & `GET /metrics` (Prometheus) endpoints + bundled [`.omp/extensions/frankengine-parallel.ts`](.omp/extensions/frankengine-parallel.ts) for single-chat multi-lane coding fan-out.
 
 <p align="center">
-  <img src="docs/assets/inkling2_dual_dgx_spark_infographic.png" alt="Inkling-2-Mini on 2× NVIDIA DGX Spark Infographic" width="680"/>
+  <img src="docs/assets/frankengine_tp1_leaderboard.png" alt="Inkling-2-Mini 1× DGX Spark Public Recipes Leaderboard (Frankengine TP=1 FP8 & Bit-Exact Lossless)" width="880"/>
 </p>
 
 ---
@@ -19,6 +20,20 @@ Built on top of upstream [`ingine`](https://github.com/satellitedown/inkling-2-m
 ## Verified Production Benchmarks (`1×` vs `2× NVIDIA DGX Spark`, GB10 `sm_121a`)
 
 Each DGX Spark (`GB10`) has **128 GB LPDDR5X unified memory** with **`231.38 GB/s` measured streaming DRAM bandwidth** (vs. `1,792 GB/s` RTX 5090 / `8,000 GB/s` NVIDIA B200), linked via dual-rail 200 GbE RoCEv2 (`bf16-moe` wire, `BATCH_SPEC=7`, `BATCH_SPEC_THRESHOLD=0.30`).
+
+### 0. `1× DGX Spark` (`TP=1`) Same-Harness Leaderboard (`knapcio/inkling-2-mini-spark-bench`, Vision ON)
+
+Measured on `1× NVIDIA DGX Spark (GB10)` with the exact public 7-step `cmpbench.sh` harness (`speedbench full` 73 prompts `T=0` reasoning low, `thinking c24`, `longctx`, `128K` + `240K` needles, `30/30` quality guard, and 3-seed `295`-item `inkqc` quality):
+
+| Recipe (`1× DGX Spark`) | Lossy? | ALL 73 (`c1`) | Prose (`c1`) | Code (`c1`) | Thinking (`c24`) | Prefill `8K` | Prefill `128K` | Decode `@32K / 128K` | Startup | Quality (`/295`) |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| **Frankengine TP=1 (FP8, Vision ON)** | Yes (`FP8 KV/dense`) | **`82.4 tok/s`** *(geo `86.2`)* | **`78.7`** | **`96.5`** | `400` | `4,810` | **`3,936`** | **`90.9 / 58.5`** | **`7 s`** | `286.0` |
+| **Frankengine TP=1 exact (`PICO12 + CERT_HEAD`, Vision ON)** | **No (bit-exact)** | **`77.2 tok/s`** *(geo `77.3`)* | **`70.0`** | **`85.0`** | `366` | `4,423` | `3,143` | `72.7 / 43.1` | **`10 s`** | **`286.3`** |
+| `knapcio v2.9.7` (SGLang + overlays, Vision OFF) | No | `73.5 tok/s` | `65.6` | `82.2` | `538` | `5,720` | `3,860` | — | `128 s` | `287.3` |
+
+Both Frankengine TP=1 configs pass `128K` and `240K` passkey needles (`PASS`), `30/30` quality guard (`PASS`), and `0` failed requests across all 7 steps (`TTFT 49.3 / 53.0 ms`, `worst MemAvailable 57.8 / 34.2 GiB`).
+
+---
 
 ### 1. Single-Stream (`c = 1`) & Long-Context Comparison (`TP=1` vs `TP=2`)
 
@@ -112,11 +127,11 @@ cmake -S engine/native -B "engine/native/build-${ARCH}" \
 cmake --build "engine/native/build-${ARCH}" -j "$(nproc)" \
   --target ingine-serve ingine-bench ingine-batch-bench ingine-validate
 
-# 3. Serve live (32 GB RTX 5090 example — 256K solo DFlash2/DSpark; or add BATCH_SPEC=7 MAX_BATCH=16 BATCH_CTX=4096 PARK_MB=0 for multi-agent batching):
+# 3. Serve live (32 GB RTX 5090 example — 256K solo DFlash2/DSpark + 8K prefill chunk; add DENSE_FP8=0 KV_FP8=0 HEAD_NVFP4=0 DENSE_PICO12=1 CERT_HEAD=1 for 100% bit-exact lossless):
 BUILD_DIR="$(pwd)/engine/native/build-${ARCH}" \
 HEAD_MODEL_DIR="$(pwd)/models/Inkling-2-Mini" \
 DFLASH2_DIR="$(pwd)/models/Inkling-2-Mini-DFlash2" \
-MAX_CTX=262144 MAX_BATCH=1 BATCH_SPEC=0 PARK_MB=2048 \
+PREFILL_CHUNK=8192 MAX_CTX=262144 MAX_BATCH=1 BATCH_SPEC=0 PARK_MB=2048 \
 ./scripts/serve_tp1.sh
 ```
 

@@ -9,6 +9,10 @@
 #include <cstddef>
 #include <cstdint>
 
+namespace ingine::kernels::pico12 {
+struct Layout;
+}
+
 namespace ingine::kernels::prefill {
 
 inline constexpr int kHidden = 2304;
@@ -16,7 +20,7 @@ inline constexpr int kHeads = 24, kKvHeads = 8, kHeadDim = 128, kRel = 16, kRelE
 inline constexpr int kKvDim = kKvHeads * kHeadDim;  // 1024
 inline constexpr int kInter = 1152, kExperts = 128, kTopK = 8;
 inline constexpr int kAttnKeyTile = 64;    // keys per attention tile (tile bounds granularity)
-inline constexpr int kAttnMaxTiles = 64;   // explicit-position key tiles per call (ring + chunk)
+inline constexpr int kAttnMaxTiles = 144;  // explicit-position key tiles per call (ring + chunk up to 8192)
 
 // ------------------------------------------------------------------------------------------------- GEMM
 
@@ -50,9 +54,10 @@ void fp8_dense_gemm(const uint8_t* A_q, const float* a_scale, int lda,
 // Keys/values of one sliding visit for the chunk: rows [0, 1024) are the ring before the chunk, rotated so
 // row i holds slot (pos0 + i) % 1024 (position order for a filled ring), rows [1024, 1024 + T) the chunk.
 // ring_gather fills rows [0, 1024) and the positions of every row (kpos int32 [kpos_rows], -1 = empty, padding
-// rows -1); attn_prep writes the chunk rows.
+// rows -1). attn_prep writes the chunk rows. v_fp16 stores transient value rows as FP16.
 void ring_gather(const __nv_bfloat16* k_ring, const __nv_bfloat16* v_ring, const int64_t* ring_pos, int pos0, int T,
-                 __nv_bfloat16* k_rows, __nv_bfloat16* v_rows, int* kpos, int kpos_rows, cudaStream_t stream, int hkv = kKvHeads, int ring_rows = 1024);
+                 __nv_bfloat16* k_rows, __nv_bfloat16* v_rows, int* kpos, int kpos_rows, cudaStream_t stream,
+                 int hkv = kKvHeads, int ring_rows = 1024, bool v_fp16 = false);
 
 // model.prefill's ring update: the last min(T, 1024) chunk rows (rows 1024.. of k_rows/v_rows) into their slots
 // (pos % 1024), ring_pos = pos.
@@ -76,17 +81,19 @@ struct AttnPrepParams {
   const float* conv_v = nullptr;
   __nv_bfloat16* q = nullptr;      // out [T, local query heads, 128]
   __nv_bfloat16* rel = nullptr;    // out [T, local query heads, 16]
-  void* k_out = nullptr;           // out [T, local KV heads, 128]: BF16 or FP8 E4M3 (full caches with out_fp8)
+  void* k_out = nullptr;           // out [T, local KV heads, head elements] in the selected cache format
   void* v_out = nullptr;
   bool out_fp8 = false;
   bool out_q4 = false;
-  void* k_scale_out = nullptr;    // Q4: FP16 [T, local KV heads, 2]
+  bool out_kv12 = false;
+  void* k_scale_out = nullptr;    // Q4 scales or KV12 overflow
   void* v_scale_out = nullptr;
-  // Optional sliding ring destination, written from the same BF16 results as k_out/v_out. Snapshot the
-  // incoming ring before launching attn_prep. Only the last min(T, 1024) rows are published.
+  // Optional sliding ring destination. Snapshot the incoming ring before launching attn_prep.
+  // Only the last min(T, 1024) rows are published, in BF16.
   __nv_bfloat16* k_ring = nullptr;
   __nv_bfloat16* v_ring = nullptr;
   int64_t* ring_pos = nullptr;
+  bool v_fp16 = false;  // Convert BF16 values to FP16 for the transient sliding v_out.
 };
 // model._qkv per token: q (scale, clip, tau, BF16), rel (scale, clip, tau, BF16), keys/values through the
 // static (sliding) or dynamic (full) conv, BF16, key clip / value RMS norm, stored at the cache precision.
@@ -101,11 +108,12 @@ void pack_rel_proj(const float* rel_proj, __nv_bfloat16* out, cudaStream_t strea
 
 struct AttnParams {
   const __nv_bfloat16* q = nullptr;  // [T, 24, 128]
-  const void* k = nullptr;           // key rows [L, 8, 128]: bf16, or fp8 e4m3 (kv_fp8)
+  const void* k = nullptr;           // [L, local KV heads, head elements] in the selected cache format
   const void* v = nullptr;
   bool kv_fp8 = false;
   bool kv_q4 = false;
-  const void* k_scale = nullptr;    // Q4: FP16 [L, local KV heads, 2]
+  bool kv_kv12 = false;
+  const void* k_scale = nullptr;    // Q4 scales or KV12 overflow
   const void* v_scale = nullptr;
   const int* kpos = nullptr;         // positions of the L keys (padded to tiles with -1), or null: key j at j
   const int4* bounds = nullptr;      // key_tile_bounds of kpos (with kpos)
@@ -120,6 +128,7 @@ struct AttnParams {
   // When both are provided, explicit sliding attention computes its own relative bias in shared memory.
   const __nv_bfloat16* rel_query = nullptr;  // [T, local query heads, 16]
   const __nv_bfloat16* rel_proj = nullptr;   // packed by pack_rel_proj
+  bool v_fp16 = false;                       // Transient FP16 values for tiled sliding attention.
 };
 // flex.attend + the output gate of model._visit: scores (q.k)/sqrt(128) + rel bias (distance < 1024), masked,
 // softmax with the per-head sink folded in through the log-sum-exp. Q.K in BF16 MMA with FP32 accumulation
@@ -149,12 +158,24 @@ struct GateRows {
   const float* h[3] = {};
   const float* msg[3] = {};
 };
+struct GateRowsBf16 {
+  const __nv_bfloat16* h[3] = {};
+  const __nv_bfloat16* msg[3] = {};
+};
 void gate_inputs(const GateRows& rows, int G, int T, __nv_bfloat16* gin, cudaStream_t stream);
+void gate_inputs_bf16(const GateRowsBf16& rows, int G, int T, __nv_bfloat16* gin, cudaStream_t stream);
 
 // out[t] = bf16(rms_norm((1 - tanh(f)) * h + tanh(g) * msg) * norm_w); f, g fp32 [T, H] (the forget / gain
 // products of the BF16 down projection).
 void gate_apply(const float* h, const float* msg, const float* f, const float* g, const float* norm_w, int T,
                 __nv_bfloat16* out, cudaStream_t stream);
+void gate_apply_bf16(const float* h, const float* msg, const __nv_bfloat16* f, const __nv_bfloat16* g,
+                     const float* norm_w, int T, __nv_bfloat16* out, cudaStream_t stream);
+// Fused BF16 Tensor Core forget/gain projection + tanh gate + RMSNorm (eliminates fpre/gpre DRAM round-trip):
+// g16 [T, 64] bf16, w_forget/w_gain [H, 64] bf16, h/msg [T, H] bf16, norm_w [H] fp32 -> out [T, H] bf16.
+void gate_fg_apply_bf16(const __nv_bfloat16* g16, const __nv_bfloat16* w_forget, const __nv_bfloat16* w_gain,
+                        const __nv_bfloat16* h, const __nv_bfloat16* msg, const float* norm_w, int T,
+                        __nv_bfloat16* out, cudaStream_t stream);
 
 
 // ------------------------------------------------------------------------------------------------- MoE
@@ -222,6 +243,7 @@ void put_rows(const __nv_bfloat16* src, int count, float* dst, cudaStream_t stre
 void store_tap(const float* x, int T, __nv_bfloat16* out, int64_t out_stride, cudaStream_t stream);
 // model.logits for one row: out[v] = 30 tanh(bf16(w_v . x) / 30), w bf16 [V, H] or FP8 rows dequantized
 // as weights.dequant (bf16(fp8 * scale[v])); x bf16 [H].
-void head_logits(const __nv_bfloat16* x, const void* w, const float* scale, int V, float* out, cudaStream_t stream);
+void head_logits(const __nv_bfloat16* x, const void* w, const float* scale, int V, float* out, cudaStream_t stream,
+                  const pico12::Layout* packed = nullptr);
 
 }  // namespace ingine::kernels::prefill

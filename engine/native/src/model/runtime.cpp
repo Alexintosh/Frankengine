@@ -5,7 +5,9 @@
 
 #include "core/device.h"
 
+#include <cstdlib>
 #include <cstring>
+#include <string_view>
 #include <algorithm>
 #include <array>
 #include <stdexcept>
@@ -15,8 +17,19 @@ namespace {
 
 constexpr int kMaxWidth = 8;
 
+bool enable_cert_head(const RuntimeOptions& options) {
+  if (options.tp.size != 1 || options.head_nvfp4 || options.dense_fp8) return false;
+  if (const char* value = std::getenv("INGINE_CERT_HEAD")) {
+    if (std::string_view(value) == "0") return false;
+    if (std::string_view(value) == "1") return true;
+    throw std::invalid_argument("INGINE_CERT_HEAD must be 0 or 1");
+  }
+  return options.cert_head || options.dense_pico12;
+}
+
 TpLayout runtime_layout(const RuntimeOptions& options) {
-  if (options.kv_fp8 && options.kv_q4) throw std::invalid_argument("--kv-fp8 and --kv-q4 are mutually exclusive");
+  validate_dense_formats(options.dense_fp8, options.dense_pico12);
+  validate_kv_formats(options.kv_fp8, options.kv_q4, options.kv_12);
   if (options.tp.size != 1 && options.tp.size != 2)
     throw std::invalid_argument("runtime supports TP sizes 1 and 2");
   if (options.tp.size == 2 && options.vision)
@@ -29,8 +42,8 @@ TpLayout runtime_layout(const RuntimeOptions& options) {
         std::find(widths.begin(), widths.end(), options.spec_verify_width) == widths.end())
       throw std::invalid_argument("fixed verify width must belong to the selected speculation width grid");
   }
-  if (options.tp.size == 2 && (options.prefill_chunk < 1 || options.prefill_chunk > 3072))
-    throw std::invalid_argument("TP=2 prefill chunk must be in 1..3072");
+  if (options.tp.size == 2 && (options.prefill_chunk < 1 || options.prefill_chunk > 8192))
+    throw std::invalid_argument("TP=2 prefill chunk must be in 1..8192");
   return TpLayout(options.tp.size, options.tp.rank);
 }
 
@@ -83,8 +96,10 @@ void GraphExec::launch(cudaStream_t stream) const {
 Runtime::Runtime(const RuntimeOptions& options) : options_(options) {
   if (options.max_ctx < 16) throw std::invalid_argument("max_ctx must be at least 16");
   const auto layout = runtime_layout(options);
+  const bool cert_head = enable_cert_head(options);
   CUDA_CHECK(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking));
-  weights_ = load_weights(options.model_dir, options.dense_fp8, stream_, options.head_nvfp4, layout);
+  weights_ = load_weights(options.model_dir, options.dense_fp8, stream_, options.head_nvfp4, layout,
+                          options.dense_pico12, cert_head);
   ablation_ = load_ablation(options.ablation);
   init();
 }
@@ -107,7 +122,7 @@ void Runtime::init() {
   if (options.batch_spec == 0 && options.max_batch > 1 && options.tp.size > 1 && (!options.tp.serve || options.tp.profile))
     throw std::invalid_argument("TP batch graphs require unprofiled serving mode");
   const auto layout = runtime_layout(options);
-  state_ = make_state(options.max_ctx, options.kv_fp8, layout, options.kv_q4);
+  state_ = make_state(options.max_ctx, options.kv_fp8, layout, options.kv_q4, options.kv_12);
   if (layout.tp_size > 1) tp_ = std::make_unique<TpRuntime>(options);
   decoder_ = std::make_unique<Decoder>(weights_, ablation_, state_, true, nullptr, tp_.get());
   pos_ = DeviceBuffer(sizeof(std::int64_t));
@@ -128,12 +143,12 @@ void Runtime::init() {
     }
   }
 
-  buffers_.emplace(1, make_buffers(1, layout, options.tp.full_logits, options.tp.serve));
+  buffers_.emplace(1, make_buffers(1, layout, options.tp.full_logits, options.tp.serve, has_cert_head()));
   history_[1] = false;
   if (options.spec) {
     for (int w : verify_width_grid(options.spec_widths)) {
       if (w > 1) {
-        buffers_.emplace(w, make_buffers(w, layout, options.tp.full_logits, options.tp.serve));
+        buffers_.emplace(w, make_buffers(w, layout, options.tp.full_logits, options.tp.serve, has_cert_head()));
         history_[w] = true;
       }
       verify_widths_.push_back(w);
@@ -149,12 +164,12 @@ void Runtime::init() {
   // every width reads its tokens from the shared buffer (set_inputs, chain_advance and the verify selector
   // write one place)
   for (auto& [m, b] : buffers_) b.token = rm(token_.p, DType::I64, {m});
-  for (const auto& [m, history] : history_) capture(m, history);
+  for (const auto& [m, history] : history_) capture(m, history, graphs_);
+  if (has_cert_head())
+    for (const auto& [m, history] : history_) capture(m, history, certified_graphs_, true);
   if (tp_ && options.tp.serve) {
     tp_->full_logits = true;
-    graphs_.swap(sampled_graphs_);
-    for (const auto& [m, history] : history_) capture(m, history);
-    graphs_.swap(sampled_graphs_);
+    for (const auto& [m, history] : history_) capture(m, history, sampled_graphs_);
     tp_->full_logits = false;
   }
   if (options.max_batch > 1 && options.batch_spec == 0) init_batch(layout);
@@ -187,7 +202,7 @@ void Runtime::set_batch_inputs(std::span<const BatchInput> rows) {
       if (const int full = FULL_INDEX[v]; full >= 0) {
         entry.k_cache = state.k_full_at(full).data;
         entry.v_cache = state.v_full_at(full).data;
-        if (state.kv_q4) {
+        if (state.kv_q4 || state.kv_12) {
           entry.k_scale = state.k_full_scale_at(full).data;
           entry.v_scale = state.v_full_scale_at(full).data;
         }
@@ -208,7 +223,7 @@ void Runtime::set_batch_inputs(std::span<const BatchInput> rows) {
 void Runtime::init_batch(const TpLayout& layout) {
   decoder_->allocate_batch_workspace(options_.max_batch);
   for (int i = 1; i < options_.max_batch; ++i)
-    extra_slots_.push_back(make_state(options_.max_ctx, options_.kv_fp8, layout, options_.kv_q4));
+    extra_slots_.push_back(make_state(options_.max_ctx, options_.kv_fp8, layout, options_.kv_q4, options_.kv_12));
   batch_table_ = DeviceBuffer(sizeof(BatchSlotTable));
   host_batch_table_ = MappedHostBuffer(sizeof(BatchSlotTable));
   std::memset(host_batch_table_.data(), 0, sizeof(BatchSlotTable));
@@ -218,17 +233,17 @@ void Runtime::init_batch(const TpLayout& layout) {
   set_batch_inputs(std::span(inputs).first(options_.max_batch));
   for (int width = 1; width <= options_.max_batch; ++width) {
     auto& entry = batch_widths_[width];
-    entry.buffers = make_buffers(width, layout, true, bool(tp_));
+    entry.buffers = make_buffers(width, layout, true, bool(tp_), has_cert_head());
     entry.buffers.token = rm(table->tokens, DType::I64, {width});
     auto capture = [&](bool full_logits) {
       if (tp_) tp_->full_logits = full_logits;
-      decoder_->decode_batch(entry.buffers, table, stream_);
+      decoder_->decode_batch(entry.buffers, table, stream_, !full_logits && has_cert_head());
       CUDA_CHECK(cudaStreamSynchronize(stream_));
       if (tp_) tp_->check();
       cudaGraph_t graph = nullptr;
       CUDA_CHECK(cudaStreamBeginCapture(stream_, cudaStreamCaptureModeThreadLocal));
       try {
-        decoder_->decode_batch(entry.buffers, table, stream_);
+        decoder_->decode_batch(entry.buffers, table, stream_, !full_logits && has_cert_head());
       } catch (...) {
         cudaStreamEndCapture(stream_, &graph);
         if (graph) cudaGraphDestroy(graph);
@@ -241,17 +256,18 @@ void Runtime::init_batch(const TpLayout& layout) {
       return GraphExec(exec);
     };
     entry.greedy = capture(false);
-    if (tp_) entry.sampled = capture(true);
+    if (tp_ || has_cert_head()) entry.sampled = capture(true);
   }
   if (tp_) tp_->full_logits = false;
   for (int i = 0; i < options_.max_batch; ++i) reset_state(state_slot(i), stream_);
 }
 
-Buffers& Runtime::run_batch(std::span<const BatchInput> rows, bool full_logits) {
+Buffers& Runtime::run_batch(std::span<const BatchInput> rows, bool full_logits, bool greedy_only) {
   auto& entry = batch_widths_.at(int(rows.size()));
   set_batch_inputs(rows);
   if (tp_) tp_->full_logits = full_logits;
-  (tp_ && full_logits ? entry.sampled : entry.greedy).launch(stream_);
+  const bool use_full_graph = tp_ ? full_logits : has_cert_head() && (full_logits || !greedy_only);
+  (use_full_graph ? entry.sampled : entry.greedy).launch(stream_);
   if (tp_) tp_->wait(stream_);
   else CUDA_CHECK(cudaStreamSynchronize(stream_));
   for (const auto& row : rows) ++state_slot(row.slot).length;
@@ -294,18 +310,18 @@ StatePtrs Runtime::state_ptrs() const {
   return p;
 }
 
-void Runtime::capture(int m, bool history) {
+void Runtime::capture(int m, bool history, std::map<int, cudaGraphExec_t>& dest, bool greedy_only) {
   // warm up so the pointer tables and kernel attributes are set outside capture; the scratch writes to the
   // conv states and ring positions are undone afterwards (the cache rows it wrote are never valid)
   const Snapshot saved = snapshot();
   Buffers& b = buffers(m);
-  for (int i = 0; i < 2; ++i) decoder_->decode(b, pos(), history, stream_);
+  for (int i = 0; i < 2; ++i) decoder_->decode(b, pos(), history, stream_, TpReduction::Reconstruct, greedy_only);
   CUDA_CHECK(cudaStreamSynchronize(stream_));
   if (tp_) tp_->check();
   cudaGraph_t graph = nullptr;
   CUDA_CHECK(cudaStreamBeginCapture(stream_, cudaStreamCaptureModeThreadLocal));
   try {
-    decoder_->decode(b, pos(), history, stream_);
+    decoder_->decode(b, pos(), history, stream_, TpReduction::Reconstruct, greedy_only);
   } catch (...) {
     cudaStreamEndCapture(stream_, &graph);
     if (graph) cudaGraphDestroy(graph);
@@ -317,7 +333,7 @@ void Runtime::capture(int m, bool history) {
   cudaGraphDestroy(graph);
   CUDA_CHECK(err);
   CUDA_CHECK(cudaGraphUpload(exec, stream_));
-  graphs_[m] = exec;
+  dest[m] = exec;
   restore(saved);
   CUDA_CHECK(cudaStreamSynchronize(stream_));
 }
@@ -328,12 +344,14 @@ void Runtime::set_inputs(std::span<const std::int32_t> tokens, int position) {
   set_step_inputs(tokens.data(), m, position, this->tokens(), pos(), stream_);
 }
 
-const float* Runtime::run_step(int m) {
-  const auto& graphs = tp_ && tp_->full_logits && options_.tp.serve ? sampled_graphs_ : graphs_;
+const float* Runtime::run_step(int m, bool greedy_only) {
+  const bool certified = greedy_only && has_cert_head();
+  const auto& graphs = certified ? certified_graphs_ :
+      tp_ && tp_->full_logits && options_.tp.serve ? sampled_graphs_ : graphs_;
   auto it = graphs.find(m);
   if (it == graphs.end()) throw std::invalid_argument("no decode graph for width " + std::to_string(m));
   CUDA_CHECK(cudaGraphLaunch(it->second, stream_));
-  return static_cast<const float*>(buffers(m).logits.data);
+  return certified ? nullptr : static_cast<const float*>(buffers(m).logits.data);
 }
 
 const float* Runtime::run_step_eager(int m) {
@@ -409,12 +427,12 @@ std::size_t Runtime::full_rows_bytes(int n) const {
   if (n < 0 || n > options_.max_ctx)
     throw std::invalid_argument("full_rows_bytes: n = " + std::to_string(n) + " outside [0, max_ctx = " +
                                 std::to_string(options_.max_ctx) + "]");
-  const std::size_t row = state_.k_full.nb[2] + (state_.kv_q4 ? state_.k_full_scale.nb[2] : 0);
+  const std::size_t row = state_.k_full.nb[2] + (state_.k_full_scale.data ? state_.k_full_scale.nb[2] : 0);
   return 2 * std::size_t(NUM_FULL_VISITS) * row * std::size_t(n);
 }
 
 // one 2D copy per cache: NUM_FULL_VISITS rows of n positions, pitch max_ctx positions in the cache, packed in
-// the parked copy (K visits, V visits, then K and V scales for Q4).
+// the parked copy (K visits, V visits, then K and V side data for Q4 or KV12).
 void Runtime::save_full_rows(void* dst, int n) {
   if (!full_rows_bytes(n)) return;
   char* p = static_cast<char*>(dst);
@@ -450,9 +468,9 @@ void Runtime::rollback(int P, int commit, int m) {
   verify_rollback(state_ptrs(), backup_, hist, nullptr, P, nullptr, commit, m, stream_);
 }
 
-void Runtime::record_step(int m, cudaStream_t stream) {
+void Runtime::record_step(int m, cudaStream_t stream, bool greedy_only) {
   if (!graphs_.count(m)) throw std::invalid_argument("record_step: no decode graph for width " + std::to_string(m));
-  decoder_->decode(buffers(m), pos(), history_.at(m), stream);
+  decoder_->decode(buffers(m), pos(), history_.at(m), stream, TpReduction::Reconstruct, greedy_only);
 }
 
 void Runtime::record_save_verify(int m, cudaStream_t stream) {

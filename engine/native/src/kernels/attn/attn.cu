@@ -384,12 +384,12 @@ struct BatchParams {
     }
 };
 
-template <int CS, int M, bool FULL, bool F8, int HKV = 8, bool Q4 = false>
+template <int CS, int M, bool FULL, bool F8, int HKV = 8, bool Q4 = false, bool KV12 = false>
 __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Params p) {
 #include "decode_body.cuh"
 }
 
-template <int CS, bool FULL, bool F8, int HKV, bool Q4>
+template <int CS, bool FULL, bool F8, int HKV, bool Q4, bool KV12>
 __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_batch_kernel(const BatchParams input) {
     constexpr int M = 1;
     const Params p = input.row<HKV>();
@@ -409,14 +409,14 @@ struct Kernel {
     size_t smem;
 };
 
-template <int CS, int M, bool FULL, bool F8, int HKV = 8, bool Q4 = false>
+template <int CS, int M, bool FULL, bool F8, int HKV = 8, bool Q4 = false, bool KV12 = false>
 constexpr Kernel kernel_of() {
-    return {attn_decode_kernel<CS, M, FULL, F8, HKV, Q4>, CS, Smem<CS, M, F8, Q4>::BYTES};
+    return {attn_decode_kernel<CS, M, FULL, F8, HKV, Q4, KV12>, CS, Smem<CS, M, F8, Q4>::BYTES};
 }
 
-template <int CS, int M, bool FULL, bool F8, int HKV = 8, bool Q4 = false>
+template <int CS, int M, bool FULL, bool F8, int HKV = 8, bool Q4 = false, bool KV12 = false>
 Kernel configured_kernel(int device) {
-    constexpr Kernel k = kernel_of<CS, M, FULL, F8, HKV, Q4>();
+    constexpr Kernel k = kernel_of<CS, M, FULL, F8, HKV, Q4, KV12>();
     static thread_local int configured_device = -1;
     if (configured_device != device) {
         if constexpr (CS > 8) CUDA_CHECK(cudaFuncSetAttribute(k.fn, cudaFuncAttributeNonPortableClusterSizeAllowed, 1));
@@ -426,23 +426,23 @@ Kernel configured_kernel(int device) {
     return k;
 }
 
-template <int CS, bool FULL, bool F8, int HKV, bool Q4>
+template <int CS, bool FULL, bool F8, int HKV, bool Q4, bool KV12>
 Kernel select(int M, int device) {
     switch (M) {
-        case 1: return configured_kernel<CS, 1, FULL, F8, HKV, Q4>(device);
-        case 2: return configured_kernel<CS, 2, FULL, F8, HKV, Q4>(device);
-        case 3: return configured_kernel<CS, 3, FULL, F8, HKV, Q4>(device);
-        case 4: return configured_kernel<CS, 4, FULL, F8, HKV, Q4>(device);
-        case 5: return configured_kernel<CS, 5, FULL, F8, HKV, Q4>(device);
-        case 6: return configured_kernel<CS, 6, FULL, F8, HKV, Q4>(device);
-        case 7: return configured_kernel<CS, 7, FULL, F8, HKV, Q4>(device);
-        default: return configured_kernel<CS, 8, FULL, F8, HKV, Q4>(device);
+        case 1: return configured_kernel<CS, 1, FULL, F8, HKV, Q4, KV12>(device);
+        case 2: return configured_kernel<CS, 2, FULL, F8, HKV, Q4, KV12>(device);
+        case 3: return configured_kernel<CS, 3, FULL, F8, HKV, Q4, KV12>(device);
+        case 4: return configured_kernel<CS, 4, FULL, F8, HKV, Q4, KV12>(device);
+        case 5: return configured_kernel<CS, 5, FULL, F8, HKV, Q4, KV12>(device);
+        case 6: return configured_kernel<CS, 6, FULL, F8, HKV, Q4, KV12>(device);
+        case 7: return configured_kernel<CS, 7, FULL, F8, HKV, Q4, KV12>(device);
+        default: return configured_kernel<CS, 8, FULL, F8, HKV, Q4, KV12>(device);
     }
 }
 
-template <bool FULL, bool F8 = false, int HKV = 8, bool Q4 = false>
+template <bool FULL, bool F8 = false, int HKV = 8, bool Q4 = false, bool KV12 = false>
 Kernel select(int M, int cs, int device) {
-    return cs == 16 ? select<16, FULL, F8, HKV, Q4>(M, device) : select<8, FULL, F8, HKV, Q4>(M, device);
+    return cs == 16 ? select<16, FULL, F8, HKV, Q4, KV12>(M, device) : select<8, FULL, F8, HKV, Q4, KV12>(M, device);
 }
 
 // attrs[0]: cluster of CS blocks; attrs[1]: programmatic dependent launch (the kernel waits with
@@ -524,7 +524,7 @@ void attn_decode(const DecodeArgs& a, cudaStream_t stream) {
                 a.conv_v_state && a.k_cache && a.v_cache && a.pos && a.workspace && a.out,
             "null argument");
     require(full || !a.cache_fp8, "float8_e4m3fn caches are supported on full layers (window = 0) only");
-    detail::check_q4(a);
+    detail::check_packed_cache(a);
     // device positions and loop bounds are int32; 2^30 leaves headroom for the tile strides
     require(a.cache_rows >= 1 && a.cache_rows <= (int64_t(1) << 30), "caches hold 1..2^30 positions");
     if (!full) {
@@ -560,6 +560,7 @@ void attn_decode(const DecodeArgs& a, cudaStream_t stream) {
     p.out = a.out;
     const auto select_heads = [&]<int HKV>() {
         if (!full) return select<false, false, HKV>(M, cs, device);
+        if (a.cache_kv12) return select<true, false, HKV, false, true>(M, cs, device);
         if (a.cache_q4) return select<true, false, HKV, true>(M, cs, device);
         return a.cache_fp8 ? select<true, true, HKV>(M, cs, device) : select<true, false, HKV>(M, cs, device);
     };
@@ -571,9 +572,9 @@ void attn_decode(const DecodeArgs& a, cudaStream_t stream) {
 
 namespace {
 
-template <int CS, bool Full, bool Fp8, int Hkv, bool Q4 = false>
+template <int CS, bool Full, bool Fp8, int Hkv, bool Q4 = false, bool KV12 = false>
 void launch_batch(BatchParams p, int batch, cudaStream_t stream, int device) {
-    constexpr auto kernel = attn_decode_batch_kernel<CS, Full, Fp8, Hkv, Q4>;
+    constexpr auto kernel = attn_decode_batch_kernel<CS, Full, Fp8, Hkv, Q4, KV12>;
     constexpr auto smem = Smem<CS, 1, Fp8, Q4>::BYTES;
     static thread_local int configured_device = -1;
     if (configured_device != device) {
@@ -600,7 +601,7 @@ void attn_decode_batch(const DecodeArgs& a, const BatchAttnSlot* slots, int batc
                 a.workspace && a.out,
             "null batch argument");
     require(a.cache_rows >= 1 && a.cache_rows <= (int64_t(1) << 30), "caches hold 1..2^30 positions");
-    detail::check_q4(a, true);
+    detail::check_packed_cache(a, true);
     require(full || (a.window == WIN && a.cache_rows == WIN && !a.cache_fp8), "invalid sliding cache");
 
     int device;
@@ -626,6 +627,7 @@ void attn_decode_batch(const DecodeArgs& a, const BatchAttnSlot* slots, int batc
     p.out = a.out;
     auto launch = [&]<int CS, int Hkv>() {
         if (!full) launch_batch<CS, false, false, Hkv>(packet, batch, stream, device);
+        else if (a.cache_kv12) launch_batch<CS, true, false, Hkv, false, true>(packet, batch, stream, device);
         else if (a.cache_q4) launch_batch<CS, true, false, Hkv, true>(packet, batch, stream, device);
         else if (a.cache_fp8) launch_batch<CS, true, true, Hkv>(packet, batch, stream, device);
         else launch_batch<CS, true, false, Hkv>(packet, batch, stream, device);

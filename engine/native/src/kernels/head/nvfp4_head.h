@@ -40,4 +40,8 @@ std::size_t nvfp4_candidate_workspace(int M, int rows);
 void head_nvfp4(const __nv_bfloat16* x, int M, Nvfp4Matrix w, float* logits, Candidate* candidates,
                 Candidate* scratch, bool pdl, cudaStream_t stream);
 
+// Certified head proxy. Writes both raw FP32 dots and a seed candidate per token.
+void head_nvfp4_raw(const __nv_bfloat16* x, int M, Nvfp4Matrix w, float* dots, Candidate* candidates,
+                    Candidate* scratch, cudaStream_t stream);
+
 }  // namespace ingine::kernels::head

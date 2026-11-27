@@ -8,6 +8,7 @@
 #include "kernels/draft/dflash2_selector.h"
 #include "kernels/draft/gemm.h"
 #include "kernels/draft/draft.h"
+#include "kernels/draft/shortlist.h"
 #include "kernels/head/nvfp4_head.h"
 
 #include <math_constants.h>
@@ -560,6 +561,7 @@ struct DFlash2::Impl {
   float *fp4_scratch = nullptr, *lattice = nullptr, *confidence = nullptr;
   int* tokens = nullptr;
   head::Nvfp4Matrix target_head;
+  kernels::draft::DFlash2DraftHead draft_head;
   DFlash2Head* sharded_head = nullptr;
   const Bf* embed = nullptr;
   const float* embed_norm = nullptr;
@@ -994,6 +996,14 @@ struct DFlash2::Impl {
     }
   }
 
+  void project_head(const Bf* hidden) {
+    const auto matrix = draft_head.matrix();
+    head::project_nvfp4(hidden, Proposals, H, matrix, unary, s);
+    kernels::draft::topk_candidates(unary, Proposals, matrix.rows, draft_head.token_ids(),
+                                    pool_values, pool_ids, top_workspace, s);
+    best16<<<Proposals, Threads, 0, s>>>(pool_values, pool_ids, top_values, top_ids);
+  }
+
   const Bf* forward(const Bf* embeds, const int* position = nullptr) {
     const int splits = attention_splits();
     const bool to_f32 = tp_size == 2 && shard_fp32;
@@ -1039,21 +1049,23 @@ __global__ void merge_head_candidates(const head::Candidate* gathered, int* ids,
 
 struct DFlash2Head::Impl {
   TpRuntime& tp;
-  head::Nvfp4Matrix matrix;
+  kernels::draft::DFlash2DraftHead draft_head;
   cudaStream_t stream;
   DeviceBuffer hidden{Proposals * H * sizeof(Bf)};
-  DeviceBuffer logits{std::size_t(Proposals) * matrix.rows * sizeof(float)};
+  DeviceBuffer logits{std::size_t(Proposals) * draft_head.matrix().rows * sizeof(float)};
   DeviceBuffer pool_values{Proposals * kernels::draft::CANDIDATES * sizeof(float)};
   DeviceBuffer pool_ids{Proposals * kernels::draft::CANDIDATES * sizeof(int)};
   DeviceBuffer top_values{HeadCandidates * sizeof(float)}, top_ids{HeadCandidates * sizeof(int)};
   DeviceBuffer local{HeadCandidates * sizeof(head::Candidate)}, gathered{2 * local.bytes};
-  DeviceBuffer workspace{kernels::draft::topk_workspace_bytes(Proposals, matrix.rows)};
+  DeviceBuffer workspace{kernels::draft::topk_workspace_bytes(Proposals, draft_head.matrix().rows)};
+
+  Impl(TpRuntime& tp_in, head::Nvfp4Matrix matrix, cudaStream_t s) : tp(tp_in), draft_head(matrix, s), stream(s) {}
 };
 
-DFlash2Head::DFlash2Head(TpRuntime& tp, head::Nvfp4Matrix matrix, cudaStream_t stream)
-    : impl_(std::make_unique<Impl>(tp, matrix, stream)) {
+DFlash2Head::DFlash2Head(TpRuntime& tp, head::Nvfp4Matrix matrix, cudaStream_t stream) {
   if (!matrix.codes || !matrix.scales)
     throw std::invalid_argument("DFlash2 sharded head requires --head-nvfp4");
+  impl_ = std::make_unique<Impl>(tp, matrix, stream);
   CUDA_CHECK(cudaMemsetAsync(impl_->workspace.p, 0, impl_->workspace.bytes, stream));
 }
 DFlash2Head::~DFlash2Head() = default;
@@ -1072,12 +1084,14 @@ void DFlash2Head::run(const Bf* hidden, bool replicated, bool run_merge) {
   auto* pool_ids = static_cast<int*>(d.pool_ids.p);
   auto* values = static_cast<float*>(d.top_values.p);
   auto* ids = static_cast<int*>(d.top_ids.p);
-  head::project_nvfp4(input, Proposals, H, d.matrix, logits, d.stream);
-  kernels::draft::topk_candidates(logits, Proposals, d.matrix.rows, nullptr,
+  const auto matrix = d.draft_head.matrix();
+  head::project_nvfp4(input, Proposals, H, matrix, logits, d.stream);
+  kernels::draft::topk_candidates(logits, Proposals, matrix.rows, d.draft_head.token_ids(),
                                    pool_values, pool_ids, d.workspace.p, d.stream);
   best16<<<Proposals, Threads, 0, d.stream>>>(pool_values, pool_ids, values, ids);
+  // A mapped shortlist already supplies global IDs and has v_begin == 0.
   pack_head_candidates<<<1, HeadCandidates, 0, d.stream>>>(
-      values, ids, d.matrix.v_begin, static_cast<head::Candidate*>(d.local.p));
+      values, ids, matrix.v_begin, static_cast<head::Candidate*>(d.local.p));
   d.tp.exchange_draft_head(d.local.p, d.local.bytes, d.gathered.p, d.stream);
   if (replicated ? run_merge : (hidden != nullptr))
     merge_head_candidates<<<1, Proposals, 0, d.stream>>>(
@@ -1102,14 +1116,17 @@ void DFlash2::bind_head(head::Nvfp4Matrix matrix, const Bf* embed, const float* 
   if (matrix.v_begin || matrix.rows < kernels::draft::CANDIDATES ||
       matrix.rows > Vocabulary || !matrix.codes || !matrix.scales)
     throw std::invalid_argument("DFlash2 requires the complete NVFP4 target head");
-  d.target_head = matrix;
   d.bind_embeddings(embed, embed_norm);
-  d.unary = d.allocate<float>(Proposals * matrix.rows);
+  d.target_head = matrix;
+  // Oracle dumps use full-vocabulary tensors with token IDs as row indices.
+  d.draft_head = kernels::draft::DFlash2DraftHead(matrix, d.s, d.dump_dir.empty());
+  const int rows = d.draft_head.matrix().rows;
+  d.unary = d.allocate<float>(Proposals * rows);
   d.pool_values = d.allocate<float>(Proposals * kernels::draft::CANDIDATES);
   d.pool_ids = d.allocate<int>(Proposals * kernels::draft::CANDIDATES);
   d.top_values = d.allocate<float>(Proposals * 16);
   d.top_ids = d.allocate<int>(Proposals * 16);
-  const auto bytes = kernels::draft::topk_workspace_bytes(Proposals, matrix.rows);
+  const auto bytes = kernels::draft::topk_workspace_bytes(Proposals, rows);
   d.top_workspace = d.allocate<std::byte>(bytes);
   CUDA_CHECK(cudaMemsetAsync(d.top_workspace, 0, bytes, d.s));
 }
@@ -1180,10 +1197,7 @@ const int* DFlash2::propose(int anchor, bool warming_up) {
     }
     if (d.sharded_head || !d.target_head.codes) return;
     d.profile.begin(DraftProfile::Head);
-    head::project_nvfp4(hidden, Proposals, H, d.target_head, d.unary, d.s);
-    kernels::draft::topk_candidates(d.unary, Proposals, d.target_head.rows, nullptr,
-                                    d.pool_values, d.pool_ids, d.top_workspace, d.s);
-    best16<<<Proposals, Threads, 0, d.s>>>(d.pool_values, d.pool_ids, d.top_values, d.top_ids);
+    d.project_head(hidden);
     d.profile.end();
     d.profile.begin(DraftProfile::Selector);
     select(d.top_ids, d.top_values, d.anchor_dev);
@@ -1420,10 +1434,7 @@ const int* DFlash2::propose_pair(DFlash2& rank0, DFlash2& rank1, int anchor, boo
   kernels::dense::embed(d0.ids, Block, d0.embed, d0.embed_norm, d0.embed_output, false, d0.s);
   convert<<<Block * H / Threads, Threads, 0, d0.s>>>(d0.embed_output, d0.embeddings, Block * H);
   const auto* hidden = forward_pair(rank0, rank1, d0.embeddings, fp32_reduce);
-  head::project_nvfp4(hidden, Proposals, H, d0.target_head, d0.unary, d0.s);
-  kernels::draft::topk_candidates(d0.unary, Proposals, d0.target_head.rows, nullptr,
-                                  d0.pool_values, d0.pool_ids, d0.top_workspace, d0.s);
-  best16<<<Proposals, Threads, 0, d0.s>>>(d0.pool_values, d0.pool_ids, d0.top_values, d0.top_ids);
+  d0.project_head(hidden);
   return rank0.select(d0.top_ids, d0.top_values, d0.anchor_dev);
 }
 

@@ -21,6 +21,7 @@ add_library(ingine_kernels_draft STATIC
   fold.cu
   gemm.cpp
   markov.cu
+  shortlist.cu
   ${_shortlist_cpp}
 )
 ingine_cuda_target(ingine_kernels_draft)

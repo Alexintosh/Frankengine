@@ -1,16 +1,20 @@
 // Prefill attention against an FP64 oracle of model.Model._attend (+ flex's sink factor and the output gate):
 // full-attention caches (BF16 and FP8 E4M3, keys past the relative extent), sliding rings (partially filled,
 // wrapped, a stale slot, chunks longer than the window), ring_gather / key_tile_bounds / ring_update.
+#include "kernels/common/kv12.cuh"
 #include "kernels/prefill/prefill.h"
+#include "model/tp_layout.h"
 #include "prefill/prefill_test.h"
 
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <vector>
 
 using namespace ingine::test;
 using namespace ingine::test::prefill;
+namespace kv12 = ingine::kernels::kv12;
 namespace pk = ingine::kernels::prefill;
 
 namespace {
@@ -120,8 +124,10 @@ bool run_attention(const char* name, const Inputs& in, const void* k_dev, const 
   const auto ref = oracle(in, K, V, kpos, window, stride, index);
   std::vector<float> got(index.size());
   for (size_t i = 0; i < index.size(); ++i) got[i] = bf16_val(got_bits[index[i]]);
-  // one BF16 rounding of the output (plus a rare flip of the rounded pre-gate value) and FP16 probabilities
-  return check_close(name, got, ref, 1.2e-2, 2e-4);
+  // one BF16 rounding of the output (plus a rare flip of the rounded pre-gate value) and FP16/FP8 probabilities
+  const char* fp8_env = std::getenv("INGINE_PREFILL_FP8_ATTN");
+  const bool fp8_mma = fp8 && window == 0 && !kpos_dev && (!fp8_env || !*fp8_env || std::atoi(fp8_env) != 0);
+  return check_close(name, got, ref, fp8_mma ? 2.5e-2 : 1.2e-2, fp8_mma ? 2.0e-3 : 2e-4);
 }
 
 bool full_case(Rng& rng, bool fp8, int pos0, int T) {
@@ -150,6 +156,76 @@ bool full_case(Rng& rng, bool fp8, int pos0, int T) {
   char name[96];
   std::snprintf(name, sizeof name, "full %s pos0=%d T=%d", fp8 ? "fp8" : "bf16", pos0, T);
   return run_attention(name, in, kd.get(), vd.get(), fp8, nullptr, nullptr, L, 0, K, V, kpos, 1);
+}
+
+void kv12_case(Rng& rng, int hkv) {
+  using namespace ingine::model;
+  const TpLayout tp(HK / hkv);
+  constexpr int prefix = 37, T = 71, L = prefix + T;
+  const int ld = tp.projection_rows(true), q_dim = tp.q_dim_local, kv_dim = tp.kv_dim_local;
+  const int k_base = tp.weight_offset(SEG_K), v_base = tp.weight_offset(SEG_V);
+  std::vector<std::uint16_t> input(std::size_t(L) * ld);
+  for (int t = 0; t < L; ++t) {
+    auto* row = input.data() + std::size_t(t) * ld;
+    for (int c = 0; c < 2 * q_dim; ++c) row[c] = bf16_bits(float(rng.uniform(-1.0, 1.0)));
+    for (int c = 0; c < kv_dim; ++c) {
+      // Alternate heads that can pack inline with heads that must use overflow.
+      const float value = t % 2 && c % D < 32 ? 0x1p-30f : 1.f;
+      row[k_base + c] = bf16_bits(value);
+      row[v_base + c] = bf16_bits(c % 2 ? value : -value);
+    }
+  }
+  DeviceArray<std::uint16_t> proj(input), q(L * q_dim), r(L * tp.hq_local * D_REL);
+  DeviceArray<std::uint16_t> rel(T * tp.hq_local * REL), ref(T * q_dim), out(T * q_dim);
+  DeviceArray<std::uint16_t> k_bf16(L * kv_dim), v_bf16(L * kv_dim);
+  DeviceArray<kv12::Head> k(L * hkv), v(L * hkv);
+  DeviceArray<kv12::Spill> ks(L * hkv), vs(L * hkv);
+  DeviceArray<float> scale(std::vector<float>(q_dim, 1.f)), weights(4 * kv_dim), state(3 * kv_dim);
+  pk::AttnPrepParams p;
+  p.full = true, p.hkv = hkv, p.ld = ld;
+  p.q_scale = p.r_scale = scale.get();
+  p.k_w = p.v_w = weights.get();
+  p.conv_k = p.conv_v = state.get();
+  for (int start : {0, prefix}) {
+    p.T = start == 0 ? prefix : T;
+    p.pos0 = start;
+    p.proj = reinterpret_cast<const __nv_bfloat16*>(proj.get() + start * ld);
+    p.q = reinterpret_cast<__nv_bfloat16*>(q.get() + start * q_dim);
+    p.rel = reinterpret_cast<__nv_bfloat16*>(r.get() + start * tp.hq_local * D_REL);
+    p.out_kv12 = false;
+    p.k_out = k_bf16.get() + start * kv_dim;
+    p.v_out = v_bf16.get() + start * kv_dim;
+    pk::attn_prep(p, nullptr);
+    p.out_kv12 = true;
+    p.k_out = k.get() + start * hkv;
+    p.v_out = v.get() + start * hkv;
+    p.k_scale_out = ks.get() + start * hkv;
+    p.v_scale_out = vs.get() + start * hkv;
+    pk::attn_prep(p, nullptr);
+  }
+  pk::AttnParams at;
+  at.q = p.q, at.proj = p.proj, at.ld = ld, at.hkv = hkv, at.T = T, at.L = L, at.pos0 = prefix;
+  at.rel = reinterpret_cast<const __nv_bfloat16*>(rel.get());
+  at.k = k_bf16.get(), at.v = v_bf16.get(), at.out = reinterpret_cast<__nv_bfloat16*>(ref.get());
+  pk::attention(at, nullptr);
+  at.k = k.get(), at.v = v.get(), at.k_scale = ks.get(), at.v_scale = vs.get(), at.kv_kv12 = true;
+  at.out = reinterpret_cast<__nv_bfloat16*>(out.get());
+  pk::attention(at, nullptr);
+  INGINE_TEST_CUDA(cudaDeviceSynchronize());
+  for (bool key : {false, true}) {
+    const auto bf16 = key ? k_bf16.download() : v_bf16.download();
+    const auto heads = key ? k.download() : v.download();
+    const auto spills = key ? ks.download() : vs.download();
+    for (std::size_t i = 0; i < heads.size(); ++i) {
+      INGINE_CHECK((reinterpret_cast<const uint8_t*>(&heads[i])[207] == 0) == (i / hkv % 2 != 0));
+      for (int c = 0; c < D / 8; ++c) {
+        std::uint32_t restored[4];
+        kv12::unpack8(heads[i], spills[i], c, restored);
+        INGINE_CHECK(std::memcmp(restored, bf16.data() + i * D + c * 8, sizeof(restored)) == 0);
+      }
+    }
+  }
+  INGINE_CHECK(out.download() == ref.download());
 }
 
 // Sliding visit: ring state before the chunk (ring_pos per slot), chunk keys, gathered rows.
@@ -239,6 +315,7 @@ int main() {
   ok &= full_case(rng, false, 1200, 77);
   ok &= full_case(rng, true, 1200, 77);
   ok &= full_case(rng, true, 3, 130);
+  for (int hkv : {HK, HK / 2}) kv12_case(rng, hkv);
   ok &= sliding_case(rng, 0, 50, false, 1);
   ok &= sliding_case(rng, 700, 300, false, 3);
   ok &= sliding_case(rng, 5000, 1100, true, 7);

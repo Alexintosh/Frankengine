@@ -26,6 +26,7 @@ ARGS=(
   --batch-spec-min "$BATCH_SPEC_MIN"
   --max-queue "$MAX_QUEUE"
   --park-mb "$PARK_MB"
+  --prefill-chunk "$PREFILL_CHUNK"
   --spec-widths "$SPEC_WIDTHS"
   --spec-threshold "$SPEC_THRESHOLD"
 )
@@ -39,6 +40,8 @@ else
   ARGS+=(--no-vision)
 fi
 [[ "$DENSE_FP8" == "1" ]] && ARGS+=(--dense-fp8)
+[[ "$DENSE_PICO12" == "1" ]] && ARGS+=(--dense-pico12)
+[[ "$CERT_HEAD" == "1" ]] && ARGS+=(--cert-head)
 [[ "$KV_FP8" == "1" ]] && ARGS+=(--kv-fp8)
 [[ "$KV_Q4" == "1" ]] && ARGS+=(--kv-q4)
 [[ "$HEAD_NVFP4" == "1" ]] && ARGS+=(--head-nvfp4)

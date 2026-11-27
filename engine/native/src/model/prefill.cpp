@@ -96,7 +96,7 @@ Prefiller::Prefiller(const Weights& w, const Ablation& abl, int max_chunk, cudaS
   }
   gin_ = rel_;
   gpre_ = fpre_ + C * H;
-  wscratch_ = w.dense_fp8 ? bf16(std::size_t(layout_.projection_rows(true)) * H) : nullptr;
+  wscratch_ = (w.dense_fp8 || w.dense_pico12) ? bf16(std::size_t(layout_.projection_rows(true)) * H) : nullptr;
   const char* fp8_env = std::getenv("INGINE_PREFILL_FP8_DENSE");
   fp8_dense_ = w.dense_fp8 && (!fp8_env || !*fp8_env || std::strtol(fp8_env, nullptr, 10) != 0);
   if (fp8_dense_) {
@@ -137,6 +137,14 @@ void Prefiller::run(State& st, const std::int32_t* tokens, int T, int pos0, floa
     const char* env = std::getenv("INGINE_PREFILL_OPT");
     return !env || !*env || std::strtol(env, nullptr, 10) != 0;
   }();
+  static const bool gate_fuse = [] {
+    const char* env = std::getenv("INGINE_PREFILL_GATE_FUSE");
+    return !env || !*env || std::strtol(env, nullptr, 10) != 0;
+  }();
+  const bool use_gate_fuse = optimize && gate_fuse;
+  auto* mixf_bf16 = reinterpret_cast<__nv_bfloat16*>(mixf_);
+  auto* msgs_bf16 = reinterpret_cast<__nv_bfloat16*>(msgs_);
+  auto* mixm_bf16 = reinterpret_cast<__nv_bfloat16*>(mixm_);
   std::array<int, NUM_SEGS + 1> offsets;
   for (int i = 0; i <= NUM_SEGS; ++i) offsets[i] = layout_.weight_offset(i);
   const cudaStream_t s = stream_;
@@ -180,10 +188,15 @@ void Prefiller::run(State& st, const std::int32_t* tokens, int T, int pos0, floa
       pk::conv_state_update(state, input, H, T, H, s);
     }
   };
-  // B rows of a Dense matrix as BF16: the matrix itself, or its FP8 rows dequantized (weights.dequant)
+  // GEMM consumes BF16 rows. Recover packed weights into per-visit scratch.
   auto bf16_rows = [&](const Dense& d) -> const __nv_bfloat16* {
-    if (!d.fp8()) return bf16p(d.w);
-    dense::dequant_rows(d.w.data, f32p(d.scale), d.rows(), d.cols(), wscratch_, s);
+    if (d.is_pico12) {
+      dense::unpack_pico12_rows(d.matrix(), d.rows(), wscratch_, s);
+    } else if (d.fp8()) {
+      dense::dequant_rows(d.w.data, f32p(d.scale), d.rows(), d.cols(), wscratch_, s);
+    } else {
+      return bf16p(d.w);
+    }
     return wscratch_;
   };
   // message_gate for G gates: h_g, msg_g fp32 [T, H] -> out bf16 [G, T, H] = bf16(rms_norm(gated) * norm_w[g])
@@ -193,12 +206,35 @@ void Prefiller::run(State& st, const std::int32_t* tokens, int T, int pos0, floa
     for (int g = 0; g < G; ++g) {
       const __nv_bfloat16* gd = bf16p(down) + std::size_t(g) * GATE_RANK * 2 * H;
       gemm_->run(gin_ + std::size_t(g) * T * 2 * H, 2 * H, gd, 2 * H, g16_, GATE_RANK, false, T, GATE_RANK, 2 * H, s);
-      gemm_->run(g16_, GATE_RANK, bf16p(forget16) + std::size_t(g) * H * GATE_RANK, GATE_RANK, fpre_, H, true, T, H,
-                 GATE_RANK, s);
-      gemm_->run(g16_, GATE_RANK, bf16p(gain16) + std::size_t(g) * H * GATE_RANK, GATE_RANK, gpre_, H, true, T, H,
-                 GATE_RANK, s);
-      pk::gate_apply(rows.h[g], rows.msg[g], fpre_, gpre_, norm_w + std::size_t(g) * H, T, out + std::size_t(g) * slab,
-                     s);
+      if (optimize) {
+        auto* fb = reinterpret_cast<__nv_bfloat16*>(fpre_);
+        auto* gb = reinterpret_cast<__nv_bfloat16*>(gpre_);
+        gemm_->run(g16_, GATE_RANK, bf16p(forget16) + std::size_t(g) * H * GATE_RANK, GATE_RANK, fb, H, false, T, H,
+                   GATE_RANK, s);
+        gemm_->run(g16_, GATE_RANK, bf16p(gain16) + std::size_t(g) * H * GATE_RANK, GATE_RANK, gb, H, false, T, H,
+                   GATE_RANK, s);
+        pk::gate_apply_bf16(rows.h[g], rows.msg[g], fb, gb, norm_w + std::size_t(g) * H, T,
+                            out + std::size_t(g) * slab, s);
+      } else {
+        gemm_->run(g16_, GATE_RANK, bf16p(forget16) + std::size_t(g) * H * GATE_RANK, GATE_RANK, fpre_, H, true, T, H,
+                   GATE_RANK, s);
+        gemm_->run(g16_, GATE_RANK, bf16p(gain16) + std::size_t(g) * H * GATE_RANK, GATE_RANK, gpre_, H, true, T, H,
+                   GATE_RANK, s);
+        pk::gate_apply(rows.h[g], rows.msg[g], fpre_, gpre_, norm_w + std::size_t(g) * H, T,
+                       out + std::size_t(g) * slab, s);
+      }
+    }
+  };
+
+  auto gates_bf16 = [&](const pk::GateRowsBf16& rows, int G, const Tensor& down, const Tensor& forget16,
+                        const Tensor& gain16, const float* norm_w, __nv_bfloat16* out) {
+    pk::gate_inputs_bf16(rows, G, T, gin_, s);
+    for (int g = 0; g < G; ++g) {
+      const __nv_bfloat16* gd = bf16p(down) + std::size_t(g) * GATE_RANK * 2 * H;
+      gemm_->run(gin_ + std::size_t(g) * T * 2 * H, 2 * H, gd, 2 * H, g16_, GATE_RANK, false, T, GATE_RANK, 2 * H, s);
+      pk::gate_fg_apply_bf16(g16_, bf16p(forget16) + std::size_t(g) * H * GATE_RANK,
+                             bf16p(gain16) + std::size_t(g) * H * GATE_RANK, rows.h[g], rows.msg[g],
+                             norm_w + std::size_t(g) * H, T, out + std::size_t(g) * slab, s);
     }
   };
 
@@ -241,7 +277,8 @@ void Prefiller::run(State& st, const std::int32_t* tokens, int T, int pos0, floa
       const float* src_base = i == 0 ? part_ : E_[p - 1];
       const float* src_write = i == 0 ? y2_ : nullptr;
       msg_mix = mix_params({B2_[p - 1]}, src_base, src_write, r_prev, w_prev, i == 0 ? E_[p - 1] : nullptr,
-                           f32p(w.message_queries) + std::size_t(i) * 4 * H, 4, nullptr, nullptr, msgs_);
+                           f32p(w.message_queries) + std::size_t(i) * 4 * H, 4, nullptr,
+                           use_gate_fuse ? msgs_bf16 : nullptr, use_gate_fuse ? nullptr : msgs_);
       if (i == 0) write = nullptr;
     }
     // ---- attention read(s)
@@ -249,7 +286,8 @@ void Prefiller::run(State& st, const std::int32_t* tokens, int T, int pos0, floa
     const int nq = layer.attn_query.data ? layer.attn_query.ne[1] : 1;
     float* partial_out = hid != base ? hid : nullptr;
     dense::MixParams attn_mix =
-        msgs ? mix_params(blocks, base, write, r_prev, w_prev, partial_out, queries, nq, nullptr, nullptr, mixf_)
+        msgs ? mix_params(blocks, base, write, r_prev, w_prev, partial_out, queries, nq, nullptr,
+                          use_gate_fuse ? mixf_bf16 : nullptr, use_gate_fuse ? nullptr : mixf_)
              : mix_params(blocks, base, write, r_prev, w_prev, partial_out, l > 0 ? queries : nullptr, l > 0 ? nq : 1,
                           f32p(layer.attn_norm_mix), xin_, nullptr);
     const bool tap_visit = tap < 3 && v == TAP_VISITS[tap];
@@ -265,10 +303,18 @@ void Prefiller::run(State& st, const std::int32_t* tokens, int T, int pos0, floa
       dense::mix(attn_mix, false, s);
     }
     if (msgs) {
-      pk::GateRows rows;
-      for (int g = 0; g < 3; ++g) rows.h[g] = mixf_ + (layer.full ? g : 0) * slab, rows.msg[g] = msgs_ + g * slab;
-      gates(rows, 3, layer.qkv_gate_down, layer.qkv_gate_forget16, layer.qkv_gate_gain16, f32p(layer.attn_norm3),
-            xin_);
+      if (use_gate_fuse) {
+        pk::GateRowsBf16 rows;
+        for (int g = 0; g < 3; ++g)
+          rows.h[g] = mixf_bf16 + (layer.full ? g : 0) * slab, rows.msg[g] = msgs_bf16 + g * slab;
+        gates_bf16(rows, 3, layer.qkv_gate_down, layer.qkv_gate_forget16, layer.qkv_gate_gain16,
+                   f32p(layer.attn_norm3), xin_);
+      } else {
+        pk::GateRows rows;
+        for (int g = 0; g < 3; ++g) rows.h[g] = mixf_ + (layer.full ? g : 0) * slab, rows.msg[g] = msgs_ + g * slab;
+        gates(rows, 3, layer.qkv_gate_down, layer.qkv_gate_forget16, layer.qkv_gate_gain16, f32p(layer.attn_norm3),
+              xin_);
+      }
     }
     if (tap_visit) {
       if (!optimize && tap_out) pk::store_tap(hid, T, tap_out + std::size_t(tap) * H, std::int64_t(NUM_TAPS) * H, s);
@@ -340,10 +386,11 @@ void Prefiller::run(State& st, const std::int32_t* tokens, int T, int pos0, floa
       const std::size_t off = std::size_t(pos0) * k.nb[2];
       void* kc = k.data;
       void* vc = value.data;
-      if (st.kv_q4) {
+      if (st.kv_q4 || st.kv_12) {
         const Tensor ks = st.k_full_scale_at(fi), vs = st.v_full_scale_at(fi);
         const std::size_t scale_off = std::size_t(pos0) * ks.nb[2];
-        ap.out_q4 = at.kv_q4 = true;
+        ap.out_q4 = at.kv_q4 = st.kv_q4;
+        ap.out_kv12 = at.kv_kv12 = st.kv_12;
         ap.k_scale_out = ptr<char>(ks) + scale_off;
         ap.v_scale_out = ptr<char>(vs) + scale_off;
         at.k_scale = ks.data;
@@ -359,7 +406,9 @@ void Prefiller::run(State& st, const std::int32_t* tokens, int T, int pos0, floa
       auto* v_ring = static_cast<__nv_bfloat16*>(st.v_ring_at(ri).data);
       std::int64_t* ring_pos = st.ring_pos_at(ri);
       // keys = cat(ring, chunk) as model.prefill reads them, before the ring takes the chunk's last rows
-      pk::ring_gather(k_ring, v_ring, ring_pos, pos0, T, krows_, vrows_, kpos_, kpos_rows_, s, layout_.hkv_local, st.k_ring_at(ri).ne[2]);
+      ap.v_fp16 = at.v_fp16 = optimize;
+      pk::ring_gather(k_ring, v_ring, ring_pos, pos0, T, krows_, vrows_, kpos_, kpos_rows_, s, layout_.hkv_local,
+                      st.k_ring_at(ri).ne[2], ap.v_fp16);
       ap.k_out = krows_ + std::size_t(WINDOW) * kv, ap.v_out = vrows_ + std::size_t(WINDOW) * kv;
       ap.out_fp8 = false;
       if (optimize) {
@@ -387,7 +436,7 @@ void Prefiller::run(State& st, const std::int32_t* tokens, int T, int pos0, floa
     // ---- output projection + post-attention conv
     const bool wo_fp32 = tp_ && !tp_->bf16_wire(2 * v);
     void* wo_product = wo_fp32 ? static_cast<void*>(partial_) : wo_out_;
-    static const bool fp8_wo = []{ const char* e = std::getenv("INGINE_PREFILL_FP8_WO"); return e && *e && std::strtol(e, nullptr, 10) != 0; }();
+    static const bool fp8_wo = []{ const char* e = std::getenv("INGINE_PREFILL_FP8_WO"); return !e || !*e || std::strtol(e, nullptr, 10) != 0; }();
     if (fp8_dense_ && fp8_wo && T >= 64 && layer.wo.fp8()) {
       pk::quantize_fp8_rows(attn_out_, q, T, q, xq_, x_scale_, s);
       pk::fp8_dense_gemm(xq_, x_scale_, q, layer.wo.w.data, f32p(layer.wo.scale), q, wo_product, H, wo_fp32, T, H, q, s);
@@ -403,12 +452,21 @@ void Prefiller::run(State& st, const std::int32_t* tokens, int T, int pos0, floa
     if (boundary) mlp_blocks.push_back(hid);
     const float* mbase = boundary ? nullptr : hid;
     if (msgs) {
-      dense::mix(mix_params(mlp_blocks, mbase, y_, attn_dirs + std::size_t(v) * H, attn_w + 4 * std::size_t(v), part_,
-                            f32p(layer.mlp_query), 1, nullptr, nullptr, mixm_), false, s);
-      pk::GateRows rows;
-      rows.h[0] = mixm_, rows.msg[0] = msgs_ + 3 * slab;
-      gates(rows, 1, layer.mlp1_gate_down, layer.mlp1_gate_forget16, layer.mlp1_gate_gain16, f32p(layer.mlp_norm1),
-            xm_);
+      if (use_gate_fuse) {
+        dense::mix(mix_params(mlp_blocks, mbase, y_, attn_dirs + std::size_t(v) * H, attn_w + 4 * std::size_t(v), part_,
+                              f32p(layer.mlp_query), 1, nullptr, mixm_bf16, nullptr), false, s);
+        pk::GateRowsBf16 rows;
+        rows.h[0] = mixm_bf16, rows.msg[0] = msgs_bf16 + 3 * slab;
+        gates_bf16(rows, 1, layer.mlp1_gate_down, layer.mlp1_gate_forget16, layer.mlp1_gate_gain16,
+                   f32p(layer.mlp_norm1), xm_);
+      } else {
+        dense::mix(mix_params(mlp_blocks, mbase, y_, attn_dirs + std::size_t(v) * H, attn_w + 4 * std::size_t(v), part_,
+                              f32p(layer.mlp_query), 1, nullptr, nullptr, mixm_), false, s);
+        pk::GateRows rows;
+        rows.h[0] = mixm_, rows.msg[0] = msgs_ + 3 * slab;
+        gates(rows, 1, layer.mlp1_gate_down, layer.mlp1_gate_forget16, layer.mlp1_gate_gain16, f32p(layer.mlp_norm1),
+              xm_);
+      }
     } else {
       dense::mix(mix_params(mlp_blocks, mbase, y_, attn_dirs + std::size_t(v) * H, attn_w + 4 * std::size_t(v), part_,
                             f32p(layer.mlp_query), 1, f32p(layer.mlp_norm1), xm_, nullptr), false, s);
@@ -457,7 +515,8 @@ void Prefiller::run(State& st, const std::int32_t* tokens, int T, int pos0, floa
   else if (w.unembed_nvfp4.codes)
     kernels::head::head_nvfp4(final_x, 1, w.unembed_nvfp4, logits, nullptr, nullptr, false, s);
   else
-    pk::head_logits(final_x, w.unembed.w.data, f32p(w.unembed.scale), UNPADDED_VOCAB, logits, s);
+    pk::head_logits(final_x, w.unembed.w.data, f32p(w.unembed.scale), UNPADDED_VOCAB, logits, s,
+                    w.unembed.matrix().pico12);
   CUDA_CHECK(cudaGetLastError());
 }
 

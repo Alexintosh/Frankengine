@@ -1,6 +1,6 @@
 // mix: ablated residual update + attention residual over block states + weighted RMS norm.
 //
-// Design. Latency-bound (a few 9 KB vectors per token), so one CTA per token whose threads own a few channel
+// Decode uses one CTA per token whose threads own a few channel
 // quads each (one float4 of every state, query and output per quad: coalesced 16-byte accesses, states live
 // in registers for the whole kernel). At most three block reductions, each a warp stage + one shared round
 // with a single barrier: (1) r . write for the ablation, (2) for every state i its sum of squares and the
@@ -19,6 +19,7 @@
 // kernel (checked byte for byte against it over all state/query counts, M = 1, 2, 3, 8): same expressions
 // and the same order of every FP32 sum (see REF_W below); changed are the thread count, the barriers, what
 // is loaded before the PDL wait, and the side outputs.
+// Bulk prefill reuses the constants across four rows per CTA and distributes the state softmax across lanes.
 #include "kernels/dense/cluster.cuh"
 #include "kernels/dense/dense.cuh"
 #include "kernels/dense/dense.h"
@@ -28,14 +29,13 @@ namespace {
 
 // The arithmetic is that of the reference kernel (576 threads, thread = one channel quad): every block sum
 // adds the per-quad terms of each of its 18 warps with a 32-lane butterfly, then the 18 warp sums in warp
-// order. Here a thread owns MIX_V quads, t + u * MIX_T (the same lane of reference warp w + u * MIX_W), so
-// the same butterflies run once per u and the totals are bit-identical for any MIX_T dividing 576 by 32s.
-constexpr int REF_W = H / 4 / 32;      // 18 reference warps
-constexpr int MIX_T = 192;             // threads per token
-constexpr int MIX_W = MIX_T / 32;
-constexpr int MIX_V = REF_W / MIX_W;   // channel quads per thread
-static_assert(MIX_T % 32 == 0 && MIX_V * MIX_W == REF_W, "MIX_T must split the 18 reference warps evenly");
+// order. A thread owns quads t + u * THREADS (the same lane of reference warp w + u * THREADS / 32).
+constexpr int REF_W = H / 4 / 32;
+constexpr int MIX_T = 192;
+constexpr int BULK_T = 288;
 constexpr int MAXB = 5, MAXQ = 4;
+constexpr int BULK_MIN_ROWS = 256;
+constexpr int BULK_ROWS = 4;
 
 struct MixArgs {
   const float* const* blocks;  // NS - 1 device pointers, each [M, H]
@@ -46,7 +46,7 @@ struct MixArgs {
   const float* abl_w;  // [4]: weight, offset, floor, detector threshold
   float* partial;      // [M, H] or null
   const float* queries;  // [Q, H]
-  const float* norm_w;   // [Q, H] (needed with out_bf16)
+  const float* norm_w;   // [Q, H] or null (direct BF16 conversion)
   __nv_bfloat16* out_bf16;  // [Q, M, H] or null
   float* out_f32;           // [Q, M, H] or null
   __nv_bfloat16* new_bf16;  // row m at + m * new_bf16_stride, or null
@@ -76,14 +76,14 @@ __device__ __forceinline__ void store_bf16x4(__nv_bfloat16* p, float4 v) {
 }
 
 // Block sum of N per-quad values in two steps. sum_part: the warp stage for this thread's quad `u`, i.e.
-// reference warp w + u * MIX_W (butterflies, or the transposing reduce_scatter for N >= 6: the same
+// reference warp w + u * THREADS / 32 (butterflies, or the transposing reduce_scatter for N >= 6: the same
 // additions), stored in `scratch` ([REF_W * block_sum_slots<N>()]). sum_total: one barrier, then lane i adds
 // the 18 warp sums of value i in warp order and the totals are broadcast by shuffles (no second barrier;
 // `scratch` belongs to one reduction).
-template <int N>
+template <int THREADS, int N>
 __device__ __forceinline__ void sum_part(float (&v)[N], float* scratch, int u) {
   constexpr int S = block_sum_slots<N>();
-  const int lane = threadIdx.x & 31, rw = (threadIdx.x >> 5) + u * MIX_W;
+  const int lane = threadIdx.x & 31, rw = (threadIdx.x >> 5) + u * (THREADS / 32);
   if constexpr (S == N) {
 #pragma unroll
     for (int i = 0; i < N; ++i) v[i] = group_sum<32>(v[i]);
@@ -96,7 +96,7 @@ __device__ __forceinline__ void sum_part(float (&v)[N], float* scratch, int u) {
   }
 }
 template <int N>
-__device__ __forceinline__ void sum_total(float (&out)[N], const float* scratch) {
+__device__ __forceinline__ float sum_lane(const float* scratch) {
   constexpr int S = block_sum_slots<N>();
   __syncthreads();
   const int lane = threadIdx.x & 31;
@@ -105,38 +105,43 @@ __device__ __forceinline__ void sum_total(float (&out)[N], const float* scratch)
 #pragma unroll
     for (int w = 0; w < REF_W; ++w) s += scratch[w * S + lane];
   }
+  return s;
+}
+template <int N>
+__device__ __forceinline__ void sum_total(float (&out)[N], const float* scratch) {
+  const float s = sum_lane<N>(scratch);
 #pragma unroll
   for (int i = 0; i < N; ++i) out[i] = __shfl_sync(0xffffffffu, s, i);
 }
 
-// The mix of token m. NS = states in the mix (blocks + new), Q = queries; NS == 1 && Q == 1 is the layer-0
-// path (no mix). red1/red2/red3: block sum scratch, [REF_W * block_sum_slots<N>()] for N = 2, NS + Q NS, Q.
-// COPIES: the call has side row copies (a.copies); without, the kernel carries no code for them.
-template <int NS, int Q, bool COPIES>
-__device__ __forceinline__ void mix_token(const MixArgs& a, int m, float* red1, float* red2, float* red3) {
-  constexpr bool SKIP = NS == 1 && Q == 1;
-  constexpr int NV = NS + Q * NS;  // sums of squares + query dots
-  const int t = threadIdx.x;
-  const size_t row = size_t(m) * H;
-  auto ld4 = [](const float* p) { return *reinterpret_cast<const float4*>(p); };
-  auto ch = [t](int u) { return 4 * (t + u * MIX_T); };
-
-  // constants (queries, ablation direction and weight, norm weights, block pointers) before the PDL wait;
-  // states after it
-  float4 s[NS][MIX_V], q[Q][MIX_V], r4[MIX_V], dt4[MIX_V], g4[Q][MIX_V];
+template <int NS, int Q, int THREADS>
+struct MixWeights {
+  static_assert(THREADS % 32 == 0 && H / 4 % THREADS == 0);
+  static constexpr int QUADS = H / 4 / THREADS;
+  float4 q[Q][QUADS], r4[QUADS], dt4[QUADS], g4[Q][QUADS];
   const float* bp[NS > 1 ? NS - 1 : 1];
+  float aw, ac, alo, atau;
+};
+
+// Each thread keeps its channel quads of the weights in registers across the CTA's rows.
+template <bool RAW, int NS, int Q, int THREADS>
+__device__ __forceinline__ void load_mix_weights(const MixArgs& a, MixWeights<NS, Q, THREADS>& w) {
+  const int t = threadIdx.x;
+  auto ld4 = [](const float* p) { return *reinterpret_cast<const float4*>(p); };
+  auto ch = [t](int u) { return 4 * (t + u * THREADS); };
+  auto& [q, r4, dt4, g4, bp, aw, ac, alo, atau] = w;
 #pragma unroll
   for (int i = 0; i < NS - 1; ++i) bp[i] = a.blocks[i];
-  float aw = 0.f, ac = 0.f, alo = 0.f, atau = 0.f;
+  aw = 0.f, ac = 0.f, alo = 0.f, atau = 0.f;
 #pragma unroll
-  for (int u = 0; u < MIX_V; ++u) {
-    if constexpr (!SKIP) {
+  for (int u = 0; u < w.QUADS; ++u) {
+    if constexpr (NS != 1 || Q != 1) {
 #pragma unroll
       for (int j = 0; j < Q; ++j) q[j][u] = ld4(a.queries + size_t(j) * H + ch(u));
     }
     r4[u] = a.abl_r ? ld4(a.abl_r + ch(u)) : make_float4(0.f, 0.f, 0.f, 0.f);
     dt4[u] = a.abl_d ? ld4(a.abl_d + ch(u)) : make_float4(0.f, 0.f, 0.f, 0.f);
-    if (a.out_bf16) {
+    if (!RAW && a.out_bf16 && a.norm_w) {
 #pragma unroll
       for (int j = 0; j < Q; ++j) g4[j][u] = ld4(a.norm_w + size_t(j) * H + ch(u));
     }
@@ -145,13 +150,42 @@ __device__ __forceinline__ void mix_token(const MixArgs& a, int m, float* red1, 
     const float4 ap = __ldg(reinterpret_cast<const float4*>(a.abl_w));
     aw = ap.x, ac = ap.y, alo = ap.z, atau = ap.w;
   }
+}
 
-  pdl_wait_fenced(a.zero);  // keeps the constant loads above ahead of the wait
-  pdl_trigger();
+// Each lane handles one state's softmax term. Visit the terms in the original state order for the max
+// and denominator. The returned probability is used only from the first NS lanes.
+template <int NS>
+__device__ __forceinline__ float mix_probability(float sum, float rinv, int state, int j) {
+  constexpr unsigned warp = 0xffffffffu;
+  const float logit = __shfl_sync(warp, sum, NS + j * NS + state) * rinv * (1.f / 48.f);
+  float mx = -INFINITY;
+#pragma unroll
+  for (int i = 0; i < NS; ++i) mx = fmaxf(mx, __shfl_sync(warp, logit, i));
+  const float e = expf(logit - mx);
+  float den = 0.f;
+#pragma unroll
+  for (int i = 0; i < NS; ++i) den += __shfl_sync(warp, e, i);
+  return e / den;
+}
+
+// NS = states in the mix (blocks + new), Q = queries; NS == 1 && Q == 1 skips mixing.
+// red1/red2/red3: [REF_W * block_sum_slots<N>()] for N = 2, NS + Q NS, Q.
+template <bool COPIES, bool BULK, bool RAW, int NS, int Q, int THREADS>
+__device__ __forceinline__ void mix_row(const MixArgs& a, const MixWeights<NS, Q, THREADS>& w, int m, float* red1,
+                                       float* red2, float* red3) {
+  constexpr bool SKIP = NS == 1 && Q == 1;
+  constexpr int NV = NS + Q * NS;  // sums of squares + query dots
+  constexpr int QUADS = MixWeights<NS, Q, THREADS>::QUADS;
+  const auto& [q, r4, dt4, g4, bp, aw, ac, alo, atau] = w;
+  const int t = threadIdx.x;
+  const size_t row = size_t(m) * H;
+  auto ld4 = [](const float* p) { return *reinterpret_cast<const float4*>(p); };
+  auto ch = [t](int u) { return 4 * (t + u * THREADS); };
+  float4 s[NS][QUADS];
   // side copies: their loads are issued first and fly during the mix; the stores come after the states'
   // loads below. (A store waits for its value: stores ahead of the state loads put a round trip in front of
   // them, measured +0.7 us per mix with two copies.) CPT 16-byte pieces per thread and copy are held in
-  // registers (rows up to CPT * MIX_T * 4 floats); longer rows finish with a plain loop.
+  // registers (rows up to CPT * THREADS * 4 floats); longer rows finish with a plain loop.
   constexpr int CPT = 2;
   uint4 cv[2][CPT];
   if constexpr (COPIES) {
@@ -162,12 +196,12 @@ __device__ __forceinline__ void mix_token(const MixArgs& a, int m, float* red1, 
       const float* src = cp.src + m * cp.src_stride;
 #pragma unroll
       for (int j = 0; j < CPT; ++j)
-        if (t + j * MIX_T < cp.cols / 4) cv[c][j] = ld_act(src + 4 * (t + j * MIX_T));
+        if (t + j * THREADS < cp.cols / 4) cv[c][j] = ld_act(src + 4 * (t + j * THREADS));
     }
   }
-  float4 nw[MIX_V], y[MIX_V];
+  float4 nw[QUADS], y[QUADS];
 #pragma unroll
-  for (int u = 0; u < MIX_V; ++u) {
+  for (int u = 0; u < QUADS; ++u) {
 #pragma unroll
     for (int i = 0; i < NS - 1; ++i) s[i][u] = ld4(bp[i] + row + ch(u));
     nw[u] = a.base ? ld4(a.base + row + ch(u)) : make_float4(0.f, 0.f, 0.f, 0.f);
@@ -182,8 +216,8 @@ __device__ __forceinline__ void mix_token(const MixArgs& a, int m, float* red1, 
       float4* dst = reinterpret_cast<float4*>(cp.dst + m * cp.dst_stride);
 #pragma unroll
       for (int j = 0; j < CPT; ++j)
-        if (t + j * MIX_T < cp.cols / 4) *reinterpret_cast<uint4*>(dst + t + j * MIX_T) = cv[c][j];
-      for (int k = t + CPT * MIX_T; k < cp.cols / 4; k += MIX_T) dst[k] = src[k];
+        if (t + j * THREADS < cp.cols / 4) *reinterpret_cast<uint4*>(dst + t + j * THREADS) = cv[c][j];
+      for (int k = t + CPT * THREADS; k < cp.cols / 4; k += THREADS) dst[k] = src[k];
     }
   }
 
@@ -195,65 +229,72 @@ __device__ __forceinline__ void mix_token(const MixArgs& a, int m, float* red1, 
       float c;
       if (a.abl_d) {
 #pragma unroll
-        for (int u = 0; u < MIX_V; ++u) {
+        for (int u = 0; u < QUADS; ++u) {
           float d[2] = {dot4(y[u], r4[u]), dot4(y[u], dt4[u])};
-          sum_part(d, red1, u);
+          sum_part<THREADS>(d, red1, u);
         }
         float d[2];
         sum_total(d, red1);
         c = d[1] > atau ? aw * fmaxf(d[0] - ac, alo) : 0.f;
       } else {
 #pragma unroll
-        for (int u = 0; u < MIX_V; ++u) {
+        for (int u = 0; u < QUADS; ++u) {
           float d[1] = {dot4(y[u], r4[u])};
-          sum_part(d, red1, u);
+          sum_part<THREADS>(d, red1, u);
         }
         float d[1];
         sum_total(d, red1);
         c = aw * fmaxf(d[0] - ac, alo);
       }
 #pragma unroll
-      for (int u = 0; u < MIX_V; ++u) {
+      for (int u = 0; u < QUADS; ++u) {
         const float4 r = r4[u];
         y[u] = make_float4(y[u].x - c * r.x, y[u].y - c * r.y, y[u].z - c * r.z, y[u].w - c * r.w);
       }
     }
 #pragma unroll
-    for (int u = 0; u < MIX_V; ++u) {
+    for (int u = 0; u < QUADS; ++u) {
       if (a.base) nw[u] = make_float4(nw[u].x + y[u].x, nw[u].y + y[u].y, nw[u].z + y[u].z, nw[u].w + y[u].w);
       else nw[u] = y[u];
     }
   }
 #pragma unroll
-  for (int u = 0; u < MIX_V; ++u) {
+  for (int u = 0; u < QUADS; ++u) {
     if (a.partial) *reinterpret_cast<float4*>(a.partial + row + ch(u)) = nw[u];
     if (a.new_bf16) store_bf16x4(a.new_bf16 + m * a.new_bf16_stride + ch(u), nw[u]);
   }
 
   if constexpr (SKIP) {
+    float rinv = 0.f;
+    if (!BULK || (!RAW && a.norm_w)) {
 #pragma unroll
-    for (int u = 0; u < MIX_V; ++u) {
-      float ss[1] = {sumsq4(nw[u])};
-      sum_part(ss, red3, u);
+      for (int u = 0; u < QUADS; ++u) {
+        float ss[1] = {sumsq4(nw[u])};
+        sum_part<THREADS>(ss, red3, u);
+      }
+      float ss[1];
+      sum_total(ss, red3);
+      rinv = rsqrtf(ss[0] / H + EPS);
     }
-    float ss[1];
-    sum_total(ss, red3);
-    const float rinv = rsqrtf(ss[0] / H + EPS);
 #pragma unroll
-    for (int u = 0; u < MIX_V; ++u) {
+    for (int u = 0; u < QUADS; ++u) {
       if (a.out_f32) *reinterpret_cast<float4*>(a.out_f32 + row + ch(u)) = nw[u];
       if (a.out_bf16) {
-        const float4 g = g4[0][u];
-        const float4 n = scale4(nw[u], rinv);
-        const float4 o = make_float4(n.x * g.x, n.y * g.y, n.z * g.z, n.w * g.w);
-        store_bf16x4(a.out_bf16 + row + ch(u), o);
-        if (a.out_copy) store_bf16x4(a.out_copy + m * a.out_copy_stride + ch(u), o);
+        if (!RAW && a.norm_w) {
+          const float4 g = g4[0][u];
+          const float4 n = scale4(nw[u], rinv);
+          const float4 o = make_float4(n.x * g.x, n.y * g.y, n.z * g.z, n.w * g.w);
+          store_bf16x4(a.out_bf16 + row + ch(u), o);
+          if (a.out_copy) store_bf16x4(a.out_copy + m * a.out_copy_stride + ch(u), o);
+        } else {
+          store_bf16x4(a.out_bf16 + row + ch(u), nw[u]);
+        }
       }
     }
     return;
   } else {
 #pragma unroll
-    for (int u = 0; u < MIX_V; ++u) {
+    for (int u = 0; u < QUADS; ++u) {
       s[NS - 1][u] = nw[u];
       float p[NV];
 #pragma unroll
@@ -262,40 +303,52 @@ __device__ __forceinline__ void mix_token(const MixArgs& a, int m, float* red1, 
 #pragma unroll
         for (int j = 0; j < Q; ++j) p[NS + j * NS + i] = dot4(q[j][u], s[i][u]);
       }
-      sum_part(p, red2, u);
+      sum_part<THREADS>(p, red2, u);
     }
-    float v[NV];
-    sum_total(v, red2);
-
+    constexpr unsigned warp = 0xffffffffu;
+    const int lane = t & 31;
+    const int state = lane < NS ? lane : 0;
+    float v[NV], sum, rinv_lane;
+    if constexpr (BULK) {
+      sum = sum_lane<NV>(red2);
+      rinv_lane = rsqrtf(__shfl_sync(warp, sum, state) / H + EPS);
+    } else {
+      sum_total(v, red2);
+    }
     float rinv[NS];
 #pragma unroll
     for (int i = 0; i < NS; ++i) {
-      rinv[i] = rsqrtf(v[i] / H + EPS);
+      const float r = BULK ? __shfl_sync(warp, rinv_lane, i) : rsqrtf(v[i] / H + EPS);
+      if constexpr (!BULK) rinv[i] = r;
 #pragma unroll
-      for (int u = 0; u < MIX_V; ++u) s[i][u] = scale4(s[i][u], rinv[i]);  // n_i
+      for (int u = 0; u < QUADS; ++u) s[i][u] = scale4(s[i][u], r);  // n_i
     }
     const float inv_sqrt_h = 1.f / 48.f;  // H ** -0.5
-    float4 mix[Q][MIX_V];
+    float4 mix[Q][QUADS];
 #pragma unroll
     for (int j = 0; j < Q; ++j) {
-      float lg[NS], mx = -INFINITY;
+      float lg[NS], den = 0.f, p_lane;
+      if constexpr (BULK) {
+        p_lane = mix_probability<NS>(sum, rinv_lane, state, j);
+      } else {
+        float mx = -INFINITY;
 #pragma unroll
-      for (int i = 0; i < NS; ++i) {
-        lg[i] = v[NS + j * NS + i] * rinv[i] * inv_sqrt_h;
-        mx = fmaxf(mx, lg[i]);
+        for (int i = 0; i < NS; ++i) {
+          lg[i] = v[NS + j * NS + i] * rinv[i] * inv_sqrt_h;
+          mx = fmaxf(mx, lg[i]);
+        }
+#pragma unroll
+        for (int i = 0; i < NS; ++i) {
+          lg[i] = expf(lg[i] - mx);
+          den += lg[i];
+        }
       }
-      float den = 0.f;
 #pragma unroll
-      for (int i = 0; i < NS; ++i) {
-        lg[i] = expf(lg[i] - mx);
-        den += lg[i];
-      }
-#pragma unroll
-      for (int u = 0; u < MIX_V; ++u) {
+      for (int u = 0; u < QUADS; ++u) {
         float4 o = make_float4(0.f, 0.f, 0.f, 0.f);
 #pragma unroll
         for (int i = 0; i < NS; ++i) {
-          const float p = lg[i] / den;
+          const float p = BULK ? __shfl_sync(warp, p_lane, i) : lg[i] / den;
           o = make_float4(o.x + p * s[i][u].x, o.y + p * s[i][u].y, o.z + p * s[i][u].z, o.w + p * s[i][u].w);
         }
         mix[j][u] = o;
@@ -305,31 +358,70 @@ __device__ __forceinline__ void mix_token(const MixArgs& a, int m, float* red1, 
 #pragma unroll
       for (int j = 0; j < Q; ++j)
 #pragma unroll
-        for (int u = 0; u < MIX_V; ++u)
+        for (int u = 0; u < QUADS; ++u)
           *reinterpret_cast<float4*>(a.out_f32 + size_t(j) * a.M * H + row + ch(u)) = mix[j][u];
     }
     if (!a.out_bf16) return;
+    if (RAW || !a.norm_w) {
 #pragma unroll
-    for (int u = 0; u < MIX_V; ++u) {
-      float p[Q];
+      for (int j = 0; j < Q; ++j)
 #pragma unroll
-      for (int j = 0; j < Q; ++j) p[j] = sumsq4(mix[j][u]);
-      sum_part(p, red3, u);
-    }
-    float ms[Q];
-    sum_total(ms, red3);
+        for (int u = 0; u < QUADS; ++u)
+          store_bf16x4(a.out_bf16 + size_t(j) * a.M * H + row + ch(u), mix[j][u]);
+    } else {
 #pragma unroll
-    for (int j = 0; j < Q; ++j) {
-      const float r = rsqrtf(ms[j] / H + EPS);
+      for (int u = 0; u < QUADS; ++u) {
+        float p[Q];
 #pragma unroll
-      for (int u = 0; u < MIX_V; ++u) {
-        const float4 g = g4[j][u];
-        const float4 n = scale4(mix[j][u], r);
-        const float4 o = make_float4(n.x * g.x, n.y * g.y, n.z * g.z, n.w * g.w);
-        store_bf16x4(a.out_bf16 + size_t(j) * a.M * H + row + ch(u), o);
-        if (j == 0 && a.out_copy) store_bf16x4(a.out_copy + m * a.out_copy_stride + ch(u), o);
+        for (int j = 0; j < Q; ++j) p[j] = sumsq4(mix[j][u]);
+        sum_part<THREADS>(p, red3, u);
+      }
+      float ms[Q];
+      sum_total(ms, red3);
+#pragma unroll
+      for (int j = 0; j < Q; ++j) {
+        const float r = rsqrtf(ms[j] / H + EPS);
+#pragma unroll
+        for (int u = 0; u < QUADS; ++u) {
+          const float4 g = g4[j][u];
+          const float4 n = scale4(mix[j][u], r);
+          const float4 o = make_float4(n.x * g.x, n.y * g.y, n.z * g.z, n.w * g.w);
+          store_bf16x4(a.out_bf16 + size_t(j) * a.M * H + row + ch(u), o);
+          if (j == 0 && a.out_copy) store_bf16x4(a.out_copy + m * a.out_copy_stride + ch(u), o);
+        }
       }
     }
+  }
+}
+
+template <int NS, int Q, bool COPIES>
+__device__ __forceinline__ void mix_token(const MixArgs& a, int m, float* red1, float* red2, float* red3) {
+  MixWeights<NS, Q, MIX_T> w;
+  load_mix_weights<false>(a, w);
+  pdl_wait_fenced(a.zero);  // keeps the constant loads ahead of the wait
+  pdl_trigger();
+  mix_row<COPIES, false, false>(a, w, m, red1, red2, red3);
+}
+
+template <int RED2, int RED3>
+struct MixScratch {
+  float red1[REF_W * block_sum_slots<2>()];
+  float red2[RED2];
+  float red3[RED3];
+};
+
+template <int NS, int Q, bool RAW, class Scratch>
+__device__ __forceinline__ void mix_tile(const MixArgs& a, int tile, Scratch (&scratch)[2]) {
+  MixWeights<NS, Q, BULK_T> w;
+  load_mix_weights<RAW>(a, w);
+  const int first = tile * BULK_ROWS;
+  const int count = min(BULK_ROWS, a.M - first);
+  // Alternate scratch storage. Any row using scratch has a block barrier, so every warp finishes row
+  // i's reads before reaching the first barrier in row i+1. The pointer flags are the same for all rows.
+#pragma unroll 1
+  for (int i = 0; i < count; ++i) {
+    Scratch& s = scratch[i & 1];
+    mix_row<false, true, RAW>(a, w, first + i, s.red1, s.red2, s.red3);
   }
 }
 
@@ -340,9 +432,14 @@ __global__ void __launch_bounds__(MIX_T) mix_kernel(MixArgs a) {
   mix_token<NS, Q, COPIES>(a, blockIdx.x, red1, red2, red3);
 }
 
-// Two independent mixes in one launch: CTAs [0, a.M) run `a` (NS states, Q queries), CTAs [a.M, 2 a.M) run
-// the message mix `b` (one block, four queries). One kernel boundary less on the message visits. No row
-// copies (the launcher rejects them).
+template <int NS, int Q, bool RAW>
+__global__ void __launch_bounds__(BULK_T) mix_bulk_kernel(MixArgs a) {
+  __shared__ MixScratch<REF_W * block_sum_slots<NS + Q * NS>(), RAW ? 1 : REF_W * block_sum_slots<Q>()> scratch[2];
+  mix_tile<NS, Q, RAW>(a, blockIdx.x, scratch);
+}
+
+// Two independent mixes in one launch: the first half of the grid runs a, the second half runs the
+// message mix b (one block, four queries). The launcher rejects row copies for both mixes.
 template <int NS, int Q>
 __global__ void __launch_bounds__(MIX_T) mix_pair_kernel(MixArgs a, MixArgs b) {
   __shared__ float red1[REF_W * block_sum_slots<2>()], red2[REF_W * 32], red3[REF_W * MAXQ];
@@ -351,9 +448,33 @@ __global__ void __launch_bounds__(MIX_T) mix_pair_kernel(MixArgs a, MixArgs b) {
 }
 
 template <int NS, int Q>
+__global__ void __launch_bounds__(BULK_T) mix_pair_bulk_kernel(MixArgs a, MixArgs b) {
+  __shared__ MixScratch<REF_W * 32, 1> scratch[2];
+  const int tiles = (a.M - 1) / BULK_ROWS + 1;
+  if (static_cast<int>(blockIdx.x) < tiles) mix_tile<NS, Q, true>(a, blockIdx.x, scratch);
+  else mix_tile<2, 4, true>(b, blockIdx.x - tiles, scratch);
+}
+
+template <int NS, int Q>
 void launch_mix(int M, const MixArgs& a, bool pdl, cudaStream_t stream) {
-  if (a.copies[0].dst || a.copies[1].dst) launch_ex(mix_kernel<NS, Q, true>, dim3(M), MIX_T, 0, 1, pdl, stream, a);
-  else launch_ex(mix_kernel<NS, Q, false>, dim3(M), MIX_T, 0, 1, pdl, stream, a);
+  if (a.copies[0].dst || a.copies[1].dst) {
+    launch_ex(mix_kernel<NS, Q, true>, dim3(M), MIX_T, 0, 1, pdl, stream, a);
+    return;
+  }
+  if (!pdl && M >= BULK_MIN_ROWS) {
+    const dim3 grid((M - 1) / BULK_ROWS + 1);
+    if (!a.norm_w) {
+      launch_ex(mix_bulk_kernel<NS, Q, true>, grid, BULK_T, 0, 1, false, stream, a);
+      return;
+    }
+    // Prefill's four-query message mix is unnormalized. Larger normalized four-query mixes spill
+    // with the tiled kernel, so keep them on the one-row launch.
+    if constexpr (NS < 4 || Q < 4) {
+      launch_ex(mix_bulk_kernel<NS, Q, false>, grid, BULK_T, 0, 1, false, stream, a);
+      return;
+    }
+  }
+  launch_ex(mix_kernel<NS, Q, false>, dim3(M), MIX_T, 0, 1, pdl, stream, a);
 }
 
 template <int NS>
@@ -440,7 +561,7 @@ namespace {
 // Validates `p` and builds the kernel arguments.
 MixArgs mix_args(const MixParams& p) {
   require(p.base || p.write, "mix needs base and/or write");
-  require(p.M >= 1, "mix: M must be >= 1");  // one CTA per row: decode uses 1..8, prefill any chunk length
+  require(p.M >= 1, "mix: M must be >= 1");
   const int nb = p.nblocks;
   require(nb >= 0 && nb <= MAXB, "mix: at most 5 blocks");
   require(nb == 0 || p.blocks, "mix: blocks table required");
@@ -461,13 +582,12 @@ MixArgs mix_args(const MixParams& p) {
   a.out_f32 = p.out_f32;
   a.out_bf16 = p.out_bf16;
   a.norm_w = p.out_bf16 ? p.norm_w : nullptr;
-  require(!a.out_bf16 || a.norm_w, "mix: norm_w is required with out_bf16");
   a.new_bf16 = p.new_bf16;
   a.new_bf16_stride = p.new_bf16_stride;
   require(a.new_bf16_stride % 4 == 0 && p.out_copy_stride % 4 == 0, "mix: bf16 copy strides must be multiples of 4");
   a.out_copy = p.out_copy;
   a.out_copy_stride = p.out_copy_stride;
-  require(!a.out_copy || (a.out_bf16 && Q == 1), "mix: out_copy needs out_bf16 and Q == 1");
+  require(!a.out_copy || (a.out_bf16 && a.norm_w && Q == 1), "mix: out_copy needs out_bf16, norm_w and Q == 1");
   for (int c = 0; c < 2; ++c) {
     a.copies[c] = p.copies[c];
     require(!a.copies[c].dst || (a.copies[c].src && a.copies[c].cols % 4 == 0 && a.copies[c].src_stride % 4 == 0 &&
@@ -482,6 +602,13 @@ MixArgs mix_args(const MixParams& p) {
 
 template <int NS>
 void launch_pair_q(int Q, int M, const MixArgs& a, const MixArgs& b, bool pdl, cudaStream_t stream) {
+  if (!pdl && M >= BULK_MIN_ROWS && !a.norm_w && !b.norm_w) {
+    const dim3 grid(2 * ((M - 1) / BULK_ROWS + 1));
+    switch (Q) {
+      case 1: launch_ex(mix_pair_bulk_kernel<NS, 1>, grid, BULK_T, 0, 1, false, stream, a, b); return;
+      case 3: launch_ex(mix_pair_bulk_kernel<NS, 3>, grid, BULK_T, 0, 1, false, stream, a, b); return;
+    }
+  }
   switch (Q) {
     case 1: launch_ex(mix_pair_kernel<NS, 1>, dim3(2 * M), MIX_T, 0, 1, pdl, stream, a, b); break;
     case 3: launch_ex(mix_pair_kernel<NS, 3>, dim3(2 * M), MIX_T, 0, 1, pdl, stream, a, b); break;

@@ -64,15 +64,19 @@ SpecLoop::SpecLoop(Runtime& rt, Drafter* drafter, DFlash2* dflash2, DFlash2Head*
     target_tokens_ = DeviceBuffer(kd::BLOCK * sizeof(std::int32_t));
   if (!host_verify_) {
     const float threshold = rt.options().spec_threshold;
-    verify_ = rt.capture_switch(
-        [&](cudaStream_t s, cudaGraphConditionalHandle h) {
-          verify_select(draft_.conf, draft_.tokens, threshold, widths, rt_.tokens(),
-                        static_cast<std::int32_t*>(width_.p), h, s);
-        },
-        [&](cudaStream_t s, int m) {
-          rt_.record_save_verify(m, s);
-          rt_.record_step(m, s);
-        });
+    auto capture = [&](bool certified) {
+      return rt.capture_switch(
+          [&](cudaStream_t s, cudaGraphConditionalHandle h) {
+            verify_select(draft_.conf, draft_.tokens, threshold, widths, rt_.tokens(),
+                          static_cast<std::int32_t*>(width_.p), h, s);
+          },
+          [&](cudaStream_t s, int m) {
+            rt_.record_save_verify(m, s);
+            rt_.record_step(m, s, certified);
+          });
+    };
+    verify_ = capture(false);
+    if (rt_.has_cert_head()) certified_verify_ = capture(true);
   }
   // where a round's outcome lives on the device: after the acceptance the drafter commits the accepted
   // rows and drafts for the next anchor from these (one graph, no host round trip in between)
@@ -102,8 +106,9 @@ SpecLoop::~SpecLoop() {
 void SpecLoop::prepare_accept(const Sampling& sampling) {
   const bool forced = !sampling.forced.empty();
   const bool greedy = sampling.temperature <= 0.f || forced;
-  const AcceptKey key = greedy ? AcceptKey{true, forced, 0.f, 1.f, 0}
-                               : AcceptKey{false, false, sampling.temperature, sampling.top_p, sampling.top_k};
+  const bool certified = certified_verify_ && sampling.temperature <= 0.f;
+  const AcceptKey key = greedy ? AcceptKey{true, forced, certified, 0.f, 1.f, 0}
+                               : AcceptKey{false, false, false, sampling.temperature, sampling.top_p, sampling.top_k};
   if (accept_ && key == accept_key_) return;
   const Widths widths = verify_widths(rt_);
   const int V = drafter_->vocab();
@@ -112,7 +117,7 @@ void SpecLoop::prepare_accept(const Sampling& sampling) {
   const auto* width = static_cast<const std::int32_t*>(width_.p);
   auto* record = static_cast<VerifyRecord*>(record_.device_ptr());
   // forced replay: the drafts are compared with the forced tokens (the argmax still runs, for the timing)
-  const auto* target = forced ? static_cast<const std::int32_t*>(forced_window_.device_ptr()) : scratch.target;
+  const auto* forced_target = forced ? static_cast<const std::int32_t*>(forced_window_.device_ptr()) : nullptr;
   accept_ = GraphExec();
   accept_ = rt_.capture_switch(
       [&](cudaStream_t s, cudaGraphConditionalHandle h) { width_select(width, widths, h, s); },
@@ -121,8 +126,10 @@ void SpecLoop::prepare_accept(const Sampling& sampling) {
         const float* logits = static_cast<const float*>(rt_.buffers(m).logits.data);
         const int n = m - 1;
         if (greedy) {
-          kh::argmax(logits, m, V, V, scratch.target, s);
-          kd::greedy_accept(target, draft_.tokens, n, scratch.result, s);
+          const auto* target = scratch.target;
+          if (certified) target = ptr<const int32_t>(rt_.buffers(m).greedy);
+          else kh::argmax(logits, m, V, V, scratch.target, s);
+          kd::greedy_accept(forced ? forced_target : target, draft_.tokens, n, scratch.result, s);
         } else {
           kh::sampling_probs(logits, m, V, V, params, scratch.probs, s);
           kd::sampled_accept(scratch.probs, draft_.logits, V, draft_.tokens, n, sampling.temperature, draft_.qstats,
@@ -216,7 +223,7 @@ void SpecLoop::generate(std::int32_t token, int max_new_tokens, const Sampling& 
       record_event(0);
     }
     if (!greedy) kh::uniform(kd::GAMMA, rng, scratch.uniforms, stream);
-    verify_.launch(stream);
+    (certified_verify_ && sampling.temperature <= 0.f ? certified_verify_ : verify_).launch(stream);
     accept_.launch(stream);
     if (!greedy) kh::sample_from_probs(scratch.resid, 1, V, V, rng, &record_dev->next, stream);
     CUDA_CHECK(cudaEventRecord(done_, stream));
@@ -387,7 +394,8 @@ void SpecLoop::generate_host_verified(std::int32_t token, int max_new_tokens, co
     int32_t inputs[kd::BLOCK] = {anchor};
     std::copy_n(p.drafts, kd::GAMMA, inputs + 1);
     rt_.set_inputs(inputs, position);
-    const int32_t* target = tp ? ptr<const int32_t>(rt_.buffers(m).greedy) : nullptr;
+    const bool certified = rt_.has_cert_head() && sampling.temperature <= 0.f;
+    const int32_t* target = tp || certified ? ptr<const int32_t>(rt_.buffers(m).greedy) : nullptr;
     if (forced) {
       auto* w = static_cast<int32_t*>(forced_window_.data());
       for (int i = 0; i < m; ++i)
@@ -396,8 +404,8 @@ void SpecLoop::generate_host_verified(std::int32_t token, int max_new_tokens, co
     }
     event(2);
     rt_.save_verify(position, m);
-    const float* logits = rt_.run_step(m);
-    if (!tp && !forced && !sampled) {
+    const float* logits = rt_.run_step(m, certified);
+    if (!tp && !certified && !forced && !sampled) {
       auto* ids = drafter_ ? drafter_->accept_scratch().target : static_cast<int32_t*>(target_tokens_.p);
       kh::argmax(logits, m, UNPADDED_VOCAB, UNPADDED_VOCAB, ids, stream);
       target = ids;

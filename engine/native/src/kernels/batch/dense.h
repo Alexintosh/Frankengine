@@ -17,6 +17,10 @@
 struct cublasLtContext;
 typedef struct cublasLtContext* cublasLtHandle_t;
 
+namespace ingine::kernels::pico12 {
+struct Layout;
+}
+
 namespace ingine::kernels::batch {
 
 // count products at once: product j reads A + j * a, B + j * b and writes C + j * c (elements)
@@ -32,12 +36,12 @@ struct Strided {
 // key_v = s_v = 30 tanh(bf16(L[r, v]) / 30) where temps[r] <= 0, else s_v / temps[r] + G(seed, r, v) as sample
 // computes it: the same token as sample over the stored logits. Each CTA writes its rows' best (key, v) to
 // partials (head_partials(M, N) elements), a second kernel picks per row. temps: device fp32 [M]; out: device int32
-// [M]. Requires K % 64 == 0, lda and ldb multiples of 8, N (and ldc) even, A, B 16-byte and logits 8-byte aligned.
+// [M]. With packed metadata, B is a PICO12 blob decoded into BF16 tiles. Requires K % 64 == 0, lda and ldb multiples of 8, N (and ldc) even, A, B 16-byte and logits 8-byte aligned.
 std::size_t head_partials(int M, int N);
-void head_sample(const __nv_bfloat16* A, int lda, const __nv_bfloat16* B, int ldb, int M, int N, int K,
+void head_sample(const __nv_bfloat16* A, int lda, const void* B, int ldb, int M, int N, int K,
                  const float* temps, std::uint64_t seed, float* logits, int ldc, int2* partials, std::int32_t* out,
                  cudaStream_t stream, int v_begin = 0, void* cand_out = nullptr,
-                 const std::uint64_t* d_seed = nullptr);
+                 const std::uint64_t* d_seed = nullptr, const pico12::Layout* packed = nullptr);
 
 // NVFP4 unembedding head with kernels::batch::sample fused: reads NVFP4 weights (3.56x smaller than BF16) with
 // exact nvfp4::decode arithmetic, supporting any M >= 1, greedy or Gumbel-max sampling, and CUDA-graph capture via d_seed.

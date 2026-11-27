@@ -116,14 +116,16 @@ BatchEngine::Stream::~Stream() {
 }
 
 static std::unique_ptr<TpRuntime> make_batch_tp(const BatchEngineOptions& o) {
-  if (o.kv_fp8 && o.kv_q4) throw std::invalid_argument("--kv-fp8 and --kv-q4 are mutually exclusive");
+  validate_kv_formats(o.kv_fp8, o.kv_q4, o.kv_12);
   if (o.tp.size <= 1) return nullptr;
   RuntimeOptions ro;
   ro.model_dir = o.model_dir;
   ro.max_ctx = o.ctx;
   ro.dense_fp8 = false;
+  ro.dense_pico12 = o.dense_pico12;
   ro.kv_fp8 = o.kv_fp8;
   ro.kv_q4 = o.kv_q4;
+  ro.kv_12 = o.kv_12;
   ro.head_nvfp4 = o.head_nvfp4;
   ro.spec = o.spec > 0;
   ro.tp = o.tp;
@@ -140,9 +142,9 @@ BatchEngine::BatchEngine(const BatchEngineOptions& o)
       spec_min_(std::max(0, std::min(o.spec_min, o.spec))),
       tp_(make_batch_tp(o)),
       w_(load_weights(o.model_dir, /*dense_fp8=*/false, stream_.s, o.head_nvfp4,
-                      tp_ ? tp_->layout : TpLayout{})),
+                      tp_ ? tp_->layout : TpLayout{}, o.dense_pico12)),
       abl_(load_ablation(o.ablation)),
-      st_(make_batch_state(o.slots, o.ctx, o.kv_fp8, tp_ ? tp_->layout : TpLayout{}, o.kv_q4)),
+      st_(make_batch_state(o.slots, o.ctx, o.kv_fp8, tp_ ? tp_->layout : TpLayout{}, o.kv_q4, o.kv_12)),
       pf_(std::make_unique<Prefiller>(w_, abl_, o.prefill_chunk, stream_.s, tp_.get())),
       dec_(std::make_unique<BatchDecoder>(w_, abl_, st_, o.slots, stream_.s, 8, tp_.get())),
       chunk_(std::size_t(std::max(o.prefill_chunk, 1)) * 4),

@@ -41,16 +41,19 @@ namespace ingine::model {
 // ---- loading (weights.load + FastDecoder._concat_projections/_stack_layer_params/_fp8_dense,
 // model.Ablation.load/none, model.State)
 Weights load_weights(const std::filesystem::path& model_dir, bool dense_fp8, cudaStream_t stream,
-                     bool head_nvfp4 = false, const TpLayout& tp = TpLayout{});
+                     bool head_nvfp4 = false, const TpLayout& tp = TpLayout{}, bool dense_pico12 = false,
+                     bool cert_head = false);
 // One layer as weights.load_layer (+ the decoder's derived tensors), for kernel tests; owns its memory.
 Layer load_layer(const std::filesystem::path& model_dir, int l, bool dense_fp8, cudaStream_t stream,
                  std::vector<DeviceBuffer>& storage, const TpLayout& tp = TpLayout{});
 Ablation load_ablation(const std::filesystem::path& path);  // empty path: Ablation.none()
 HeadWeights load_head(const std::filesystem::path& model_dir, bool dense_fp8, bool head_nvfp4, cudaStream_t stream,
-                      std::vector<DeviceBuffer>& storage, const TpLayout& tp = TpLayout{});
+                      std::vector<DeviceBuffer>& storage, const TpLayout& tp = TpLayout{}, bool dense_pico12 = false);
 
-State make_state(int max_ctx, bool kv_fp8, const TpLayout& layout = TpLayout{}, bool kv_q4 = false);
-Buffers make_buffers(int m, const TpLayout& tp = TpLayout{}, bool full_logits = false, bool mixed = false);
+State make_state(int max_ctx, bool kv_fp8, const TpLayout& layout = TpLayout{}, bool kv_q4 = false,
+                 bool kv_12 = false);
+Buffers make_buffers(int m, const TpLayout& tp = TpLayout{}, bool full_logits = false, bool mixed = false,
+                     bool cert_head = false);
 
 // model.State.reset: ring_pos = -1, conv states = 0, length = 0 (caches keep their contents).
 void reset_state(State& state, cudaStream_t stream);
@@ -77,14 +80,14 @@ class Decoder {
   // logits in b.logits, taps in b.taps, conv inputs in b.hist_* when `history`. Graph capturable once it
   // ran eagerly for `b` (pointer tables are built on first use).
   void decode(Buffers& b, const std::int64_t* pos, bool history, cudaStream_t stream,
-              TpReduction reduction = TpReduction::Reconstruct);
+              TpReduction reduction = TpReduction::Reconstruct, bool greedy_only = false);
 
-  void decode_batch(Buffers& b, const BatchSlotTable* slots, cudaStream_t stream);
+  void decode_batch(Buffers& b, const BatchSlotTable* slots, cudaStream_t stream, bool greedy_only = false);
   void allocate_batch_workspace(int max_batch);
 
  private:
   void decode_impl(Buffers& b, const std::int64_t* pos, bool history, cudaStream_t stream,
-                   TpReduction reduction, const BatchSlotTable* slots);
+                   TpReduction reduction, const BatchSlotTable* slots, bool greedy_only);
   const std::int64_t* block_table(const std::vector<const float*>& blocks);
 
   const Weights& w_;
@@ -94,6 +97,7 @@ class Decoder {
   TpSimulation* simulation_;
   TpRuntime* tp_;
   DeviceBuffer down_workspace_;  // sharded GB10 speculative W2 expert dots
+  DeviceBuffer cert_head_ws_;
   DeviceBuffer batch_attn_ws_;
   DeviceBuffer attn_ws_;  // attn workspace for up to 8 rows (zeroed once)
   std::map<std::vector<const float*>, DeviceBuffer> tables_;  // device pointer tables for mix
@@ -144,7 +148,8 @@ class Runtime {
   };
   State& state_slot(int slot);
   // Advances each participating slot by one token. Outputs are in compact row order.
-  Buffers& run_batch(std::span<const BatchInput> rows, bool full_logits);
+  // greedy_only opts into IDs for TP=1 when the certified head is loaded and full_logits is false.
+  Buffers& run_batch(std::span<const BatchInput> rows, bool full_logits, bool greedy_only = false);
 
   // Call widths available: width 1 and the configured speculative widths.
   bool has_width(int m) const;
@@ -154,9 +159,10 @@ class Runtime {
 
   // Stream-ordered step inputs: buffers(tokens.size()).token = tokens, pos = position (a kernel; no copy).
   void set_inputs(std::span<const std::int32_t> tokens, int position);
-  // Replays width m's graph on stream. Returns device logits for TP=1 or full-logit rank 0.
-  // TP=2 greedy mode writes buffers(m).greedy and returns nullptr.
-  const float* run_step(int m);
+  // A certified TP=1 greedy-only step writes buffers(m).greedy and returns nullptr.
+  // TP=2 selects logits or IDs through its existing rank configuration.
+  bool has_cert_head() const { return weights_.unembed_certified.bounds != nullptr; }
+  const float* run_step(int m, bool greedy_only = false);
   // set_inputs + run_step for one token (engine._decode_logits).
   const float* decode_logits(std::int32_t token, int position);
   // The same step without graphs (validation, tests).
@@ -211,14 +217,14 @@ class Runtime {
                            const std::function<void(cudaStream_t, int)>& branch);
   // Records width m's decode step, save_verify(*pos(), m) and rollback(*pos(), *accepted + 1, m) on `stream`
   // (positions and the accepted count read on the device).
-  void record_step(int m, cudaStream_t stream);
+  void record_step(int m, cudaStream_t stream, bool greedy_only = false);
   void record_save_verify(int m, cudaStream_t stream);
   void record_rollback(int m, const std::int32_t* accepted, cudaStream_t stream);
   std::int64_t* tokens() { return static_cast<std::int64_t*>(token_.p); }  // the shared int64 [8] input tokens
 
  private:
   void init();
-  void capture(int m, bool history);
+  void capture(int m, bool history, std::map<int, cudaGraphExec_t>& dest, bool greedy_only = false);
   void init_batch(const TpLayout& layout);
   void set_batch_inputs(std::span<const BatchInput> rows);
   StatePtrs state_ptrs() const;
@@ -242,7 +248,7 @@ class Runtime {
   std::map<int, BatchWidth> batch_widths_;
   std::map<int, Buffers> buffers_;
   std::map<int, bool> history_;
-  std::map<int, cudaGraphExec_t> graphs_, sampled_graphs_;
+  std::map<int, cudaGraphExec_t> graphs_, sampled_graphs_, certified_graphs_;
   std::vector<int> verify_widths_;
   // rollback scratch (VerifyBackup) and the width-1 undo records (StepUndo by position parity)
   DeviceBuffer backup_storage_;

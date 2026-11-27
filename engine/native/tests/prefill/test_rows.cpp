@@ -2,6 +2,7 @@
 // full dynamic conv with log scaling, BF16 and FP8 key/value outputs, conv state before the chunk),
 // rel_logits, static_conv + conv_state_update (T < 3 and T > 3), message gates, head logits (BF16 and FP8
 // rows), the cuBLASLt GEMM wrapper, taps.
+#include "kernels/common/pico12.cuh"
 #include "kernels/prefill/prefill.h"
 #include "prefill/prefill_test.h"
 
@@ -258,6 +259,16 @@ bool test_head(Rng& rng, bool fp8) {
                   fp8 ? ds.get() : nullptr, V, out.get(), nullptr);
   INGINE_TEST_CUDA(cudaDeviceSynchronize());
   const auto g = out.download();
+  if (!fp8) {
+    auto packed = ingine::kernels::pico12::pack_pico12_host(wb.data(), V, H);
+    DeviceArray<uint8_t> blob(packed.bytes);
+    INGINE_TEST_CUDA(cudaMemcpy(blob.get(), packed.data.get(), packed.bytes, cudaMemcpyHostToDevice));
+    pk::head_logits(reinterpret_cast<const __nv_bfloat16*>(dx.get()), blob.get(), nullptr, V, out.get(), nullptr,
+                    &packed.layout);
+    INGINE_TEST_CUDA(cudaDeviceSynchronize());
+    const auto packed_logits = out.download();
+    INGINE_CHECK(std::memcmp(g.data(), packed_logits.data(), g.size() * sizeof(float)) == 0);
+  }
   std::vector<float> got(g.begin(), g.end());
   std::vector<double> ref;
   for (int v = 0; v < V; ++v) {

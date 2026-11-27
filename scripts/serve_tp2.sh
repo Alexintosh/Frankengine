@@ -36,12 +36,14 @@ ARGS=(
   --batch-spec-min "$BATCH_SPEC_MIN"
   --max-queue "$MAX_QUEUE"
   --park-mb "$PARK_MB"
+  --prefill-chunk "$PREFILL_CHUNK"
   --no-vision
   --spec-widths "$SPEC_WIDTHS"
   --spec-threshold "$SPEC_THRESHOLD"
   --tp-wire "$TP_WIRE"
 )
 [[ "$DENSE_FP8" == "1" ]] && ARGS+=(--dense-fp8)
+[[ "$DENSE_PICO12" == "1" ]] && ARGS+=(--dense-pico12)
 [[ "$KV_FP8" == "1" ]] && ARGS+=(--kv-fp8)
 [[ "$KV_Q4" == "1" ]] && ARGS+=(--kv-q4)
 [[ "$HEAD_NVFP4" == "1" ]] && ARGS+=(--head-nvfp4)

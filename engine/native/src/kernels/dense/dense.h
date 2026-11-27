@@ -12,14 +12,20 @@
 
 #include <cstdint>
 
+namespace ingine::kernels::pico12 {
+struct Layout;
+}
+
 namespace ingine::kernels::dense {
 
-// A weight matrix [rows, K]: BF16 rows (scale == nullptr) or float8_e4m3fn rows with fp32 per-row scales.
+// A weight matrix [rows, K]: BF16, float8_e4m3fn with fp32 per-row scales, or a PICO12 device blob.
 struct Matrix {
   const void* w = nullptr;
   const float* scale = nullptr;
   int rows = 0;
   int cols = 0;  // 0 uses the entry point's legacy K
+  const pico12::Layout* pico12 = nullptr;  // host metadata read during launch, only for packed weights
+  bool pico12_exact = false;  // use BF16 accumulation order for packed weights
 };
 
 // proj: multi-segment GEMV. xin bf16 [3, M, H]; segments int32 device [nseg, 3] = (row_begin, row_end,
@@ -53,8 +59,19 @@ void conv_residual_epilogue(const float* x, const __nv_bfloat16* x_bf16, int M, 
 // head: out[m, v] = 30 tanh(bf16(w_v . x[m]) / 30), x bf16 [M, H], out fp32 [M, V], V = w.rows.
 void head(const __nv_bfloat16* x, int M, Matrix w, float* out, bool pdl, cudaStream_t stream);
 
+// Device-selected tiles of the reference head. Tile widths are 8 for M=1 and 16 otherwise.
+struct HeadTiles {
+  const int* indices;             // [tile_count], or nullptr for consecutive tiles
+  const unsigned* count;          // number of selected tiles
+  const unsigned* masks;          // [vocabulary rows], token bitsets, or nullptr for all tokens
+  const unsigned* fallback;       // token bitset; if nonzero, traverse all tiles
+  unsigned long long* best;       // [M], ordered (score, inverse id) keys, initialized by caller
+};
+
+void head_tiles(const __nv_bfloat16* x, int M, Matrix w, HeadTiles work, int blocks, cudaStream_t stream);
+
 // gemv: plain GEMV (drafter o_proj / down_proj). x bf16 [M, K] (row stride K), out fp32 [M, R] =
-// bf16(w[r] . x[m]), R = w.rows; K = 3072 or 9216; same PDL contract as proj.
+// bf16(w[r] . x[m]), R = w.rows; K = 2304, 3072 or 9216; same PDL contract as proj.
 void gemv(const __nv_bfloat16* x, int M, int K, Matrix w, float* out, bool pdl, cudaStream_t stream);
 
 // Eight-row DFlash2 projection with E4M3 weights and BF16 or FP32 output.
@@ -66,6 +83,10 @@ void fp8_rows(const __nv_bfloat16* w, int rows, int K, void* q, float* scale, cu
 
 // dequant_rows: weights.dequant: out = bf16(float(q) * scale[row]) for FP8 rows [rows, K].
 void dequant_rows(const void* q, const float* scale, int rows, int K, __nv_bfloat16* out, cudaStream_t stream);
+
+// Restore BF16 rows from PICO12 for GEMM. Select consecutive rows from first, or rows named by device indices.
+void unpack_pico12_rows(Matrix w, int rows, __nv_bfloat16* out, cudaStream_t stream, int first = 0,
+                        const std::int32_t* indices = nullptr);
 
 // router: x bf16 [M, H]; w [128, H] fp32 (w_fp32) or bf16 holding BF16 values; bias fp32 [128];
 // idx int32 [M, 8] (descending score), wts fp32 [M, 8] = 8 s / (sum s + 1e-20).

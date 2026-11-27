@@ -125,6 +125,10 @@ BatchDrafter::BatchDrafter(const std::filesystem::path& model_dir, const Weights
       kd::fold_head(q.p, static_cast<const float*>(scale.p), short_rows_, hw, hb, fold_w_, fold_b_, stream_);
       kdense::dequant_rows(q.p, static_cast<const float*>(scale.p), short_rows_, H, rows, stream_);
       CUDA_CHECK(cudaStreamSynchronize(stream_));
+    } else if (unembed.is_pico12) {
+      kdense::unpack_pico12_rows(unembed.matrix(), short_rows_, rows, stream_, 0, static_cast<const std::int32_t*>(ids.p));
+      CUDA_CHECK(cudaMemcpyAsync(short_map_, ids.p, S * sizeof(std::int32_t), cudaMemcpyDeviceToDevice, stream_));
+      kd::fold_head(rows, nullptr, short_rows_, hw, hb, fold_w_, fold_b_, stream_);
     } else {
       kd::gather_head_rows(unembed.w.data, nullptr, std::size_t(H) * 2, static_cast<const std::int32_t*>(ids.p),
                            short_rows_, rows, nullptr, short_map_, stream_);

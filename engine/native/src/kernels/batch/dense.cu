@@ -2,6 +2,7 @@
 
 #include "kernels/common/l2.cuh"
 #include "kernels/common/nvfp4.cuh"
+#include "kernels/common/pico12.cuh"
 
 #include <cuda_fp16.h>
 #include <math_constants.h>
@@ -27,7 +28,7 @@ constexpr int BK = 64;
 
 struct HeadArgs {
   const __nv_bfloat16* A;
-  const __nv_bfloat16* B;
+  const void* B;
   float* C;  // nullptr: L not stored
   int lda, ldb, ldc, M, N, K;
   const float* temps;
@@ -36,6 +37,7 @@ struct HeadArgs {
   int ntiles;
   int v_begin;
   const std::uint64_t* d_seed;
+  pico12::DeviceView pico;
 };
 
 __device__ __forceinline__ float bf16r(float x) { return __bfloat162float(__float2bfloat16_rn(x)); }
@@ -105,7 +107,7 @@ struct MmaCfg {
   static_assert(NF % 2 == 0 && SMEM <= 96 * 1024);
 };
 
-template <class C>
+template <class C, bool Packed, bool Escapes>
 __global__ void __launch_bounds__(C::NT) head_kernel(const HeadArgs p) {
   extern __shared__ __align__(128) std::uint8_t smem[];
   constexpr int MF = C::MF, NF = C::NF, TM = C::TM, TN = C::TN, NT = C::NT, STAGES = C::STAGES;
@@ -113,7 +115,6 @@ __global__ void __launch_bounds__(C::NT) head_kernel(const HeadArgs p) {
   const int warp_m = warp / C::WN, warp_n = warp % C::WN;
   const int mtile = blockIdx.x, ntile = blockIdx.y;
   const __nv_bfloat16* A = p.A + std::size_t(mtile) * TM * p.lda;
-  const __nv_bfloat16* B = p.B + std::size_t(ntile) * TN * p.ldb;
   const int m_rows = min(TM, p.M - mtile * TM), n_rows = min(TN, p.N - ntile * TN);
   const int nk = p.K / BK;
 
@@ -130,7 +131,25 @@ __global__ void __launch_bounds__(C::NT) head_kernel(const HeadArgs p) {
     for (int i = tid; i < TN * 8; i += NT) {
       const int r = i >> 3, c = i & 7;
       const bool ok = r < n_rows;
-      cp_async16(smem_addr(base + swz(r, c)), B + std::size_t(ok ? r : 0) * p.ldb + kt * BK + c * 8, ok);
+      const int col = kt * BK + c * 8;
+      if constexpr (Packed) {
+        uint4 bf16{};
+        if (ok) {
+          const std::size_t row = std::size_t(ntile) * TN + r;
+          const auto* src = static_cast<const std::uint8_t*>(p.B) + row * pico12::row_bytes(p.K);
+          const auto chunk = pico12::load8<l2::Evict::none>(src, p.K, col, 0);
+          if constexpr (Escapes) {
+            if (p.K > pico12::kCompactCols) bf16 = pico12::restore8<true>(chunk, p.pico, int(row), col);
+            else bf16 = pico12::restore8<false>(chunk, p.pico, int(row), col);
+          } else {
+            bf16 = pico12::decode8(chunk, p.pico);
+          }
+        }
+        *reinterpret_cast<uint4*>(base + swz(r, c)) = bf16;
+      } else {
+        const auto* src = static_cast<const __nv_bfloat16*>(p.B) + (std::size_t(ntile) * TN + (ok ? r : 0)) * p.ldb;
+        cp_async16(smem_addr(base + swz(r, c)), src + col, ok);
+      }
     }
   };
 
@@ -540,10 +559,10 @@ static_assert(Cfg64::TN == HEAD_TN && Cfg32::TN == HEAD_TN);
 using Nvfp4Cfg32 = Nvfp4HeadCfg<2, 2, 1, 8, 2>;
 using Nvfp4Cfg64 = Nvfp4HeadCfg<2, 4, 2, 4, 2>;
 
-template <class C>
+template <class C, bool Packed, bool Escapes>
 void launch(const HeadArgs& a, cudaStream_t stream) {
   static const bool attr = [] {
-    return cudaFuncSetAttribute(head_kernel<C>, cudaFuncAttributeMaxDynamicSharedMemorySize, C::SMEM) == cudaSuccess;
+    return cudaFuncSetAttribute(head_kernel<C, Packed, Escapes>, cudaFuncAttributeMaxDynamicSharedMemorySize, C::SMEM) == cudaSuccess;
   }();
   if (!attr) throw std::runtime_error("batch head_sample: shared memory attribute");
   cudaLaunchConfig_t cfg{};
@@ -556,7 +575,7 @@ void launch(const HeadArgs& a, cudaStream_t stream) {
   pdl.val.programmaticStreamSerializationAllowed = 1;
   cfg.attrs = &pdl;
   cfg.numAttrs = 1;
-  if (cudaLaunchKernelEx(&cfg, head_kernel<C>, a) != cudaSuccess)
+  if (cudaLaunchKernelEx(&cfg, head_kernel<C, Packed, Escapes>, a) != cudaSuccess)
     throw std::runtime_error("batch head_sample: launch failed");
 }
 
@@ -876,15 +895,23 @@ std::size_t head_partials_nvfp4(int M, int N) {
   return std::size_t(M) * ((N + NVFP4_SMALL_TILE - 1) / NVFP4_SMALL_TILE);
 }
 
-void head_sample(const __nv_bfloat16* A, int lda, const __nv_bfloat16* B, int ldb, int M, int N, int K,
+void head_sample(const __nv_bfloat16* A, int lda, const void* B, int ldb, int M, int N, int K,
                  const float* temps, std::uint64_t seed, float* logits, int ldc, int2* partials, std::int32_t* out,
-                 cudaStream_t stream, int v_begin, void* cand_out, const std::uint64_t* d_seed) {
-  if (M <= 0 || N <= 0 || K % BK || lda % 8 || ldb % 8 || (logits && (N % 2 || ldc % 2)))
+                 cudaStream_t stream, int v_begin, void* cand_out, const std::uint64_t* d_seed,
+                 const pico12::Layout* packed) {
+  if (M <= 0 || N <= 0 || K % BK || lda % 8 || ldb % 8 || (logits && (N % 2 || ldc % 2)) ||
+      (packed && (packed->rows != N || packed->cols != K)))
     throw std::invalid_argument("batch head_sample: unsupported shape");
+  const auto pico = packed ? pico12::device_view(*packed, static_cast<const std::uint8_t*>(B)) : pico12::DeviceView{};
   const HeadArgs a{A, B, logits, lda, ldb, ldc, M, N, K, temps, seed, partials, (N + HEAD_TN - 1) / HEAD_TN, v_begin,
-                   d_seed};
-  if (M <= 32) launch<Cfg32>(a, stream);
-  else launch<Cfg64>(a, stream);
+                   d_seed, pico};
+  auto dispatch = [&]<class C>() {
+    if (!packed) launch<C, false, false>(a, stream);
+    else if (packed->escapes) launch<C, true, true>(a, stream);
+    else launch<C, true, false>(a, stream);
+  };
+  if (M <= 32) dispatch.template operator()<Cfg32>();
+  else dispatch.template operator()<Cfg64>();
   head_pick_kernel<<<M, PICK_T, 0, stream>>>(partials, a.ntiles, out, static_cast<int2*>(cand_out));
 }
 

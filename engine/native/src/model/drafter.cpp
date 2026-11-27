@@ -68,9 +68,8 @@ Drafter::Drafter(const std::filesystem::path& model_dir, const Weights& w, int m
                  int shortlist_rows, bool nvfp4, const Dense* full_vocab_head, bool profile)
     : w_(w), stream_(stream), ctx_(std::min(max_ctx, DRAFT_CTX)), nvfp4_(nvfp4) {
   if (max_ctx < 2 * BLOCK) throw std::invalid_argument("Drafter: max_ctx must hold two blocks");
-  const Dense& unembed = full_vocab_head ? *full_vocab_head : w.unembed;
-  head_ = {unembed.w.data, ptr<const float>(unembed.scale), unembed.rows()};
-  V_ = head_.rows;
+  head_ = full_vocab_head ? *full_vocab_head : w.unembed;
+  V_ = head_.rows();
   load(model_dir);
 
   auto bf16s = [&](std::size_t n) { return static_cast<__nv_bfloat16*>(alloc(n * 2)); };
@@ -148,14 +147,14 @@ Drafter::Drafter(const std::filesystem::path& model_dir, const Weights& w, int m
       if (short_in_[t]) list.push_back(t);
     short_K_ = int(list.size());
     const int rows = short_K_ + CONTEXT_ROWS;
-    const std::size_t row_bytes = head_.scale ? std::size_t(H) : std::size_t(H) * 2;
+    const std::size_t row_bytes = std::size_t(H) * (head_.fp8() ? 1 : 2);
     void* q = alloc(std::size_t(rows) * row_bytes);
-    auto* qs = head_.scale ? f32s(rows) : nullptr;
+    auto* qs = head_.fp8() ? f32s(rows) : nullptr;
     short_map_ = i32s(rows);
     short_ids_ = i32s(rows);
     CUDA_CHECK(cudaMemsetAsync(short_map_, 0, std::size_t(rows) * 4, stream_));
     CUDA_CHECK(cudaMemcpyAsync(short_ids_, list.data(), list.size() * 4, cudaMemcpyHostToDevice, stream_));
-    kd::gather_head_rows(head_.w, head_.scale, row_bytes, short_ids_, short_K_, q, qs, short_map_, stream_);
+    gather_head_rows(short_K_, q, qs, short_map_);
     short_head_ = kdense::Matrix{q, qs, rows};
     seg_short_ = segments({short_K_});
     kd::fill(base_, std::size_t(GAMMA) * rows, -INFINITY, stream_);
@@ -338,7 +337,19 @@ void Drafter::load(const std::filesystem::path& model_dir) {
   fold_b_ = static_cast<__nv_bfloat16*>(alloc(std::size_t(V_) * 2));
   const __nv_bfloat16* hw = persist({{mh + "hidden_out.weight", {h, kd::RANK}}});
   const __nv_bfloat16* hb = persist({{mh + "hidden_out.bias", {h}}});
-  kd::fold_head(head_.w, head_.scale, V_, hw, hb, fold_w_, fold_b_, stream_);
+  DeviceBuffer pico_scratch;
+  if (head_.is_pico12) {
+    constexpr int chunk = 4096;
+    pico_scratch = DeviceBuffer(std::size_t(chunk) * H * sizeof(__nv_bfloat16));
+    auto* bf16 = static_cast<__nv_bfloat16*>(pico_scratch.p);
+    for (int first = 0; first < V_; first += chunk) {
+      const int rows = std::min(chunk, V_ - first);
+      kdense::unpack_pico12_rows(head_.matrix(), rows, bf16, stream_, first);
+      kd::fold_head(bf16, nullptr, rows, hw, hb, fold_w_ + std::size_t(first) * kd::RANK, fold_b_ + first, stream_);
+    }
+  } else {
+    kd::fold_head(head_.w.data, ptr<const float>(head_.scale), V_, hw, hb, fold_w_, fold_b_, stream_);
+  }
   CUDA_CHECK(cudaStreamSynchronize(stream_));  // raw and cat are freed on return
 }
 
@@ -362,6 +373,18 @@ void Drafter::set_context_rows(int rows) {
              stream_);
 }
 
+void Drafter::gather_head_rows(int rows, void* weights, float* scales, std::int32_t* map) {
+  if (head_.is_pico12) {
+    kdense::unpack_pico12_rows(head_.matrix(), rows, static_cast<__nv_bfloat16*>(weights), stream_, 0, short_ids_);
+    CUDA_CHECK(cudaMemcpyAsync(map, short_ids_, std::size_t(rows) * sizeof(std::int32_t),
+                               cudaMemcpyDeviceToDevice, stream_));
+  } else {
+    const std::size_t bytes = std::size_t(H) * (head_.fp8() ? 1 : 2);
+    kd::gather_head_rows(head_.w.data, ptr<const float>(head_.scale), bytes, short_ids_, rows,
+                         weights, scales, map, stream_);
+  }
+}
+
 void Drafter::note_tokens(std::span<const std::int32_t> ids) {
   std::vector<std::int32_t> add;
   for (std::int32_t t : ids)
@@ -371,12 +394,11 @@ void Drafter::note_tokens(std::span<const std::int32_t> ids) {
     }
   if (add.empty()) return;
   const std::size_t row = std::size_t(short_K_ + short_E_);
-  const std::size_t row_bytes = head_.scale ? std::size_t(H) : std::size_t(H) * 2;
+  const std::size_t row_bytes = std::size_t(H) * (head_.fp8() ? 1 : 2);
   // pageable sources: copied before cudaMemcpyAsync returns; short_ids_ is free once earlier gathers ran
   CUDA_CHECK(cudaMemcpyAsync(short_ids_, add.data(), add.size() * 4, cudaMemcpyHostToDevice, stream_));
-  kd::gather_head_rows(head_.w, head_.scale, row_bytes, short_ids_, int(add.size()),
-                       static_cast<std::uint8_t*>(const_cast<void*>(short_head_.w)) + row * row_bytes,
-                       head_.scale ? const_cast<float*>(short_head_.scale) + row : nullptr, short_map_ + row, stream_);
+  gather_head_rows(int(add.size()), static_cast<std::uint8_t*>(const_cast<void*>(short_head_.w)) + row * row_bytes,
+                   head_.fp8() ? const_cast<float*>(short_head_.scale) + row : nullptr, short_map_ + row);
   short_extra_.insert(short_extra_.end(), add.begin(), add.end());
   short_E_ += int(add.size());
   const int seg[3] = {0, short_K_ + short_E_, 0};

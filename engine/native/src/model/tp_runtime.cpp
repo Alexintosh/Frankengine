@@ -93,13 +93,16 @@ std::uint64_t checkpoint_fingerprint(const RuntimeOptions& options) {
 comm::CommPlan make_plan(const RuntimeOptions& options) {
   const bool bf16 = options.tp.wire == TpWire::Bf16;
   const auto bytes = std::size_t(options.prefill_chunk) * HIDDEN * (bf16 ? 2 : 4);
-  // Reserve twelve bits for the chunk length and five for mode, precision and head flags.
+  // Reserve twelve low bits (5..16) plus high bits (40..42) for chunk length up to 8192.
   const std::uint64_t schedule = 0x4d34000000000000ull |
-      (std::uint64_t(options.max_ctx) << 17) | (std::uint64_t(options.prefill_chunk) << 5) |
+      (std::uint64_t(options.max_ctx) << 17) | (std::uint64_t(options.prefill_chunk & 0xfff) << 5) |
+      (std::uint64_t(options.prefill_chunk >> 12) << 40) |
       (options.spec << 4) | (options.head_nvfp4 << 3) | (options.dense_fp8 << 2) | (options.kv_fp8 << 1) | options.tp.full_logits;
   const std::uint64_t wire_hash = bf16 ? 0x200b : options.tp.wire == TpWire::Bf16Moe ? 0x200c : 0x200f;
   const std::uint64_t layout_hash = wire_hash | (std::uint64_t(options.kv_q4) << 15) |
-                                    (std::uint64_t(options.max_batch - 1) << 16);
+                                    (std::uint64_t(options.max_batch - 1) << 16) |
+                                    (std::uint64_t(options.dense_pico12) << 32) |
+                                    (std::uint64_t(options.kv_12) << 33);
   const auto gather_bytes = kVocabularyShard * sizeof(float) * options.max_batch;
   const bool dflash2_active = options.draft_type != "dspark";
   const bool shard_dflash2 = dflash2_active && dflash2_shard_backbone();
@@ -209,12 +212,10 @@ void TpRuntime::head(const Weights& w, const __nv_bfloat16* x, float* logits, in
                      false, stream);
   } else {
     if (schedule == TpSchedule::Decode) {
-      const kernels::dense::Matrix matrix{w.unembed.w.data, ptr<float>(w.unembed.scale),
-                                          w.unembed.rows(), w.unembed.cols()};
-      kernels::dense::head(x, m, matrix, shard, false, stream);
+      kernels::dense::head(x, m, w.unembed.matrix(), shard, false, stream);
     } else {
       kernels::prefill::head_logits(x, w.unembed.w.data, ptr<float>(w.unembed.scale),
-                                    kVocabularyShard, shard, stream);
+                                    kVocabularyShard, shard, stream, w.unembed.matrix().pico12);
     }
     if (!full_logits) {
       auto* index = static_cast<int32_t*>(impl_->index.p);

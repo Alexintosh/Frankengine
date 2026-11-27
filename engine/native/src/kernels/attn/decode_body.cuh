@@ -7,6 +7,7 @@
                   OFF_VDYN = layout.activation_offset(model::SEG_V_DYN);
     static_assert(FULL || (!F8 && !Q4), "quantized caches are full-layer only");
     static_assert(!F8 || !Q4);
+    static_assert(!KV12 || (FULL && !F8 && !Q4));
     using CT = std::conditional_t<F8, __nv_fp8_storage_t, __nv_bfloat16>;  // cache element
     using KV = std::conditional_t<F8, uint2, uint4>;                        // 8 dims of a cache row
     constexpr int KW = 8, ROWS = GQA * M;  // KW: key-slice warps of the M = 1 path
@@ -58,7 +59,11 @@
             b.kp[u] = -1;
             if (j < old_end) {
                 const size_t off = (size_t(j) * HKV + g) * D + c * 8;
-                if constexpr (Q4) {
+                if constexpr (KV12) {
+                    const size_t head = size_t(j) * HKV + g;
+                    b.k[u] = kv12::load8(p.k_cache, p.k_scale, head, c);
+                    b.v[u] = kv12::load8(p.v_cache, p.v_scale, head, c);
+                } else if constexpr (Q4) {
                     const size_t head = size_t(j) * HKV + g;
                     b.k[u] = detail::load_q4<false>(p.k_cache, p.k_scale, head, c, kvpol);
                     b.v[u] = detail::load_q4<true>(p.v_cache, p.v_scale, head, c, kvpol);
@@ -105,7 +110,11 @@
         for (int i = tid; i < KT * 2 * (D / 8); i += NT) {
             const int key = i / (2 * (D / 8)), kv = (i / (D / 8)) % 2, ch = i % (D / 8), j = base + key;
             const bool ok = j < L_old;
-            if constexpr (Q4) {
+            if constexpr (KV12) {
+                const size_t head = size_t(j) * HKV + g;
+                *reinterpret_cast<uint4*>(kvs + kv_off(st, key, kv, ch)) =
+                    ok ? kv12::load8(kv ? p.v_cache : p.k_cache, kv ? p.v_scale : p.k_scale, head, ch) : uint4{};
+            } else if constexpr (Q4) {
                 uint4 packed{};
                 if (ok) {
                     const size_t head = size_t(j) * HKV + g;
@@ -347,6 +356,11 @@
                        : make_uint2(q4_g64::expand_pair<false>(bits, 0, f), q4_g64::expand_pair<false>(bits, 2, f));
             } else {
                 v = make_uint2(pack2(y[0], y[1]), pack2(y[2], y[3]));
+                if constexpr (KV12) {
+                    const size_t head = size_t(p0 + m) * HKV + g;
+                    kv12::pack4(v, static_cast<kv12::Head*>(kv ? p.v_cache : p.k_cache)[head],
+                                static_cast<kv12::Spill*>(kv ? p.v_scale : p.k_scale)[head]);
+                }
             }
             reinterpret_cast<uint2*>(&s_nkv[kv][m][0])[lane] = v;
         }
@@ -834,6 +848,7 @@
     // owner: the global writes, at the end so they delay nothing (and, for M > 1 on a ring, because the
     // overwritten slots were still being read)
     if (owner) {
+        if constexpr (!KV12)
         for (int idx = tid; idx < 2 * M * 16; idx += NT) {  // new K/V rows
             const int kv = idx / (M * 16), m = (idx / 16) % M, c8 = idx % 16;
             const int row = FULL ? p0 + m : (p0 + m) & (WIN - 1);

@@ -153,6 +153,7 @@ class Drafter {
   void profile_mark(unsigned boundary);
   std::array<cudaEvent_t, 5> profile_events_{};
   void load(const std::filesystem::path& model_dir);
+  void gather_head_rows(int rows, void* weights, float* scales, std::int32_t* map);
   void run_draft(int bucket);
   void run_layers(int bucket);                                                  // a draft after its input rows
   void run_commit(const __nv_bfloat16* feats, int n, int row0, bool last_piece);  // large commits
@@ -181,9 +182,9 @@ class Drafter {
   const __nv_bfloat16 *final_norm_ = nullptr, *mask_embed_ = nullptr, *f_norm_ = nullptr;
   const __nv_bfloat16 *w1_ = nullptr, *rnn_w_ = nullptr, *rnn_b_ = nullptr;
   __nv_bfloat16 *fold_w_ = nullptr, *fold_b_ = nullptr;
-  kernels::dense::Matrix head_{};         // the unembedding
+  Dense head_;  // full-vocabulary unembedding and its packed metadata
   // the shortlist head: rows [0, short_K_) = ranked tokens and specials (ascending ids), then context tokens
-  kernels::dense::Matrix short_head_{};   // [short_K_ + CONTEXT_ROWS, H] like head_
+  kernels::dense::Matrix short_head_{};   // [short_K_ + CONTEXT_ROWS, H] BF16 or FP8 rows
   std::int32_t* short_map_ = nullptr;     // row -> token id
   std::int32_t* short_ids_ = nullptr;     // staging of ids to gather
   int short_K_ = 0, short_E_ = 0;         // ranked rows, context rows in use

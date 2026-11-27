@@ -10,6 +10,7 @@
 #include "kernels/batch/mx_gemm.h"
 #include "kernels/dense/dense.h"
 #include "kernels/draft/gemm.h"
+#include "kernels/draft/shortlist.h"
 
 #include <cuda_fp8.h>
 #include <math_constants.h>
@@ -620,7 +621,7 @@ struct LayerW {
 
 struct BatchDFlash2Head::Impl {
   TpRuntime& tp;
-  head::Nvfp4Matrix matrix;
+  kernels::draft::DFlash2DraftHead draft_head;
   int max_seqs;
   cudaStream_t stream;
   std::vector<DeviceBuffer> storage;
@@ -640,12 +641,12 @@ struct BatchDFlash2Head::Impl {
   }
 
   Impl(TpRuntime& tp_in, head::Nvfp4Matrix m, int max_s, cudaStream_t s)
-      : tp(tp_in), matrix(m), max_seqs(max_s), stream(s) {
-    if (!matrix.codes || !matrix.scales || matrix.rows < 16)
+      : tp(tp_in), draft_head(m, s), max_seqs(max_s), stream(s) {
+    if (!m.codes || !m.scales || m.rows < 16)
       throw std::invalid_argument("BatchDFlash2Head requires --head-nvfp4");
     const int mh_max = max_seqs * GAMMA;
     hidden = alloc<Bf>(std::size_t(mh_max) * H);
-    head_ws = alloc<std::byte>(kernels::batch::head_topk16_nvfp4_workspace_bytes(mh_max, matrix.rows));
+    head_ws = alloc<std::byte>(kernels::batch::head_topk16_nvfp4_workspace_bytes(mh_max, draft_head.matrix().rows));
     top_vals = alloc<float>(std::size_t(mh_max) * 16);
     top_ids = alloc<std::int32_t>(std::size_t(mh_max) * 16);
     local_cand = alloc<head::Candidate>(std::size_t(mh_max) * 16);
@@ -670,8 +671,10 @@ void BatchDFlash2Head::run_rows(int total_rows, const Bf* hidden_in) {
   const std::size_t hidden_bytes = std::size_t(total_rows) * H * sizeof(Bf);
   Bf* input = hidden_in ? const_cast<Bf*>(hidden_in) : d.hidden;
   d.tp.exchange_draft_head(input, hidden_bytes, nullptr, d.stream);
-  kernels::batch::head_topk16_nvfp4(input, H, d.matrix, total_rows, d.head_ws, d.top_vals, d.top_ids, d.stream);
+  kernels::batch::head_topk16_nvfp4(input, H, d.draft_head.matrix(), total_rows, d.head_ws, d.top_vals,
+                                    d.top_ids, d.stream);
   const int total_cands = total_rows * 16;
+  d.draft_head.remap_ids(d.top_ids, total_cands, d.stream);
   pack_batch_candidates<<<(total_cands + 255) / 256, 256, 0, d.stream>>>(
       d.top_vals, d.top_ids, total_cands, d.local_cand);
   d.tp.exchange_draft_head(d.local_cand, std::size_t(total_cands) * sizeof(head::Candidate), d.gathered_cand,
@@ -685,7 +688,7 @@ void BatchDFlash2Head::run_rows(int total_rows, const Bf* hidden_in) {
 
 const std::int32_t* BatchDFlash2Head::ids() const { return impl_->top_ids; }
 const float* BatchDFlash2Head::values() const { return impl_->top_vals; }
-std::size_t BatchDFlash2Head::device_bytes() const { return impl_->bytes; }
+std::size_t BatchDFlash2Head::device_bytes() const { return impl_->bytes + impl_->draft_head.device_bytes(); }
 
 // =================================================================================================
 // BatchDFlash2
@@ -707,7 +710,7 @@ struct BatchDFlash2::Impl {
   // Target embeddings and head
   const Bf* embed = nullptr;
   const float* embed_norm = nullptr;
-  head::Nvfp4Matrix target_head{};
+  kernels::draft::DFlash2DraftHead draft_head;
   BatchDFlash2Head* sharded_head = nullptr;
 
   // DFlash2 weights
@@ -798,6 +801,7 @@ struct BatchDFlash2::Impl {
       throw std::invalid_argument("BatchDFlash2: invalid slots or max_seqs");
     if (!embed || !embed_norm) throw std::invalid_argument("BatchDFlash2: missing target embeddings");
     if (!sharded_head) {
+      head::Nvfp4Matrix target_head;
       if (head_override && head_override->codes && head_override->scales) {
         target_head = *head_override;
       } else if (w.unembed_nvfp4.codes && w.unembed_nvfp4.scales) {
@@ -807,6 +811,7 @@ struct BatchDFlash2::Impl {
       }
       if (target_head.v_begin != 0 || target_head.rows < 16 || target_head.rows > Vocabulary)
         throw std::invalid_argument("BatchDFlash2 TP=1 requires the complete NVFP4 target head");
+      draft_head = kernels::draft::DFlash2DraftHead(target_head, s, target_head.rows == Vocabulary);
     }
     if (precision == Precision::MXFP8) mx_gemm = std::make_unique<kbd::MxGemm>();
 
@@ -950,7 +955,7 @@ struct BatchDFlash2::Impl {
     attn_partial_ml = alloc<float>(max_seq_chunks * KVHeads * GqaRows * 2);
 
     if (!sharded_head) {
-      head_ws = alloc<std::byte>(kernels::batch::head_topk16_nvfp4_workspace_bytes(MH, target_head.rows));
+      head_ws = alloc<std::byte>(kernels::batch::head_topk16_nvfp4_workspace_bytes(MH, draft_head.matrix().rows));
       top_vals = alloc<float>(std::size_t(MH) * 16);
       top_ids = alloc<std::int32_t>(std::size_t(MH) * 16);
     }
@@ -1194,7 +1199,9 @@ struct BatchDFlash2::Impl {
       cand_ids = sharded_head->ids();
       cand_vals = sharded_head->values();
     } else {
-      kernels::batch::head_topk16_nvfp4(hidden_props, H, target_head, total_rows, head_ws, top_vals, top_ids, s);
+      kernels::batch::head_topk16_nvfp4(hidden_props, H, draft_head.matrix(), total_rows, head_ws, top_vals,
+                                        top_ids, s);
+      draft_head.remap_ids(top_ids, total_rows * 16, s);
       cand_ids = top_ids;
       cand_vals = top_vals;
     }
@@ -1230,7 +1237,8 @@ BatchDFlash2::Drafts BatchDFlash2::propose(int n, const std::int32_t* slots, con
 int BatchDFlash2::slots() const { return impl_->slots; }
 int BatchDFlash2::max_seqs() const { return impl_->max_seqs; }
 std::size_t BatchDFlash2::device_bytes() const {
-  return impl_->bytes + (impl_->mx_gemm ? kbd::MxGemm::WORKSPACE_BYTES : 0) + (std::size_t(32) << 20);
+  return impl_->bytes + impl_->draft_head.device_bytes() +
+         (impl_->mx_gemm ? kbd::MxGemm::WORKSPACE_BYTES : 0) + (std::size_t(32) << 20);
 }
 
 BatchDFlash2::Precision BatchDFlash2::default_precision() {

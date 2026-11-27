@@ -121,6 +121,16 @@ struct TpOptions {
 // Command-line values override INKLING_TP_SIZE, INKLING_TP_RANK and INKLING_TP_WIRE.
 TpOptions tp_options(std::optional<int> size = {}, std::optional<int> rank = {}, std::string wire = {});
 
+inline void validate_dense_formats(bool fp8, bool pico12) {
+  if (fp8 && pico12) throw std::invalid_argument("--dense-fp8 and --dense-pico12 are mutually exclusive");
+}
+
+inline void validate_kv_formats(bool fp8, bool q4, bool kv12) {
+  if (kv12 && (fp8 || q4))
+    throw std::invalid_argument("--kv-12 is mutually exclusive with --kv-fp8 and --kv-q4");
+  if (fp8 && q4) throw std::invalid_argument("--kv-fp8 and --kv-q4 are mutually exclusive");
+}
+
 struct RuntimeOptions {
   int max_batch = 1;
   int batch_ctx = 32768;
@@ -135,7 +145,9 @@ struct RuntimeOptions {
   // than 2048 for 0.38 GB more scratch; results differ between chunk sizes only by rounding.
   int prefill_chunk = 3072;
   bool dense_fp8 = true, kv_fp8 = false, spec = false;
+  bool dense_pico12 = false;  // Bit-exact BF16 projections and dense unembedding
   bool kv_q4 = false;  // Q4_G64 full-attention caches
+  bool kv_12 = false;  // Bit-exact BF16 full-attention caches
   float spec_threshold = 0.8f;
   SpecWidths spec_widths = SpecWidths::Coarse;
   std::string draft_type = "dspark";
@@ -155,6 +167,7 @@ struct RuntimeOptions {
   bool cold_prefill = false;  // benchmark without prompt reuse
   TpOptions tp;
   bool head_nvfp4 = false;  // packed NVFP4 unembedding, independent of projection precision
+  bool cert_head = false;  // TP=1 exact greedy head; auto-enabled for PICO12; INGINE_CERT_HEAD overrides
 };
 
 struct BatchSampling {

@@ -10,7 +10,9 @@
 #include "core/arena.h"
 #include "core/tensor.h"
 #include "model/tp_layout.h"
-#include "kernels/head/nvfp4_head.h"
+#include "kernels/common/pico12.cuh"
+#include "kernels/dense/dense.h"
+#include "kernels/head/cert_head.h"
 
 #include <array>
 #include <cstdint>
@@ -111,19 +113,25 @@ inline T* ptr(const Tensor& t) {
 
 // ----------------------------------------------------------------------------------------------- weights
 
-// A dense matrix as the decoder stores it: BF16 rows, or float8_e4m3fn rows with FP32 per-row scales
-// (`scale.data != nullptr`; value = fp8 * scale, see weights.dequant / dense fp8_rows).
+// BF16 rows, FP8 rows with FP32 per-row scales, or a PICO12 byte blob.
 struct Dense {
-  Tensor w;      // [rows, cols] bf16 or fp8
-  Tensor scale;  // [rows] fp32, or empty (data == nullptr) for BF16
+  Tensor w;
+  Tensor scale;  // [rows] fp32, only for FP8
+  kernels::pico12::Layout pico12_layout{};
+  bool is_pico12 = false;
+
   bool fp8() const { return scale.data != nullptr; }
-  int rows() const { return w.ne[1]; }
-  int cols() const { return w.ne[0]; }
+  int rows() const { return is_pico12 ? pico12_layout.rows : w.ne[1]; }
+  int cols() const { return is_pico12 ? pico12_layout.cols : w.ne[0]; }
+  kernels::dense::Matrix matrix() const {
+    return {w.data, ptr<const float>(scale), rows(), cols(), is_pico12 ? &pico12_layout : nullptr, false};
+  }
 };
 
 struct HeadWeights {
   Dense dense;
   kernels::head::Nvfp4Matrix nvfp4;
+  kernels::head::CertifiedHead certified;
   int v_begin = 0;
 };
 
@@ -152,7 +160,7 @@ struct Layer {
   Tensor mlp_norm;
 
   // attention projections: one [R, H] matrix in SEG order (R = proj_rows(full)); the per-projection
-  // entries are row views of it (with the matching rows of its scales when FP8)
+  // entries are row views for BF16 and FP8. Packed PICO12 uses the whole matrix.
   Dense wproj;
   Dense wq, wgate, wr, wsink, wk, wv, wk_dyn, wv_dyn;
   Dense wo;  // [H, 3072]
@@ -195,11 +203,13 @@ struct Weights {
   Tensor embed_norm;          // fp32 [H]
   Tensor final_query;         // fp32 [1, H]
   Tensor final_norm;          // fp32 [H] (also final_norm1 = [1, H] view of the same memory)
-  Dense unembed;              // [UNPADDED_VOCAB, H] bf16, or FP8 rows + scales (dense_fp8)
+  Dense unembed;              // [UNPADDED_VOCAB, H] BF16, FP8, or PICO12
   kernels::head::Nvfp4Matrix unembed_nvfp4;
+  kernels::head::CertifiedHead unembed_certified;
   Tensor message_queries;     // fp32 [12, 4, H]: q, k, v, mlp per loop layer
   std::array<ExpertFormat, LAYERS> expert_formats{};
   bool dense_fp8 = false;     // wproj (+ views) and wo use FP8 rows
+  bool dense_pico12 = false;  // wproj and wo use PICO12
 
   std::vector<DeviceBuffer> storage;  // device allocations behind the views
 };
@@ -225,11 +235,11 @@ struct Ablation {
 struct State {
   int max_ctx = 0;
   int ring_rows = WINDOW;
-  bool kv_fp8 = false, kv_q4 = false;
+  bool kv_fp8 = false, kv_q4 = false, kv_12 = false;
   Tensor k_ring, v_ring;      // bf16 [40, 1024, local KV heads, 128] (sliding visits, RING_INDEX)
   Tensor ring_pos;            // int64 [40, 1024], absolute position per slot, -1 = empty
-  Tensor k_full, v_full;      // [full visits, max_ctx, local KV heads, 128 (BF16/FP8) or 64 (Q4)]
-  Tensor k_full_scale, v_full_scale;  // Q4 only: FP16 [full visits, max_ctx, local KV heads, 2]
+  Tensor k_full, v_full;      // [full visits, max_ctx, local KV heads, head elements]
+  Tensor k_full_scale, v_full_scale;  // FP16 Q4 scales or U8 KV12 overflow, same leading dimensions
   Tensor conv_k, conv_v;      // fp32 [48, 3, local KV channels] previous 3 inputs (oldest first)
   Tensor conv_attn, conv_mlp; // fp32 [48, 3, H]
   int length = 0;             // tokens in the context (host copy; decode steps do not advance it)
@@ -272,7 +282,7 @@ struct Buffers {
   Tensor wts;                       // fp32 [m, 8]
   Tensor act;                       // bf16 [m, 8, I]
   Tensor xf;                        // bf16 [1, m, H]
-  Tensor greedy;                    // TP=2: merged greedy token (int32 [1])
+  Tensor greedy;                    // exact greedy IDs (int32 [m])
   Tensor logits;                    // fp32 [m, UNPADDED_VOCAB]
   Tensor taps;                      // bf16 [m, 4, H]: partial block entering TAP_VISITS + final normed hidden
   // convolution inputs of each row per visit, for rolling back rejected rows (history = true)

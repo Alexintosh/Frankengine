@@ -63,9 +63,9 @@ struct Args {
   std::string filter;
   std::optional<int> tp_size, tp_rank;
   std::string tp_wire;
-  bool dense_fp8 = false, head_nvfp4 = false;
+  bool dense_fp8 = false, dense_pico12 = false, head_nvfp4 = false;
   bool generate = false;
-  bool kv_fp8 = false, kv_q4 = false, kv_q4_kld = false;
+  bool kv_fp8 = false, kv_q4 = false, kv_12 = false, kv_q4_kld = false;
   int kld_tokens = 7700;
   int dflash2_max_ctx = 1536;
   std::string draft_type = "dspark", dflash2_dir;
@@ -89,8 +89,8 @@ void usage() {
       "usage: ingine-validate [--model-dir DIR] [--ablation FILE] [--golden DIR] [--cases SUBSTR] [--generate [--spec] [--generate-tokens N] [--generate-trace FILE]]\n"
       "                       [--max-batch 1..8] [--spec-widths coarse|fine|fine2] [--draft-nvfp4] [--path N [--spec] [--tie-margin X] [--max-gap-rate R]] [--max-kl X] [--max-mean-kl X]\n"
       "                       [--greedy-witness FILE] [--spec-threshold P]\n"
-      "                       [--kv-fp8 | --kv-q4] [--kv-q4-kld] [--kld-tokens N]\n"
-      "                       [--min-top1 F] [--dense-fp8] [--head-nvfp4] [--tp-size N] [--tp-rank N] [--tp-wire bf16|fp32|bf16-moe]\n"
+      "                       [--kv-fp8 | --kv-q4 | --kv-12] [--kv-q4-kld] [--kld-tokens N]\n"
+      "                       [--min-top1 F] [--dense-fp8 | --dense-pico12] [--head-nvfp4] [--tp-size N] [--tp-rank N] [--tp-wire bf16|fp32|bf16-moe]\n"
       "--cases takes comma-separated name substrings; --ablation defaults to <golden>/ablation.safetensors, the\n"
       "plain-projection file the goldens of the abliterated model were made with\n");
 }
@@ -422,13 +422,15 @@ bool score_greedy_witness(const Args& args, TpOptions tp) {
   bool ok = true;
   tp.full_logits = true;
   for (bool kv_fp8 : {false, true}) {
-    if (args.kv_fp8 && !kv_fp8) continue;
+    if ((args.kv_fp8 && !kv_fp8) || (args.kv_12 && kv_fp8)) continue;
     RuntimeOptions opt;
     opt.model_dir = args.model_dir;
     opt.dense_fp8 = args.dense_fp8;
+    opt.dense_pico12 = args.dense_pico12;
     opt.head_nvfp4 = args.head_nvfp4;
     opt.kv_fp8 = kv_fp8 && !args.kv_q4;
     opt.kv_q4 = args.kv_q4;
+    opt.kv_12 = args.kv_12;
     opt.tp = tp;
     opt.max_ctx = 0;
     opt.prefill_chunk = 2048;  // same chunk boundaries as the TP benchmark and chat golden
@@ -519,8 +521,10 @@ int main(int argc, char** argv) {
     else if (k == "--tp-rank") a.tp_rank = std::stoi(val());
     else if (k == "--tp-wire") a.tp_wire = val();
     else if (k == "--dense-fp8") a.dense_fp8 = true;
+    else if (k == "--dense-pico12") a.dense_pico12 = true;
     else if (k == "--kv-fp8") a.kv_fp8 = true;
     else if (k == "--kv-q4") a.kv_q4 = true;
+    else if (k == "--kv-12") a.kv_12 = true;
     else if (k == "--kv-q4-kld") a.kv_q4_kld = true;
     else if (k == "--kld-tokens") {
       a.kld_tokens = std::stoi(val());
@@ -540,7 +544,9 @@ int main(int argc, char** argv) {
   }
   if (a.ablation.empty()) a.ablation = a.golden / "ablation.safetensors";
   try {
-    if (a.kv_fp8 && a.kv_q4) throw std::invalid_argument("--kv-fp8 and --kv-q4 are mutually exclusive");
+    validate_dense_formats(a.dense_fp8, a.dense_pico12);
+    validate_kv_formats(a.kv_fp8, a.kv_q4, a.kv_12);
+    if (a.kv_12 && a.kv_q4_kld) throw std::invalid_argument("--kv-12 is mutually exclusive with --kv-q4-kld");
     if (a.kv_q4_kld && (a.kld_tokens < 1 || a.kv_fp8 || a.generate || a.path_tokens > 0 ||
                         !a.greedy_witness.empty() || !a.logits_dump.empty()))
       throw std::invalid_argument("Q4 KLD needs a positive stage count and runs as a standalone comparison");
@@ -574,7 +580,7 @@ int main(int argc, char** argv) {
         if (!hit) continue;
       }
       const bool fp8 = c.at("kv_fp8").get<bool>();
-      if (a.kv_fp8 && !fp8) continue;
+      if ((a.kv_fp8 && !fp8) || (a.kv_12 && fp8)) continue;
       auto& group = groups[{c.at("ablated").get<bool>(), fp8 && !a.kv_q4_kld}];
       auto golden = load_json(a.golden / c.at("file").get<std::string>());
       if (a.kv_q4_kld && std::any_of(group.begin(), group.end(), [&](const auto& prior) {
@@ -597,7 +603,9 @@ int main(int argc, char** argv) {
       opt.ablation = key.first ? a.ablation : fs::path();
       opt.kv_fp8 = key.second && !a.kv_q4;
       opt.kv_q4 = a.kv_q4;
-      opt.dense_fp8 = a.dense_fp8 || manifest.value("dense_fp8", true);
+      opt.kv_12 = a.kv_12;
+      opt.dense_fp8 = !a.dense_pico12 && (a.dense_fp8 || manifest.value("dense_fp8", true));
+      opt.dense_pico12 = a.dense_pico12;
       opt.head_nvfp4 = a.head_nvfp4;
       opt.tp = tp;
       opt.max_ctx = manifest.value("max_ctx", 8192);
@@ -617,6 +625,7 @@ int main(int argc, char** argv) {
         continue;
       }
       std::printf("== %s model, %s full-attention KV\n", key.first ? "abliterated" : "original",
+                  opt.kv_12 ? "KV12 / BF16 golden" :
                   opt.kv_q4 ? (key.second ? "Q4 / FP8 golden" : "Q4 / BF16 golden") : key.second ? "FP8" : "BF16");
       if (a.path_tokens > 0) run_path(opt, cases, a, tot, gaps);
       else if (a.generate) run_generate(opt, cases, a, tot);

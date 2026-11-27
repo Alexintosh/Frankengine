@@ -1,7 +1,7 @@
 // Weights in the decoder's device layouts, read from the Hugging Face checkpoint: weights.load / load_layer,
 // plus fast.FastDecoder._concat_projections (one [R, H] projection matrix per layer, the per-projection
 // matrices are row views of it), _stack_layer_params (stacked norms and gate weights) and _fp8_dense
-// (wproj, wo and the unembedding as FP8 rows + FP32 row scales, the BF16 copies freed), and
+// (wproj, wo and the unembedding as FP8 rows + FP32 row scales), or lossless PICO12 packing, and
 // model.Ablation.load / none.
 //
 // Large tensors are uploaded straight from the file with the core DeviceUploader; small per-channel
@@ -178,6 +178,22 @@ Dense to_fp8(Loader& ld, const Tensor& bf16, int rows, int cols) {
   return Dense{rm(q, DType::FP8_E4M3FN, {rows, cols}), rm(s, DType::FP32, {rows})};
 }
 
+Dense to_pico12(Loader& ld, const void* bf16, int rows, int cols) {
+  auto packed = kernels::pico12::pack_pico12_host(bf16, rows, cols);
+  if (packed.bytes > std::size_t(std::numeric_limits<std::int32_t>::max()))
+    throw std::length_error("weights: PICO12 blob exceeds tensor size limit");
+  void* d = ld.alloc(packed.bytes);
+  CUDA_CHECK(cudaMemcpyAsync(d, packed.data.get(), packed.bytes, cudaMemcpyHostToDevice, ld.stream()));
+  CUDA_CHECK(cudaStreamSynchronize(ld.stream()));
+  return {rm(d, DType::U8, {int(packed.bytes)}), {}, packed.layout, true};
+}
+
+void read_bf16_rows(SafetensorsRef ref, void* dst, int cols, int rows, int first) {
+  const auto req = upload_request(ref, dst);
+  const std::size_t stride = std::size_t(cols) * sizeof(std::uint16_t);
+  ref.file->read_range(req.offset + std::size_t(first) * stride, std::size_t(rows) * stride, dst);
+}
+
 Dense row_view(const Dense& d, int begin, int end) {
   const int cols = d.cols();
   const std::size_t esize = d.fp8() ? 1 : 2;
@@ -195,7 +211,7 @@ void copy_columns(Loader& ld, void* dst, int dst_cols, const void* src, int src_
                               rows, cudaMemcpyDeviceToDevice, ld.stream()));
 }
 
-Layer load_layer_into(Loader& ld, int l, ExpertFormat fmt, bool dense_fp8, const TpLayout& tp = TpLayout{}) {
+Layer load_layer_into(Loader& ld, int l, ExpertFormat fmt, bool dense_fp8, const TpLayout& tp, bool dense_pico12) {
   const SafetensorsModel& m = ld.model();
   const std::string p = "model.llm.layers." + std::to_string(l) + ".";
   Layer layer;
@@ -222,21 +238,45 @@ Layer load_layer_into(Loader& ld, int l, ExpertFormat fmt, bool dense_fp8, const
   const bool sharded = tp.tp_size > 1;
   DeviceBuffer proj_tmp, wo_tmp, w2_tmp, w2_scale_tmp;
   Tensor wproj_bf16, wo_bf16;
-  auto queue_bf16_rows = [&](const std::string& name, void* dst, int rows, int cols, int local, int first) {
+  auto bf16_matrix = [&](const std::string& name, int rows, int cols) {
     const SafetensorsRef ref = m.at(name);
     if (ref->dtype != "BF16" || ref->numel() != std::int64_t(rows) * cols)
       throw std::runtime_error("weights: " + name + " must be BF16 [" + std::to_string(rows) + ", " +
                                std::to_string(cols) + "]");
-    ld.queue(name, dst, local, first);
+    return ref;
   };
-  {
+  const std::string wo_name = p + "attn.wo_ud.weight";
+  const auto wo_ref = bf16_matrix(wo_name, H, HEADS * HEAD_DIM);
+  if (dense_pico12) {
+    std::vector<std::uint16_t> proj(std::size_t(R) * H);
+    for (int s = 0; s < num_segs(layer.full); ++s) {
+      const auto ref = bf16_matrix(p + seg_names[s], SEG_ROWS[s], H);
+      read_bf16_rows(ref, proj.data() + std::size_t(tp.weight_offset(s)) * H, H,
+                     tp.segment_rows(s), tp.tp_rank * tp.segment_rows(s));
+    }
+    layer.wproj = to_pico12(ld, proj.data(), R, H);
+    const int cols = HEADS * HEAD_DIM;
+    std::vector<std::uint16_t> wo(std::size_t(H) * cols);
+    read_bf16_rows(wo_ref, wo.data(), cols, H, 0);
+    if (sharded) {
+      const int first = tp.tp_rank * tp.q_dim_local;
+      // Compact the rank's column slice in place, ahead of the rows still to read.
+      for (int r = 0; r < H; ++r)
+        std::memmove(wo.data() + std::size_t(r) * tp.q_dim_local, wo.data() + std::size_t(r) * cols + first,
+                     std::size_t(tp.q_dim_local) * sizeof(wo[0]));
+    }
+    layer.wo = to_pico12(ld, wo.data(), H, tp.q_dim_local);
+  } else {
     void* d = dense_fp8 ? (proj_tmp = DeviceBuffer(std::size_t(R) * H * 2)).p : ld.alloc(std::size_t(R) * H * 2);
-    for (int s = 0; s < num_segs(layer.full); ++s)
-      queue_bf16_rows(p + seg_names[s], static_cast<char*>(d) + std::size_t(tp.weight_offset(s)) * H * 2,
-                       SEG_ROWS[s], H, tp.segment_rows(s), tp.tp_rank * tp.segment_rows(s));
+    for (int s = 0; s < num_segs(layer.full); ++s) {
+      const std::string name = p + seg_names[s];
+      bf16_matrix(name, SEG_ROWS[s], H);
+      ld.queue(name, static_cast<char*>(d) + std::size_t(tp.weight_offset(s)) * H * 2,
+               tp.segment_rows(s), tp.tp_rank * tp.segment_rows(s));
+    }
     wproj_bf16 = rm(d, DType::BF16, {R, H});
     void* o = dense_fp8 || sharded ? (wo_tmp = DeviceBuffer(std::size_t(H) * 3072 * 2)).p : ld.alloc(std::size_t(H) * 3072 * 2);
-    queue_bf16_rows(p + "attn.wo_ud.weight", o, H, HEADS * HEAD_DIM, H, 0);
+    ld.queue(wo_name, o, H, 0);
     wo_bf16 = rm(o, DType::BF16, {H, HEADS * HEAD_DIM});
   }
 
@@ -387,33 +427,51 @@ Layer load_layer_into(Loader& ld, int l, ExpertFormat fmt, bool dense_fp8, const
     copy_w2(ex.w2_scale, w2_scale_tmp, scale_block);
   }
 
-  layer.wproj = dense_fp8 ? to_fp8(ld, wproj_bf16, R, H) : Dense{wproj_bf16, {}};
   DeviceBuffer wo_codes_tmp;
-  if (dense_fp8 && sharded) {
-    // Quantize the full checkpoint rows first. Each rank retains the same FP32 row scales.
-    wo_codes_tmp = DeviceBuffer(std::size_t(H) * HEADS * HEAD_DIM);
-    auto* scales = static_cast<float*>(ld.alloc(std::size_t(H) * sizeof(float)));
-    kernels::dense::fp8_rows(static_cast<const __nv_bfloat16*>(wo_bf16.data), H, HEADS * HEAD_DIM,
-                             wo_codes_tmp.p, scales, ld.stream());
-    layer.wo = {rm(wo_codes_tmp.p, DType::FP8_E4M3FN, {H, HEADS * HEAD_DIM}), rm(scales, DType::FP32, {H})};
-  } else {
-    layer.wo = dense_fp8 ? to_fp8(ld, wo_bf16, H, HEADS * HEAD_DIM) : Dense{wo_bf16, {}};
-  }
-  if (sharded) {
-    const int element_size = dense_fp8 ? 1 : 2;
-    void* local = ld.alloc(std::size_t(H) * tp.q_dim_local * element_size);
-    copy_columns(ld, local, tp.q_dim_local, layer.wo.w.data, HEADS * HEAD_DIM, tp.tp_rank * tp.q_dim_local,
-                 tp.q_dim_local, H, element_size);
-    layer.wo.w = rm(local, layer.wo.w.dtype, {H, tp.q_dim_local});
+  if (!dense_pico12) {
+    layer.wproj = dense_fp8 ? to_fp8(ld, wproj_bf16, R, H) : Dense{wproj_bf16, {}};
+    if (dense_fp8 && sharded) {
+      // Quantize the full checkpoint rows first. Each rank retains the same FP32 row scales.
+      wo_codes_tmp = DeviceBuffer(std::size_t(H) * HEADS * HEAD_DIM);
+      auto* scales = static_cast<float*>(ld.alloc(std::size_t(H) * sizeof(float)));
+      kernels::dense::fp8_rows(static_cast<const __nv_bfloat16*>(wo_bf16.data), H, HEADS * HEAD_DIM,
+                               wo_codes_tmp.p, scales, ld.stream());
+      layer.wo = {rm(wo_codes_tmp.p, DType::FP8_E4M3FN, {H, HEADS * HEAD_DIM}), rm(scales, DType::FP32, {H})};
+    } else {
+      layer.wo = dense_fp8 ? to_fp8(ld, wo_bf16, H, HEADS * HEAD_DIM) : Dense{wo_bf16, {}};
+    }
+    if (sharded) {
+      const int element_size = dense_fp8 ? 1 : 2;
+      void* local = ld.alloc(std::size_t(H) * tp.q_dim_local * element_size);
+      copy_columns(ld, local, tp.q_dim_local, layer.wo.w.data, HEADS * HEAD_DIM, tp.tp_rank * tp.q_dim_local,
+                   tp.q_dim_local, H, element_size);
+      layer.wo.w = rm(local, layer.wo.w.dtype, {H, tp.q_dim_local});
+    }
+    Dense* views[NUM_SEGS] = {&layer.wq, &layer.wgate, &layer.wr, &layer.wsink,
+                              &layer.wk, &layer.wv,    &layer.wk_dyn, &layer.wv_dyn};
+    for (int s = 0; s < num_segs(layer.full); ++s) *views[s] = row_view(layer.wproj, tp.weight_offset(s), tp.weight_offset(s + 1));
   }
   if (dense_fp8 || sharded) CUDA_CHECK(cudaStreamSynchronize(ld.stream()));  // temporaries
-  Dense* views[NUM_SEGS] = {&layer.wq, &layer.wgate, &layer.wr, &layer.wsink,
-                            &layer.wk, &layer.wv,    &layer.wk_dyn, &layer.wv_dyn};
-  for (int s = 0; s < num_segs(layer.full); ++s) *views[s] = row_view(layer.wproj, tp.weight_offset(s), tp.weight_offset(s + 1));
   return layer;
 }
 
-HeadWeights load_head_into(Loader& ld, bool dense_fp8, bool head_nvfp4, const TpLayout& tp) {
+kernels::head::CertifiedHead load_cert_head(Loader& ld, const __nv_bfloat16* values, int rows) {
+  using namespace kernels::head;
+  constexpr int H = HIDDEN;
+  const auto stream = ld.stream();
+  const std::size_t elements = std::size_t(rows) * H;
+  const float g = nvfp4_outer_scale(values, elements, stream);
+  auto* codes = static_cast<uint8_t*>(ld.alloc(elements / 2));
+  auto* scales = static_cast<uint8_t*>(ld.alloc(elements / 16));
+  auto* bounds = static_cast<float*>(ld.alloc(std::size_t(rows) * sizeof(float)));
+  nvfp4_pack_rows(values, rows, g, codes, scales, stream);
+  const Nvfp4Matrix proxy{codes, scales, g, rows, 0};
+  cert_head_bounds(values, proxy, bounds, stream);
+  return {proxy, bounds};
+}
+
+HeadWeights load_head_into(Loader& ld, bool dense_fp8, bool head_nvfp4, const TpLayout& tp, bool dense_pico12,
+                           bool cert_head = false) {
   const std::string name = "model.llm.unembed.weight";
   const auto ref = ld.model().at(name);
   const int H = HIDDEN, local = tp.v_end - tp.v_begin;
@@ -422,13 +480,26 @@ HeadWeights load_head_into(Loader& ld, bool dense_fp8, bool head_nvfp4, const Tp
 
   const int rows = head_nvfp4 && tp.tp_size == 1 ? int(ref->shape.at(0)) : local;
   const std::size_t bytes = std::size_t(rows) * H * 2;
+  HeadWeights out;
+  out.v_begin = tp.v_begin;
+  if (dense_pico12 && !head_nvfp4) {
+    ld.flush();
+    auto host = std::make_unique_for_overwrite<std::uint16_t[]>(std::size_t(rows) * H);
+    read_bf16_rows(ref, host.get(), H, rows, tp.v_begin);
+    out.dense = to_pico12(ld, host.get(), rows, H);
+    if (cert_head) {
+      DeviceBuffer original(bytes);
+      original.copy_from_host(host.get(), bytes);
+      out.certified = load_cert_head(ld, static_cast<const __nv_bfloat16*>(original.p), rows);
+      CUDA_CHECK(cudaStreamSynchronize(ld.stream()));
+    }
+    return out;
+  }
   DeviceBuffer tmp;
   void* d = dense_fp8 || head_nvfp4 ? (tmp = DeviceBuffer(bytes)).p : ld.alloc(bytes);
   ld.queue(name, d, rows, tp.v_begin);
   ld.flush();
 
-  HeadWeights out;
-  out.v_begin = tp.v_begin;
   if (head_nvfp4) {
     auto stream = ld.stream();
     const auto* values = static_cast<const __nv_bfloat16*>(d);
@@ -460,6 +531,7 @@ HeadWeights load_head_into(Loader& ld, bool dense_fp8, bool head_nvfp4, const Tp
   } else {
     const Tensor bf = rm(d, DType::BF16, {local, H});
     out.dense = dense_fp8 ? to_fp8(ld, bf, local, H) : Dense{bf, {}};
+    if (cert_head) out.certified = load_cert_head(ld, static_cast<const __nv_bfloat16*>(d), local);
     if (dense_fp8) CUDA_CHECK(cudaStreamSynchronize(ld.stream()));
   }
   return out;
@@ -468,16 +540,19 @@ HeadWeights load_head_into(Loader& ld, bool dense_fp8, bool head_nvfp4, const Tp
 }  // namespace
 
 Weights load_weights(const fs::path& model_dir, bool dense_fp8, cudaStream_t stream, bool head_nvfp4,
-                     const TpLayout& tp) {
+                     const TpLayout& tp, bool dense_pico12, bool cert_head) {
+  validate_dense_formats(dense_fp8, dense_pico12);
   const SafetensorsModel m(model_dir);
   DeviceUploader up;
   Weights w;
   w.dense_fp8 = dense_fp8;
+  w.dense_pico12 = dense_pico12;
   w.expert_formats = expert_formats(model_dir);
   w.storage.reserve(4096);
   Loader ld(m, up, stream, w.storage);
   const int H = HIDDEN;
-  for (int l = 0; l < LAYERS; ++l) w.layers.push_back(load_layer_into(ld, l, w.expert_formats[l], dense_fp8, tp));
+  for (int l = 0; l < LAYERS; ++l)
+    w.layers.push_back(load_layer_into(ld, l, w.expert_formats[l], dense_fp8, tp, dense_pico12));
 
   // message_queries [12, 4, H] = cat([queries[:, :1], kv_queries, queries[:, 1:]], dim=1) with queries and
   // kv_queries [24, H] unflattened to [12, 2, H]
@@ -498,9 +573,11 @@ Weights load_weights(const fs::path& model_dir, bool dense_fp8, cudaStream_t str
   w.embed_norm = ld.f32("model.llm.embed_norm.weight", {H});
   w.final_query = ld.f32("model.llm.attn_res.output_query", {1, H});
   w.final_norm = ld.f32("model.llm.norm.weight", {H});
-  const HeadWeights head = load_head_into(ld, dense_fp8, head_nvfp4, tp);
+  const HeadWeights head = load_head_into(ld, dense_fp8, head_nvfp4, tp, dense_pico12,
+                                          cert_head && tp.tp_size == 1 && !dense_fp8 && !head_nvfp4);
   w.unembed = head.dense;
   w.unembed_nvfp4 = head.nvfp4;
+  w.unembed_certified = head.certified;
   CUDA_CHECK(cudaStreamSynchronize(stream));
   return w;
 }
@@ -511,17 +588,18 @@ Layer load_layer(const fs::path& model_dir, int l, bool dense_fp8, cudaStream_t 
   const SafetensorsModel m(model_dir);
   DeviceUploader up;
   Loader ld(m, up, stream, storage);
-  Layer layer = load_layer_into(ld, l, expert_formats(model_dir)[l], dense_fp8, tp);
+  Layer layer = load_layer_into(ld, l, expert_formats(model_dir)[l], dense_fp8, tp, false);
   CUDA_CHECK(cudaStreamSynchronize(stream));
   return layer;
 }
 
 HeadWeights load_head(const fs::path& model_dir, bool dense_fp8, bool head_nvfp4, cudaStream_t stream,
-                      std::vector<DeviceBuffer>& storage, const TpLayout& tp) {
+                      std::vector<DeviceBuffer>& storage, const TpLayout& tp, bool dense_pico12) {
+  validate_dense_formats(dense_fp8, dense_pico12);
   const SafetensorsModel m(model_dir);
   DeviceUploader up;
   Loader ld(m, up, stream, storage);
-  return load_head_into(ld, dense_fp8, head_nvfp4, tp);
+  return load_head_into(ld, dense_fp8, head_nvfp4, tp, dense_pico12);
 }
 
 // File layouts (FP32 or BF16 tensors):
