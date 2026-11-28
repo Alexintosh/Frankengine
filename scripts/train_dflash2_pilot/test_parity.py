@@ -18,11 +18,11 @@ from safetensors import safe_open
 from torch.nn import functional as F
 
 if __package__:
-    from .model import DFlash2DraftModel, load_target_head_and_embed
+    from .model import TOP_K, DFlash2DraftModel, load_target_head_and_embed
     from . import collect_rollouts, train
     from .train import Anchors, Sequence, configure_stage, loss_rows
 else:
-    from model import DFlash2DraftModel, load_target_head_and_embed
+    from model import TOP_K, DFlash2DraftModel, load_target_head_and_embed
     import collect_rollouts
     import train
     from train import Anchors, Sequence, configure_stage, loss_rows
@@ -164,30 +164,36 @@ class DFlash2Parity(unittest.TestCase):
         embed = torch.randn(128, 2304, generator=rng, dtype=torch.bfloat16)
         head = torch.randn(128, 2304, generator=rng, dtype=torch.bfloat16) * 0.05
         for stage in self.stages:
-            with self.subTest(stage=stage):
-                model = model_with(self.weights)
-                groups = configure_stage(model, stage)
-                rows, *_ = loss_rows(model, (ctx, mask, pos, ids, block_pos, pred, teacher),
-                                     embed, torch.ones(2304), head, head.float(), stage == "full", 1.0,
-                                     grad_checkpoint=stage == "full")
-                rows.mean().backward()
-                group_for = {id(parameter): (group["name"], group["weight_decay"])
-                             for group in groups for parameter in group["params"]}
-                self.assertEqual(len(group_for), sum(len(group["params"]) for group in groups))
-                for name, parameter in model.named_parameters():
-                    if stage == "selector" and not name.startswith("candidate_selector."):
-                        self.assertFalse(parameter.requires_grad)
-                        self.assertIsNone(parameter.grad)
-                        self.assertNotIn(id(parameter), group_for)
-                    else:
-                        component = "selector" if name.startswith("candidate_selector.") else "backbone"
-                        decay = 0.0 if parameter.ndim == 1 or name.endswith("_codebook") else 0.01
-                        self.assertEqual(group_for[id(parameter)], (component, decay), name)
-                        self.assertIsNotNone(parameter.grad, name)
-                        self.assertEqual(parameter.grad.dtype, torch.float32)
-                        self.assertTrue(torch.isfinite(parameter.grad).all().item(), name)
-                        self.assertGreater(parameter.grad.abs().max().item(), 0, name)
-                del model, groups, rows, parameter, _
+            for freeze in (False, True):
+                with self.subTest(stage=stage, freeze_codebooks=freeze):
+                    model = model_with(self.weights)
+                    groups = configure_stage(model, stage, freeze_codebooks=freeze)
+                    rows = loss_rows(
+                        model, (ctx, mask, pos, ids, block_pos, pred, teacher),
+                        embed, torch.ones(2304), head, head.float(), stage == "full", 1.0,
+                        loss_mode="tv_accept", grad_checkpoint=stage == "full",
+                    )[0]
+                    self.assertTrue(torch.isfinite(rows).all().item())
+                    rows.mean().backward()
+                    group_for = {id(parameter): (group["name"], group["weight_decay"])
+                                 for group in groups for parameter in group["params"]}
+                    self.assertEqual(len(group_for), sum(len(group["params"]) for group in groups))
+                    for name, parameter in model.named_parameters():
+                        selector = name.startswith("candidate_selector.")
+                        codebook = name.endswith("_codebook")
+                        if (stage == "selector" and not selector) or (freeze and codebook):
+                            self.assertFalse(parameter.requires_grad, name)
+                            self.assertIsNone(parameter.grad, name)
+                            self.assertNotIn(id(parameter), group_for)
+                        else:
+                            component = "selector" if selector else "backbone"
+                            decay = 0.0 if parameter.ndim == 1 or codebook else 0.01
+                            self.assertEqual(group_for[id(parameter)], (component, decay), name)
+                            self.assertIsNotNone(parameter.grad, name)
+                            self.assertEqual(parameter.grad.dtype, torch.float32)
+                            self.assertTrue(torch.isfinite(parameter.grad).all().item(), name)
+                            self.assertGreater(parameter.grad.abs().max().item(), 0, name)
+                    del model, groups, rows, parameter
 
     def test_checkpoint_round_trip(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -257,10 +263,10 @@ class CalibrationMetrics(unittest.TestCase):
         top_ids = torch.arange(2).expand(1, 7, 2)
         scores = torch.tensor([0.25, -0.5]).expand(1, 7, 2)
         model = SimpleNamespace(forward_backbone=lambda *_: torch.zeros_like(teacher),
-                                score_selector_reached=lambda *_: (top_ids, scores))
+                                score_selector_reached=lambda *_, top_k: (top_ids, scores))
         batch = (None, None, None, ids, None, None, teacher)
         weights = (head, torch.ones(2), head, head.float())
-        loss, target, *_ = loss_rows(model, batch, *weights, False, 1.0)
+        loss, target, *_ = loss_rows(model, batch, *weights, False, 1.0, loss_mode="kl")
         expected = torch.zeros_like(loss)
         for temperature, coefficient in ((0.8, 0.5 * 0.8 ** 2), (1.0, 0.5)):
             expected += coefficient * F.kl_div(
@@ -268,18 +274,64 @@ class CalibrationMetrics(unittest.TestCase):
                 (target / temperature).softmax(-1), reduction="none",
             ).sum(-1)
         torch.testing.assert_close(loss, expected)
-        with_ce, *_ = loss_rows(model, batch, *weights, False, 1.0, ce_weight=0.2)
+        with_ce, *_ = loss_rows(model, batch, *weights, False, 1.0, loss_mode="kl", ce_weight=0.2)
         ce = F.cross_entropy(scores.transpose(1, 2), target.argmax(-1), reduction="none")
         torch.testing.assert_close(with_ce, expected + 0.2 * ce)
 
+    def test_tv_accept_improves_overlap_and_loss(self):
+        head = torch.zeros(40, 2, dtype=torch.bfloat16)
+        head[0, 0] = 5.0
+        teacher = torch.tensor([1.0, 0.0], dtype=torch.bfloat16).expand(1, 7, 2)
+        top_ids = torch.arange(TOP_K).expand(1, 7, TOP_K)
+        logits = torch.nn.Parameter(torch.zeros(TOP_K))
+
+        def score(*_, top_k):
+            self.assertEqual(top_k, TOP_K)
+            return top_ids, logits.expand_as(top_ids)
+
+        model = SimpleNamespace(forward_backbone=lambda *_: torch.zeros_like(teacher), score_selector_reached=score)
+        batch = (None, None, None, torch.zeros(1, 8, dtype=torch.long), None, None, teacher)
+        weights = (head, torch.ones(2), head, head.float())
+        optimizer = torch.optim.SGD([logits], lr=4.0)
+        previous_loss = previous_overlap = None
+        for step in range(5):
+            optimizer.zero_grad()
+            rows, target, _, scores = loss_rows(model, batch, *weights, False, 1.0)
+            expected = torch.zeros_like(rows)
+            overlaps = []
+            unary_tv = torch.zeros_like(rows)
+            for temperature in (0.8, 1.0):
+                p = (target / temperature).softmax(-1)
+                p_top = p.gather(-1, top_ids)
+                overlap = torch.minimum(p_top, (scores / temperature).softmax(-1)).sum(-1)
+                overlaps.append(overlap.detach())
+                survival = torch.stack([overlap[:, :depth].prod(-1) for depth in range(1, 8)], dim=-1)
+                expected += 0.5 * (p_top.sum(-1) - overlap - survival.mean(-1, keepdim=True))
+                unary_tv += 0.25 * (p - 1 / p.shape[-1]).abs().sum(-1)
+            torch.testing.assert_close(rows, expected)
+            if step == 0:
+                full_rows = loss_rows(model, batch, *weights, True, 0.7, ce_weight=0.2)[0]
+                ce = F.cross_entropy(scores.transpose(1, 2), target.gather(-1, top_ids).argmax(-1), reduction="none")
+                torch.testing.assert_close(full_rows, rows + 0.7 * unary_tv + 0.2 * ce)
+            loss = rows.mean()
+            overlap = torch.stack(overlaps)
+            if previous_loss is not None:
+                self.assertLess(loss.item(), previous_loss)
+                self.assertTrue((overlap > previous_overlap).all().item())
+            previous_loss, previous_overlap = loss.item(), overlap
+            loss.backward()
+            optimizer.step()
+
     def test_survival_and_greedy_miss_denominator(self):
-        # The teacher is uniform on four tokens; the proposal has two candidates.
-        # At T=0.8 the proposal is uniform there, giving an overlap of 0.5 on every edge.
-        target = torch.zeros(1, 7, 4)
-        top_ids = torch.tensor([[[0, 1], [1, 0]] + [[2, 3]] * 5])
-        scores = torch.zeros(1, 7, 2)
+        # Uniform teacher over twice the proposal's support, so overlap is 0.5.
+        target = torch.zeros(1, 7, 2 * TOP_K)
+        top_ids = torch.arange(TOP_K).repeat(1, 7, 1)
+        top_ids[0, 1, :2] = torch.tensor([1, 0])
+        top_ids[0, 2:] = torch.arange(2, TOP_K + 2)
+        scores = torch.zeros(1, 7, TOP_K)
         loss = torch.arange(7, dtype=torch.float32)[None]
-        args = SimpleNamespace(batch_size=1, ctx_len=0, stage="selector", unary_weight=1.0, ce_weight=0.0)
+        args = SimpleNamespace(batch_size=1, ctx_len=0, stage="selector", unary_weight=1.0,
+                               loss_mode="tv_accept", ce_weight=0.0)
         anchors = SimpleNamespace(batch=lambda *_: None)
         with patch.object(train, "loss_rows", return_value=(loss, target, top_ids, scores)):
             metrics = train.validate(torch.nn.Module(), anchors, [0], args, "cpu", (), torch.ones(7))
@@ -293,7 +345,9 @@ class CalibrationMetrics(unittest.TestCase):
         self.assertAlmostEqual(metrics["greedy_acc_mean"], 1 / 7)
         self.assertAlmostEqual(metrics["greedy_miss_in_top16_pct"], 100 / 6)
         self.assertEqual(metrics["pred_alpha_p1_t0"], 2.0)
-        self.assertAlmostEqual(metrics["pred_alpha_p1_t08"], 1 + sum(0.5 ** k for k in range(1, 8)))
+        expected_alpha = 1 + sum(0.5 ** k for k in range(1, 8))
+        self.assertAlmostEqual(metrics["pred_alpha_p1_t08"], expected_alpha)
+        self.assertAlmostEqual(metrics["pred_alpha_p1_t10"], expected_alpha)
 
 
 class RolloutExclusions(unittest.TestCase):
@@ -349,6 +403,15 @@ class RolloutExclusions(unittest.TestCase):
 
 
 class TrainingArguments(unittest.TestCase):
+    def test_warmup_and_cosine_edges(self):
+        self.assertEqual([train.lr_scale(step, 3, 0) for step in (1, 3)], [1.0, 0.1])
+        self.assertAlmostEqual(train.lr_scale(2, 3, 0), 0.55)
+        self.assertEqual([train.lr_scale(step, 4, 4) for step in range(1, 5)], [0.25, 0.5, 0.75, 1.0])
+        self.assertEqual(train.lr_scale(1, 1, 0), 1.0)
+        self.assertEqual(train.lr_scale(1, 1, 1), 1.0)
+        self.assertEqual(train.lr_scale(2, 4, 2), 1.0)
+        self.assertEqual(train.lr_scale(4, 4, 2), 0.1)
+
     def test_freeze_codebooks(self):
         for stage in ("selector", "full"):
             with self.subTest(stage=stage):
@@ -371,12 +434,15 @@ class TrainingArguments(unittest.TestCase):
             self.assertEqual(args.lr_backbone, 2e-5)
             self.assertEqual(args.warmup_frac, 0.10)
             self.assertEqual(args.ce_weight, 0.0)
+            self.assertEqual(args.loss_mode, "tv_accept")
             self.assertFalse(args.freeze_codebooks)
             self.assertFalse(args.grad_checkpoint)
             with self.assertRaisesRegex(ValueError, "--out-dir must differ from --dflash2-dir"):
                 train.main()
-        with patch.object(sys, "argv", [*argv, "--stage", "full"]):
-            self.assertEqual(train.parse_args().lr_selector, 2e-5)
+        with patch.object(sys, "argv", [*argv, "--stage", "full", "--loss-mode", "kl"]):
+            args = train.parse_args()
+            self.assertEqual(args.lr_selector, 2e-5)
+            self.assertEqual(args.loss_mode, "kl")
 
 
 if __name__ == "__main__":

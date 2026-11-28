@@ -16,12 +16,12 @@ from torch.utils.checkpoint import checkpoint
 
 if __package__:
     from .model import (
-        BLOCK, GAMMA, HIDDEN, MASK_TOKEN_ID, NUM_TAPS, WINDOW,
+        BLOCK, GAMMA, HIDDEN, MASK_TOKEN_ID, NUM_TAPS, TOP_K, WINDOW,
         DFlash2DraftModel, embed_tokens, load_target_head_and_embed, softcap,
     )
 else:
     from model import (
-        BLOCK, GAMMA, HIDDEN, MASK_TOKEN_ID, NUM_TAPS, WINDOW,
+        BLOCK, GAMMA, HIDDEN, MASK_TOKEN_ID, NUM_TAPS, TOP_K, WINDOW,
         DFlash2DraftModel, embed_tokens, load_target_head_and_embed, softcap,
     )
 
@@ -147,8 +147,27 @@ def kl_rows(target, student, temperature):
     return (p.exp() * (p - q)).sum(dim=-1)
 
 
+def support_overlap(target, top_ids, scores, temperature):
+    scaled = target / temperature
+    p = (scaled.gather(-1, top_ids) - scaled.logsumexp(-1, keepdim=True)).exp()
+    q = (scores / temperature).softmax(-1)
+    return p.sum(-1), torch.minimum(p, q).sum(-1)
+
+
+def tv_accept_rows(target, top_ids, scores, temperature):
+    mass, overlap = support_overlap(target, top_ids, scores, temperature)
+    accept_loss = -overlap.clamp_min(1e-6).cumprod(-1).sum(-1) / GAMMA
+    return mass - overlap + accept_loss.unsqueeze(-1)
+
+
+def tv_rows(target, student, temperature):
+    p = (target / temperature).softmax(-1)
+    q = (student / temperature).softmax(-1)
+    return 0.5 * (p - q).abs().sum(-1)
+
+
 def loss_rows(model, batch, embed, embed_norm, head, head_fp32, full, unary_weight,
-              *, ce_weight=0.0, grad_checkpoint=False):
+              *, loss_mode="tv_accept", ce_weight=0.0, grad_checkpoint=False):
     ctx, mask, positions, ids, block_positions, predecessors, teacher = batch
     with torch.no_grad():
         embeds = embed_tokens(ids, embed, embed_norm)
@@ -160,16 +179,24 @@ def loss_rows(model, batch, embed, embed_norm, head, head_fp32, full, unary_weig
         else:
             hidden = model.forward_backbone(*backbone_inputs)
         unary = F.linear(hidden, head).float()
-    top_ids, scores = model.score_selector_reached(hidden, unary, predecessors)
+    tv_accept = loss_mode == "tv_accept"
+    top_ids, scores = model.score_selector_reached(hidden, unary, predecessors, top_k=TOP_K)
     t_top = target.gather(-1, top_ids)
-    selector_loss = 0.5 * (0.8 ** 2) * kl_rows(t_top, scores, 0.8) + 0.5 * kl_rows(t_top, scores, 1.0)
+    if tv_accept:
+        selector_loss = 0.5 * (tv_accept_rows(target, top_ids, scores, 0.8)
+                               + tv_accept_rows(target, top_ids, scores, 1.0))
+    else:
+        selector_loss = 0.5 * (0.8 ** 2) * kl_rows(t_top, scores, 0.8) + 0.5 * kl_rows(t_top, scores, 1.0)
     if ce_weight > 0:
         selector_loss = selector_loss + ce_weight * F.cross_entropy(
             scores.transpose(1, 2), t_top.argmax(-1), reduction="none",
         )
     if full:
         u_soft = softcap(unary)
-        unary_loss = 0.5 * 0.8 ** 2 * kl_rows(target, u_soft, 0.8) + 0.5 * kl_rows(target, u_soft, 1.0)
+        if tv_accept:
+            unary_loss = 0.5 * (tv_rows(target, u_soft, 0.8) + tv_rows(target, u_soft, 1.0))
+        else:
+            unary_loss = 0.5 * 0.8 ** 2 * kl_rows(target, u_soft, 0.8) + 0.5 * kl_rows(target, u_soft, 1.0)
         selector_loss = selector_loss + unary_weight * unary_loss
     return selector_loss, target, top_ids, scores
 
@@ -181,7 +208,8 @@ def validate(model, anchors, indices, args, device, target_weights, weights):
     for start in range(0, len(indices), args.batch_size):
         batch = anchors.batch(indices[start:start + args.batch_size], args.ctx_len, device)
         loss, target, top_ids, scores = loss_rows(
-            model, batch, *target_weights, args.stage == "full", args.unary_weight, ce_weight=args.ce_weight,
+            model, batch, *target_weights, args.stage == "full", args.unary_weight,
+            loss_mode=args.loss_mode, ce_weight=args.ce_weight,
         )
         tgt_greedy = target.argmax(-1)
         drafted = top_ids.gather(-1, scores.argmax(-1, keepdim=True)).squeeze(-1)
@@ -196,17 +224,12 @@ def validate(model, anchors, indices, args, device, target_weights, weights):
             "pred_alpha_p1_t0": 1 + correct.float().cumprod(-1).sum(-1),
         }
         for label, temperature in (("t08", 0.8), ("t10", 1.0)):
-            scaled = target / temperature
-            log_z = scaled.logsumexp(-1, keepdim=True)
-            p = (scaled.gather(-1, top_ids) - log_z).exp()
-            q = (scores / temperature).softmax(-1)
-            mass = p.sum(-1)
-            overlap = torch.minimum(p, q).sum(-1)
+            mass, overlap = support_overlap(target, top_ids, scores, temperature)
             row_metrics["overlap_" + label] = overlap.mean(-1)
             row_metrics["calib_gap_" + label] = (mass - overlap).mean(-1)
+            row_metrics["pred_alpha_p1_" + label] = 1 + overlap.cumprod(-1).sum(-1)
             if label == "t08":
                 row_metrics["top16_mass_t08"] = mass.mean(-1)
-                row_metrics["pred_alpha_p1_t08"] = 1 + overlap.cumprod(-1).sum(-1)
         for key, value in row_metrics.items():
             sums[key] = sums.get(key, 0) + value.sum(dtype=torch.float64)
 
@@ -219,6 +242,17 @@ def validate(model, anchors, indices, args, device, target_weights, weights):
     return metrics
 
 
+def lr_scale(step, steps, warmup):
+    """Linear warmup and cosine decay for one-indexed optimizer steps."""
+    if warmup and step <= warmup:
+        return step / warmup
+    # With no warmup, start the cosine at the first optimizer step.
+    start = max(1, warmup)
+    progress = (step - start) / max(1, steps - start)
+    min_lr_scale = 0.1
+    return min_lr_scale + (1 - min_lr_scale) * 0.5 * (1 + math.cos(math.pi * progress))
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-dir", type=Path, required=True)
@@ -229,7 +263,8 @@ def parse_args():
     parser.add_argument("--steps", type=int, default=1500)
     parser.add_argument("--lr-selector", type=float, help="Defaults to 5e-5 for selector and 2e-5 for full")
     parser.add_argument("--lr-backbone", type=float, default=2e-5)
-    parser.add_argument("--warmup-frac", type=float, default=0.10, help="Fraction of full-stage steps for LR warmup")
+    parser.add_argument("--warmup-frac", type=float, default=0.10, help="Fraction of training steps for LR warmup in either stage")
+    parser.add_argument("--loss-mode", choices=("tv_accept", "kl"), default="tv_accept")
     parser.add_argument("--ce-weight", type=float, default=0.0, help="Weight of optional hard selector cross-entropy")
     parser.add_argument("--freeze-codebooks", action="store_true", help="Train with fixed selector codebooks")
     parser.add_argument("--grad-checkpoint", action="store_true", help="Recompute backbone activations during full-stage backward")
@@ -300,17 +335,15 @@ def main():
             if step:
                 step_start = time.monotonic()
                 optimizer.zero_grad(set_to_none=True)
-                if full:
-                    scale = (step / warmup if step <= warmup else
-                             0.5 * (1 + math.cos(math.pi * (step - warmup - 1) / (args.steps - warmup))))
-                    for rate, group in zip(base_rates, optimizer.param_groups):
-                        group["lr"] = scale * rate
+                scale = lr_scale(step, args.steps, warmup)
+                for rate, group in zip(base_rates, optimizer.param_groups):
+                    group["lr"] = scale * rate
                 for _ in range(args.grad_accum):
                     indices = rng.integers(len(train), size=args.batch_size)
                     batch = train.batch(indices, args.ctx_len, device)
                     loss = loss_rows(
                         model, batch, *target_weights, full, args.unary_weight,
-                        ce_weight=args.ce_weight, grad_checkpoint=args.grad_checkpoint,
+                        loss_mode=args.loss_mode, ce_weight=args.ce_weight, grad_checkpoint=args.grad_checkpoint,
                     )[0]
                     batch_loss = (loss * position_weights).mean() / args.grad_accum
                     batch_loss.backward()
