@@ -2,7 +2,9 @@
 """CPU parity, gradient, and checkpoint tests for the DFlash2 pilot."""
 
 import argparse
+import contextlib
 import importlib.util
+import io
 import json
 import random
 import sys
@@ -266,7 +268,7 @@ class CalibrationMetrics(unittest.TestCase):
                                 score_selector_reached=lambda *_, top_k: (top_ids, scores))
         batch = (None, None, None, ids, None, None, teacher)
         weights = (head, torch.ones(2), head, head.float())
-        loss, target, *_ = loss_rows(model, batch, *weights, False, 1.0, loss_mode="kl")
+        loss, target, *_ = loss_rows(model, batch, *weights, False, 1.0, loss_mode="kl", temps=(0.25,))
         expected = torch.zeros_like(loss)
         for temperature, coefficient in ((0.8, 0.5 * 0.8 ** 2), (1.0, 0.5)):
             expected += coefficient * F.kl_div(
@@ -292,27 +294,28 @@ class CalibrationMetrics(unittest.TestCase):
         model = SimpleNamespace(forward_backbone=lambda *_: torch.zeros_like(teacher), score_selector_reached=score)
         batch = (None, None, None, torch.zeros(1, 8, dtype=torch.long), None, None, teacher)
         weights = (head, torch.ones(2), head, head.float())
-        optimizer = torch.optim.SGD([logits], lr=4.0)
+        optimizer = torch.optim.SGD([logits], lr=1.0)
         previous_loss = previous_overlap = None
         for step in range(5):
             optimizer.zero_grad()
             rows, target, _, scores = loss_rows(model, batch, *weights, False, 1.0)
-            expected = torch.zeros_like(rows)
+            expected = []
             overlaps = []
-            unary_tv = torch.zeros_like(rows)
-            for temperature in (0.8, 1.0):
+            for temperature in (0.25, 0.8, 1.0):
                 p = (target / temperature).softmax(-1)
                 p_top = p.gather(-1, top_ids)
                 overlap = torch.minimum(p_top, (scores / temperature).softmax(-1)).sum(-1)
                 overlaps.append(overlap.detach())
                 survival = torch.stack([overlap[:, :depth].prod(-1) for depth in range(1, 8)], dim=-1)
-                expected += 0.5 * (p_top.sum(-1) - overlap - survival.mean(-1, keepdim=True))
-                unary_tv += 0.25 * (p - 1 / p.shape[-1]).abs().sum(-1)
-            torch.testing.assert_close(rows, expected)
+                expected.append(p_top.sum(-1) - overlap - survival.mean(-1, keepdim=True))
+            torch.testing.assert_close(rows, torch.stack(expected).mean(0))
             if step == 0:
-                full_rows = loss_rows(model, batch, *weights, True, 0.7, ce_weight=0.2)[0]
+                full_rows = loss_rows(model, batch, *weights, True, 0.7, temps=(0.25,), ce_weight=0.2)[0]
+                p = (target / 0.8).softmax(-1)
+                unary_tv = 0.5 * (p - 1 / p.shape[-1]).abs().sum(-1)
                 ce = F.cross_entropy(scores.transpose(1, 2), target.gather(-1, top_ids).argmax(-1), reduction="none")
-                torch.testing.assert_close(full_rows, rows + 0.7 * unary_tv + 0.2 * ce)
+                torch.testing.assert_close(full_rows, expected[0] + 0.7 * unary_tv + 0.2 * ce)
+                reference_grad = torch.autograd.grad(torch.stack(expected).mean(), logits, retain_graph=True)[0]
             loss = rows.mean()
             overlap = torch.stack(overlaps)
             if previous_loss is not None:
@@ -320,7 +323,25 @@ class CalibrationMetrics(unittest.TestCase):
                 self.assertTrue((overlap > previous_overlap).all().item())
             previous_loss, previous_overlap = loss.item(), overlap
             loss.backward()
+            if step == 0:
+                torch.testing.assert_close(logits.grad, reference_grad)
+                self.assertGreater(logits.grad.abs().sum().item(), 0)
             optimizer.step()
+
+    def test_teacher_bf16_is_opt_in(self):
+        rng = torch.Generator().manual_seed(83)
+        head = torch.randn(32, 8, generator=rng, dtype=torch.bfloat16)
+        teacher = torch.randn(1, 7, 8, generator=rng, dtype=torch.bfloat16)
+        model = SimpleNamespace(
+            forward_backbone=lambda *_: torch.zeros_like(teacher),
+            score_selector_reached=lambda _hidden, unary, _pred, top_k: tuple(reversed(unary.topk(top_k))),
+        )
+        batch = (None, None, None, torch.zeros(1, 8, dtype=torch.long), None, None, teacher)
+        target = loss_rows(model, batch, head, torch.ones(8), head, head.float(), False, 1.0)[1]
+        fast_target = loss_rows(model, batch, head, torch.ones(8), head, None, False, 1.0, teacher_bf16=True)[1]
+        torch.testing.assert_close(target, train.softcap(F.linear(teacher.float(), head.float())), rtol=0, atol=0)
+        torch.testing.assert_close(fast_target, train.softcap(F.linear(teacher, head).float()), rtol=0, atol=0)
+        self.assertFalse(torch.equal(target, fast_target))
 
     def test_survival_and_greedy_miss_denominator(self):
         # Uniform teacher over twice the proposal's support, so overlap is 0.5.
@@ -331,10 +352,12 @@ class CalibrationMetrics(unittest.TestCase):
         scores = torch.zeros(1, 7, TOP_K)
         loss = torch.arange(7, dtype=torch.float32)[None]
         args = SimpleNamespace(batch_size=1, ctx_len=0, stage="selector", unary_weight=1.0,
-                               loss_mode="tv_accept", ce_weight=0.0)
+                               loss_mode="tv_accept", temps=(0.25, 0.8, 1.0), ce_weight=0.0, teacher_bf16=True)
         anchors = SimpleNamespace(batch=lambda *_: None)
-        with patch.object(train, "loss_rows", return_value=(loss, target, top_ids, scores)):
+        with patch.object(train, "loss_rows", return_value=(loss, target, top_ids, scores)) as compute_loss:
             metrics = train.validate(torch.nn.Module(), anchors, [0], args, "cpu", (), torch.ones(7))
+        self.assertEqual(compute_loss.call_args.kwargs["temps"], args.temps)
+        self.assertTrue(compute_loss.call_args.kwargs["teacher_bf16"])
         self.assertEqual(metrics["val_loss"], 3.0)
         self.assertEqual(metrics["top16_mass_t08"], 0.5)
         self.assertEqual(metrics["overlap_t08"], 0.5)
@@ -402,7 +425,139 @@ class RolloutExclusions(unittest.TestCase):
         self.assertEqual(bank, [("code", "Open file b.")])
 
 
+class RolloutCollection(unittest.TestCase):
+    def setUp(self):
+        directory = self.enterContext(tempfile.TemporaryDirectory())
+        self.root = Path(directory)
+        self.output = self.root / "rollouts.jsonl"
+        exclusions = self.root / "excluded.json"
+        exclusions.write_text(json.dumps([
+            "Repair café inventory display",
+            "Summarize the tidal marsh survey",
+            "Calculate annual garden yield from monthly notes",
+        ]))
+        self.argv = ["--output", str(self.output), "--exclude-files", str(exclusions)]
+        self.enterContext(contextlib.redirect_stdout(io.StringIO()))
+
+    @staticmethod
+    def rollout(plan, _args):
+        domain, prompt, *_ = plan
+        return {"prompt": prompt, "domain": domain}, None
+
+    def rows(self):
+        return [json.loads(line) for line in self.output.read_text().splitlines()]
+
+    def test_external_files_share_leakage_filter_and_precede_builtin(self):
+        source = self.root / "train.json"
+        source.write_text(json.dumps([
+            {"prompt": "REPAIR CAFÉ inventory display!"},
+            "Please summarize the tidal marsh survey accurately.",
+            {"instruction": "From monthly notes calculate garden yield minus annual waste."},
+            {"prompt": "Explain chromatic aberration.", "domain": "optics"},
+            "Create a recipe for lentil bread.",
+        ]))
+        turns = self.root / "train.jsonl"
+        turns.write_text("\n".join(map(json.dumps, (
+            {"instruction": "Paint a thistle using watercolors."},
+            {"prompt": "Explain chromatic aberration"},
+            {"messages": [
+                {"role": "system", "content": "Act as a youth sports coach."},
+                {"role": "user", "content": "Plan a bicycle safety lesson."},
+                {"role": "assistant", "content": "Start with a helmet."},
+            ]},
+        ))))
+        argv = [*self.argv, "--prompt-files", str(source), "--prompt-files", str(turns),
+                "--jaccard", str(7 / 9)]
+        external = [
+            ("optics", "Explain chromatic aberration."),
+            ("external", "Create a recipe for lentil bread."),
+            ("external", "Paint a thistle using watercolors."),
+            ("external", "Plan a bicycle safety lesson."),
+        ]
+        with patch.object(collect_rollouts, "request_rollout", side_effect=self.rollout) as request:
+            self.assertEqual(collect_rollouts.main([*argv, "--no-builtin-bank", "--count", "4"]), 0)
+            self.assertEqual(request.call_count, 4)
+            self.assertEqual([(row["domain"], row["prompt"]) for row in self.rows()], external)
+            with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                collect_rollouts.main([*argv, "--no-builtin-bank", "--count", "5"])
+            self.assertEqual(request.call_count, 4)
+            self.assertEqual(collect_rollouts.main([*argv, "--count", "5"]), 0)
+        rows = self.rows()
+        self.assertEqual([(row["domain"], row["prompt"]) for row in rows[:4]], external)
+        self.assertIn(rows[4]["domain"], collect_rollouts.DOMAINS)
+
+    def test_resume_skips_normalized_prompts_and_backfills_failures(self):
+        source = self.root / "train.json"
+        prompts = [
+            "Check the water pressure.",
+            "Write a failed completion.",
+            "Describe a brass telescope.",
+            "Sort rocks by density.",
+            "Place a spare prompt here.",
+        ]
+        source.write_text(json.dumps(prompts))
+        original = json.dumps({"prompt": "CHECK THE WATER PRESSURE!", "response": "Done."})
+        self.output.write_text(original)
+        argv = [*self.argv, "--prompt-files", str(source), "--resume", "--no-builtin-bank", "--count", "3"]
+
+        def request(plan, args):
+            if plan[1] == prompts[1]:
+                return None, "test failure"
+            return self.rollout(plan, args)
+
+        with (
+            patch.object(collect_rollouts, "request_rollout", side_effect=request) as collect,
+            contextlib.redirect_stderr(io.StringIO()) as errors,
+        ):
+            self.assertEqual(collect_rollouts.main(argv), 0)
+            self.assertEqual(collect.call_count, 3)
+            self.assertIn("test failure", errors.getvalue())
+            self.assertTrue(self.output.read_text().startswith(original + "\n"))
+            self.assertEqual([row["prompt"] for row in self.rows()], ["CHECK THE WATER PRESSURE!", *prompts[2:4]])
+            before = self.output.read_bytes()
+            self.assertEqual(collect_rollouts.main(argv), 0)
+            self.assertEqual(collect.call_count, 3)
+            self.assertEqual(self.output.read_bytes(), before)
+
+    def test_mix_parsing_and_payload(self):
+        _, defaults = collect_rollouts.parse_args(self.argv)
+        self.assertEqual(defaults.temp_mix, ((0.0, 0.25), (0.8, 0.50), (1.0, 0.25)))
+        self.assertEqual(defaults.effort_mix, (("off", 0.20), ("low", 0.40), ("high", 0.40)))
+        for flag, values in (
+            ("--temp-mix", ("", "nan:1", "-0.1:1", "2.1:1", "0.8:inf", "0.8:-1", "0.8:0", "0.8:1,0.80:1")),
+            ("--effort-mix", ("", "medium:1", "off:nan", "off:0,low:0", "low:1,low:2")),
+        ):
+            for value in values:
+                with self.subTest(flag=flag, value=value), contextlib.redirect_stderr(io.StringIO()):
+                    with self.assertRaises(SystemExit) as error:
+                        collect_rollouts.parse_args([*self.argv, f"{flag}={value}"])
+                    self.assertEqual(error.exception.code, 2)
+        source = self.root / "train.json"
+        source.write_text(json.dumps(["Invent a name for a constellation."]))
+        for temperature, effort, wire_effort in ((0.0, "off", "none"), (0.8, "low", "low"), (1.0, "high", "high")):
+            with self.subTest(temperature=temperature, effort=effort):
+                body = json.dumps({"choices": [{"message": {"content": "The Crane"}, "finish_reason": "stop"}]})
+                with patch.object(collect_rollouts, "urlopen", return_value=io.BytesIO(body.encode())) as open_url:
+                    self.assertEqual(collect_rollouts.main([
+                        *self.argv, "--prompt-files", str(source), "--no-builtin-bank", "--count", "1",
+                        "--temp-mix", f"{temperature}:2", "--effort-mix", f"{effort}:3",
+                    ]), 0)
+                payload = json.loads(open_url.call_args.args[0].data)
+                self.assertEqual(payload["temperature"], temperature)
+                self.assertEqual(payload["enable_thinking"], effort != "off")
+                self.assertEqual(payload["chat_template_kwargs"], {"reasoning_effort": wire_effort})
+                self.assertEqual((payload["top_k"], payload["top_p"], payload["max_tokens"]), (0, 1.0, 1024))
+                self.assertIsInstance(payload["seed"], int)
+                row, = self.rows()
+                self.assertEqual(row["reasoning_effort"], wire_effort)
+                self.assertEqual(row["thinking"], effort != "off")
+                self.assertEqual(row["temperature"], temperature)
+
+
 class TrainingArguments(unittest.TestCase):
+    argv = ["--stage", "selector", "--data-dir", "unused", "--model-dir", "unused",
+            "--dflash2-dir", "draft", "--out-dir", "draft/stage/.."]
+
     def test_warmup_and_cosine_edges(self):
         self.assertEqual([train.lr_scale(step, 3, 0) for step in (1, 3)], [1.0, 0.1])
         self.assertAlmostEqual(train.lr_scale(2, 3, 0), 0.55)
@@ -425,9 +580,7 @@ class TrainingArguments(unittest.TestCase):
                 self.assertIn(id(model.candidate_selector.hidden_projection.weight), optimized)
 
     def test_defaults_and_checkpoint_path_guard(self):
-        argv = ["train.py", "--stage", "selector", "--data-dir", "unused", "--model-dir", "unused",
-                "--dflash2-dir", "draft", "--out-dir", "draft/stage/.."]
-        with patch.object(sys, "argv", argv):
+        with patch.object(sys, "argv", ["train.py", *self.argv]):
             args = train.parse_args()
             self.assertEqual(args.ctx_len, 2048)
             self.assertEqual(args.lr_selector, 5e-5)
@@ -435,14 +588,108 @@ class TrainingArguments(unittest.TestCase):
             self.assertEqual(args.warmup_frac, 0.10)
             self.assertEqual(args.ce_weight, 0.0)
             self.assertEqual(args.loss_mode, "tv_accept")
+            self.assertEqual(args.temps, (0.25, 0.8, 1.0))
+            self.assertIsNone(args.lr_codebook)
+            self.assertFalse(args.teacher_bf16)
             self.assertFalse(args.freeze_codebooks)
             self.assertFalse(args.grad_checkpoint)
             with self.assertRaisesRegex(ValueError, "--out-dir must differ from --dflash2-dir"):
                 train.main()
-        with patch.object(sys, "argv", [*argv, "--stage", "full", "--loss-mode", "kl"]):
-            args = train.parse_args()
-            self.assertEqual(args.lr_selector, 2e-5)
-            self.assertEqual(args.loss_mode, "kl")
+        args = train.parse_args([*self.argv, "--stage", "full", "--loss-mode", "kl"])
+        self.assertEqual(args.lr_selector, 2e-5)
+        self.assertEqual(args.loss_mode, "kl")
+
+    def test_temperatures_and_teacher_flag(self):
+        args = train.parse_args([*self.argv, "--temps", "0.25, 0.8,1.0", "--teacher-bf16"])
+        self.assertEqual(args.temps, (0.25, 0.8, 1.0))
+        self.assertTrue(args.teacher_bf16)
+        self.assertEqual(train.parse_args([*self.argv, "--temps", "0.5"]).temps, (0.5,))
+        for invalid in ("", "0", "-0.1", "inf", "nan", "1.0,,0.8", "0.25,"):
+            with self.subTest(invalid=invalid), contextlib.redirect_stderr(io.StringIO()) as errors:
+                with self.assertRaises(SystemExit) as error:
+                    train.parse_args([*self.argv, f"--temps={invalid}"])
+                self.assertEqual(error.exception.code, 2)
+                self.assertIn("--temps", errors.getvalue())
+
+    def test_codebook_learning_rate(self):
+        for stage in ("selector", "full"):
+            with self.subTest(stage=stage):
+                args = train.parse_args([*self.argv, "--stage", stage, "--lr-codebook", "3e-6"])
+                model = DFlash2DraftModel(device="meta")
+                groups = configure_stage(model, args.stage, lr_codebook=args.lr_codebook)
+                optimizer = torch.optim.AdamW(groups, lr=args.lr_selector)
+                codebooks, = [group for group in optimizer.param_groups if group["name"] == "codebook"]
+                self.assertEqual(codebooks["lr"], 3e-6)
+                self.assertEqual(codebooks["weight_decay"], 0.0)
+                self.assertEqual({id(parameter) for parameter in codebooks["params"]},
+                                 {id(parameter) for name, parameter in model.named_parameters()
+                                  if name.endswith("_codebook")})
+                for group in optimizer.param_groups:
+                    if group["name"] == "selector":
+                        self.assertEqual(group["lr"], args.lr_selector)
+        for options in (("--freeze-codebooks", "--lr-codebook", "1e-5"),
+                        *((f"--lr-codebook={value}",) for value in ("0", "-0.1", "nan", "inf"))):
+            with self.subTest(options=options), contextlib.redirect_stderr(io.StringIO()) as errors:
+                with self.assertRaises(SystemExit) as error:
+                    train.parse_args([*self.argv, *options])
+                self.assertEqual(error.exception.code, 2)
+                self.assertIn("--lr-codebook", errors.getvalue())
+
+    def test_best_and_latest_checkpoints(self):
+        class TinyDraft(torch.nn.Module):
+            save_checkpoint = DFlash2DraftModel.save_checkpoint
+
+            def __init__(self):
+                super().__init__()
+                self.candidate_selector = torch.nn.Linear(1, 1, bias=False)
+                with torch.no_grad():
+                    self.candidate_selector.weight.fill_(0.5)
+
+        with tempfile.TemporaryDirectory() as directory, contextlib.redirect_stdout(io.StringIO()):
+            root = Path(directory)
+            source = root / "source"
+            source.mkdir()
+            (source / "config.json").write_text("{}\n")
+            seq = Sequence(np.arange(8), np.zeros((8, 4, 2304), dtype=np.uint16), 0)
+            baseline = {"pred_alpha_p1_t0": 3.0, "pred_alpha_p1_t08": 3.0, "pred_alpha_p1_t10": 3.0}
+            trained = {"pred_alpha_p1_t0": 3.1, "pred_alpha_p1_t08": 3.1, "pred_alpha_p1_t10": 2.7}
+            for steps in (0, 1):
+                with self.subTest(steps=steps):
+                    model = TinyDraft()
+                    output = root / f"out-{steps}"
+                    argv = ["train.py", *self.argv, "--dflash2-dir", str(source), "--out-dir", str(output),
+                            "--steps", str(steps), "--device", "cpu", "--lr-selector", "0.1", "--teacher-bf16"]
+                    head = torch.zeros(1, dtype=torch.bfloat16)
+
+                    def loss(draft, *_args, **kwargs):
+                        self.assertTrue(kwargs["teacher_bf16"])
+                        return (draft.candidate_selector.weight.square(),)
+
+                    with (
+                        patch.object(sys, "argv", argv),
+                        patch.object(train.DFlash2DraftModel, "from_checkpoint", return_value=model),
+                        patch.object(train, "load_sequences", return_value=[seq, seq]),
+                        patch.object(train, "load_target_head_and_embed", return_value=(None, None, head)),
+                        patch.object(train, "loss_rows", side_effect=loss),
+                        patch.object(train, "validate", side_effect=[baseline, trained]) as validate,
+                    ):
+                        train.main()
+                    self.assertIsNone(validate.call_args.args[5][3])
+                    rows = [json.loads(line) for line in (output / "metrics.jsonl").read_text().splitlines()]
+                    self.assertEqual(rows[0]["score"], 9.0)
+                    self.assertTrue(rows[0]["best"])
+                    latest = output / "latest"
+                    self.assertEqual(latest.is_dir(), steps > 0)
+                    if steps > 0:
+                        self.assertAlmostEqual(rows[1]["score"], 8.9)
+                        self.assertFalse(rows[1]["best"])
+                        with (
+                            safe_open(output / "model.safetensors", framework="pt") as best_checkpoint,
+                            safe_open(latest / "model.safetensors", framework="pt") as latest_checkpoint,
+                        ):
+                            name = "candidate_selector.weight"
+                            self.assertLess(latest_checkpoint.get_tensor(name).item(),
+                                            best_checkpoint.get_tensor(name).item())
 
 
 if __name__ == "__main__":

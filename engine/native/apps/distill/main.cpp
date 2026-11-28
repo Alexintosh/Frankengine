@@ -56,6 +56,7 @@ Sequence read_sequence(const Json& row, const fs::path& model_dir, std::optional
   chat::ChatOptions options;
   const bool thinking = row.value("thinking", true);
   options.enable_thinking = thinking;
+  if (const auto effort = row.find("reasoning_effort"); effort != row.end()) options.reasoning_effort = *effort;
   auto prompt = format->render(Json::array({{{"role", "user"}, {"content", row.at("prompt").get<std::string>()}}}),
                                nullptr, options);
   const auto prompt_len = prompt.ids.size();

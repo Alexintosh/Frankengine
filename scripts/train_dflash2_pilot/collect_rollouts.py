@@ -3,11 +3,13 @@
 
 import argparse
 import json
+import math
 import random
 import re
 import sys
 import time
 import unicodedata
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from urllib.error import HTTPError, URLError
@@ -209,40 +211,81 @@ def excluded_prompts(value):
                     yield from excluded_prompts(message.get("content"))
 
 
+def read_prompt_file(path):
+    with path.open(encoding="utf-8") as source:
+        try:
+            yield json.load(source)
+            return
+        except json.JSONDecodeError:
+            source.seek(0)
+        for number, line in enumerate(source, 1):
+            if not line.strip():
+                continue
+            try:
+                yield json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"Invalid JSONL at {path}:{number}: {exc}") from exc
+
+
 def load_exclusions(paths):
     unique = set()
     for path in paths:
-        source = path.read_text(encoding="utf-8")
-        try:
-            records = json.loads(source)
-        except json.JSONDecodeError:
-            records = [json.loads(line) for line in source.splitlines() if line.strip()]
-        found = {normalized for prompt in excluded_prompts(records) if (normalized := normalize(prompt))}
+        found = {normalized for value in read_prompt_file(path) for prompt in excluded_prompts(value)
+                 if (normalized := normalize(prompt))}
         if not found:
             raise ValueError(f"No readable evaluation prompts in {path}")
         unique.update(found)
     return sorted(unique)
 
 
+def external_prompts(value):
+    if isinstance(value, str):
+        yield "external", value
+    elif isinstance(value, list):
+        for item in value:
+            yield from external_prompts(item)
+    elif isinstance(value, dict):
+        domain = value.get("domain")
+        if not isinstance(domain, str) or not domain.strip():
+            domain = "external"
+        for key in ("prompt", "instruction"):
+            prompt = value.get(key)
+            if isinstance(prompt, str) and prompt.strip():
+                yield domain, prompt
+                return
+        messages = value.get("messages")
+        if isinstance(messages, list):
+            for message in messages:
+                if not isinstance(message, dict) or message.get("role") != "user":
+                    continue
+                content = message.get("content")
+                if isinstance(content, list):
+                    content = "\n".join(part["text"] for part in content
+                                        if isinstance(part, dict) and part.get("type") == "text"
+                                        and isinstance(part.get("text"), str))
+                if isinstance(content, str):
+                    yield domain, content
+
+
+def load_external_prompts(paths):
+    for path in paths:
+        for value in read_prompt_file(path):
+            yield from external_prompts(value)
+
+
 def supports_fuzzy_match(prompt):
     return len(prompt) >= 16 and len(prompt.split()) >= 4
 
 
-def build_bank(exclusions, threshold, rng):
+def build_bank(exclusions, threshold, rng, *, external=(), include_builtin=True, seen=()):
     exact = set(exclusions)
     fuzzy = [(f" {prompt} ", set(prompt.split())) for prompt in exact if supports_fuzzy_match(prompt)]
-    domains = {name: [template.format(topic=topic) for topic in topics for template in templates]
-               for name, (topics, templates) in DOMAINS.items()}
-    domains["multilingual"] = [template.format(topic=topic) for topics, templates in MULTILINGUAL
-                              for topic in topics for template in templates]
-    seen = set()
-    kept = []
-    for name, prompts in domains.items():
-        rng.shuffle(prompts)
-        domain = []
-        for prompt in prompts:
+    seen = set(seen)
+
+    def screen(prompts):
+        for name, prompt in prompts:
             normalized = normalize(prompt)
-            if normalized in seen or normalized in exact:
+            if not normalized or normalized in seen or normalized in exact:
                 continue
             if supports_fuzzy_match(normalized):
                 padded = f" {normalized} "
@@ -252,17 +295,52 @@ def build_bank(exclusions, threshold, rng):
                        for other, tokens in fuzzy):
                     continue
             seen.add(normalized)
-            domain.append((name, prompt))
-        kept.append(domain)
-    bank = [domain[index] for index in range(max(map(len, kept))) for domain in kept if index < len(domain)]
+            yield name, prompt
+
+    bank = list(screen(external))
+    if not include_builtin:
+        return bank
+    domains = {name: [template.format(topic=topic) for topic in topics for template in templates]
+               for name, (topics, templates) in DOMAINS.items()}
+    domains["multilingual"] = [template.format(topic=topic) for topics, templates in MULTILINGUAL
+                              for topic in topics for template in templates]
+    kept = []
+    for name, prompts in domains.items():
+        rng.shuffle(prompts)
+        kept.append(list(screen((name, prompt) for prompt in prompts)))
+    bank.extend(domain[index] for index in range(max(map(len, kept))) for domain in kept if index < len(domain))
     return bank
 
 
+def load_collected(path):
+    seen = set()
+    written = 0
+    needs_newline = False
+    with path.open(encoding="utf-8", newline="") as source:
+        for number, line in enumerate(source, 1):
+            needs_newline = not line.endswith("\n")
+            if not line.strip():
+                continue
+            try:
+                prompt = json.loads(line)["prompt"]
+            except (ValueError, KeyError, TypeError) as exc:
+                raise ValueError(f"Invalid rollout at {path}:{number}") from exc
+            if not isinstance(prompt, str) or not (normalized := normalize(prompt)):
+                raise ValueError(f"Invalid rollout prompt at {path}:{number}")
+            seen.add(normalized)
+            written += 1
+    return written, seen, needs_newline
+
+
 def request_rollout(plan, args):
-    domain, prompt, temperature, thinking, seed = plan
+    domain, prompt, temperature, effort, seed = plan
+    thinking = effort != "off"
+    # ingine-serve uses "none" for zero effort.
+    reasoning_effort = effort if thinking else "none"
     payload = {
         "model": args.model, "messages": [{"role": "user", "content": prompt}],
         "temperature": temperature, "enable_thinking": thinking, "max_tokens": args.max_tokens,
+        "chat_template_kwargs": {"reasoning_effort": reasoning_effort},
         "top_k": 0, "top_p": 1.0, "seed": seed,
     }
     request = Request(args.url.rstrip("/") + "/chat/completions", data=json.dumps(payload).encode(),
@@ -278,6 +356,7 @@ def request_rollout(plan, args):
                     or (not thinking and reasoning) or (not content and not reasoning) or reason == "tool_calls"):
                 raise ValueError("completion cannot be represented as a text rollout")
             return {"prompt": prompt, "response": content, "reasoning": reasoning, "thinking": thinking,
+                    "reasoning_effort": reasoning_effort,
                     "temperature": temperature, "finish_reason": reason or "", "domain": domain}, None
         except HTTPError as exc:
             error = f"HTTP {exc.code}"
@@ -293,11 +372,39 @@ def request_rollout(plan, args):
     return None, error
 
 
-def main():
+def parse_mix(value, kind):
+    mix = {}
+    try:
+        for item in value.split(","):
+            label, weight = item.split(":")
+            label = label.strip()
+            if kind == "temperature":
+                label = float(label)
+                if not 0 <= label <= 2:
+                    raise ValueError("temperatures must be in [0, 2]")
+            elif label not in ("off", "low", "high"):
+                raise ValueError("efforts must be off, low or high")
+            weight = float(weight)
+            if label in mix or not math.isfinite(weight) or weight < 0:
+                raise ValueError("labels must be unique and weights finite and nonnegative")
+            mix[label] = weight
+        total = sum(mix.values())
+        if not 0 < total < math.inf:
+            raise ValueError("total weight must be finite and positive")
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"expected comma-separated {kind}:weight pairs ({exc})") from exc
+    return tuple(mix.items())
+
+
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--exclude-files", type=Path, nargs="+", action="extend", required=True,
                         help="Evaluation JSON or JSONL files containing prompts")
+    parser.add_argument("--prompt-files", type=Path, nargs="+", action="extend", default=[],
+                        help="Collect from these JSON or JSONL prompt files before the built-in bank")
+    parser.add_argument("--no-builtin-bank", action="store_true", help="Collect only from external prompts")
     parser.add_argument("--output", "--out", type=Path, required=True)
+    parser.add_argument("--resume", action="store_true", help="Append missing rollouts up to the total count")
     parser.add_argument("--url", default="http://127.0.0.1:8834/v1")
     parser.add_argument("--model", default="inkling-2-mini")
     parser.add_argument("--concurrency", type=int, default=16)
@@ -307,33 +414,66 @@ def main():
     parser.add_argument("--timeout", type=float, default=180.0)
     parser.add_argument("--retries", type=int, default=2)
     parser.add_argument("--jaccard", type=float, default=0.72, help="Reject overlap at or above this cutoff")
-    args = parser.parse_args()
+    parser.add_argument("--temp-mix", type=lambda value: parse_mix(value, "temperature"),
+                        default="0.0:0.25,0.8:0.50,1.0:0.25", help="Comma-separated temperature:weight pairs")
+    parser.add_argument("--effort-mix", type=lambda value: parse_mix(value, "effort"),
+                        default="off:0.20,low:0.40,high:0.40", help="Comma-separated effort:weight pairs")
+    args = parser.parse_args(argv)
     if (min(args.count, args.concurrency, args.max_tokens) < 1 or args.retries < 0
             or not 0 < args.timeout < float("inf") or not 0 < args.jaccard <= 1):
         parser.error("Invalid count, concurrency, budget, retry, timeout or Jaccard cutoff")
+    return parser, args
+
+
+def main(argv=None):
+    parser, args = parse_args(argv)
     rng = random.Random(args.seed)
+    append = args.resume and args.output.exists()
+    written, seen, needs_newline = 0, set(), False
     try:
-        if any(args.output.resolve() == path.resolve() for path in args.exclude_files):
-            raise ValueError("Output path must differ from each exclusion file")
+        output = args.output.resolve()
+        if any(output == path.resolve() for path in (*args.exclude_files, *args.prompt_files)):
+            raise ValueError("Output path must differ from each exclusion or prompt file")
+        if append:
+            written, seen, needs_newline = load_collected(args.output)
+        if written >= args.count:
+            print(f"Already collected {written} rollouts in {args.output}", flush=True)
+            return 0
         exclusions = load_exclusions(args.exclude_files)
-        bank = build_bank(exclusions, args.jaccard, rng)
+        bank = build_bank(exclusions, args.jaccard, rng, external=load_external_prompts(args.prompt_files),
+                          include_builtin=not args.no_builtin_bank, seen=seen)
     except (OSError, ValueError) as exc:
         parser.error(str(exc))
-    if len(bank) < args.count:
-        parser.error(f"Only {len(bank)} disjoint prompts available for --count {args.count}")
-    hot = set(rng.sample(range(args.count), round(0.8 * args.count)))
-    thinking = set(rng.sample(range(args.count), round(0.8 * args.count)))
-    plans = [(domain, prompt, 0.8 if index in hot else 0.0, index in thinking, rng.randrange(2 ** 63))
-             for index, (domain, prompt) in enumerate(bank[:args.count])]
-    print(f"Collecting {len(plans)} prompts screened against {len(exclusions)} evaluation prompts", flush=True)
+    remaining = args.count - written
+    if len(bank) < remaining:
+        parser.error(f"Only {len(bank)} disjoint prompts available for {remaining} remaining rollouts")
+    temps, temp_weights = zip(*args.temp_mix)
+    efforts, effort_weights = zip(*args.effort_mix)
+    plans = ((domain, prompt, rng.choices(temps, temp_weights)[0],
+              rng.choices(efforts, effort_weights)[0], rng.randrange(2 ** 63))
+             for domain, prompt in bank)
+    print(f"Collecting {remaining} rollouts from {len(bank)} prompts screened against "
+          f"{len(exclusions)} evaluation prompts", flush=True)
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    written = 0
-    with args.output.open("w", encoding="utf-8") as out, ThreadPoolExecutor(args.concurrency) as pool:
-        completions = pool.map(lambda plan: request_rollout(plan, args), plans)
-        for index, (row, error) in enumerate(completions, 1):
+    with args.output.open("a" if append else "w", encoding="utf-8") as out, ThreadPoolExecutor(args.concurrency) as pool:
+        pending = deque()
+        index = 0
+        while written < args.count:
+            while len(pending) < min(args.concurrency, args.count - written):
+                plan = next(plans, None)
+                if plan is None:
+                    break
+                pending.append(pool.submit(request_rollout, plan, args))
+            if not pending:
+                break
+            row, error = pending.popleft().result()
+            index += 1
             if error is not None:
                 print(f"rollout {index}: {error}", file=sys.stderr, flush=True)
                 continue
+            if needs_newline:
+                out.write("\n")
+                needs_newline = False
             out.write(json.dumps(row, ensure_ascii=False) + "\n")
             out.flush()
             written += 1

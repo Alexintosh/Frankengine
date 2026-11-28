@@ -25,6 +25,8 @@ else:
         DFlash2DraftModel, embed_tokens, load_target_head_and_embed, softcap,
     )
 
+DEFAULT_TEMPS = (0.25, 0.8, 1.0)
+
 
 @dataclass(frozen=True)
 class Sequence:
@@ -116,7 +118,7 @@ class Anchors:
         )
 
 
-def configure_stage(model, stage, freeze_codebooks=False):
+def configure_stage(model, stage, freeze_codebooks=False, lr_codebook=None):
     full = stage == "full"
     model.requires_grad_(full)
     # Keep FP32 master parameters and Adam moments while the model casts
@@ -133,12 +135,21 @@ def configure_stage(model, stage, freeze_codebooks=False):
     for name, parameter in model.named_parameters():
         if not parameter.requires_grad:
             continue
-        component = "selector" if name.startswith("candidate_selector.") else "backbone"
+        codebook = name.endswith("_codebook")
+        if codebook and lr_codebook is not None:
+            component = "codebook"
+        else:
+            component = "selector" if name.startswith("candidate_selector.") else "backbone"
         # Decaying a codebook would update even the vocabulary rows with no gradient.
-        decay = 0.0 if parameter.ndim == 1 or name.endswith("_codebook") else 0.01
+        decay = 0.0 if parameter.ndim == 1 or codebook else 0.01
         groups.setdefault((component, decay), []).append(parameter)
-    return [{"name": component, "weight_decay": decay, "params": parameters}
-            for (component, decay), parameters in groups.items()]
+    param_groups = []
+    for (component, decay), parameters in groups.items():
+        group = {"name": component, "weight_decay": decay, "params": parameters}
+        if component == "codebook":
+            group["lr"] = lr_codebook
+        param_groups.append(group)
+    return param_groups
 
 
 def kl_rows(target, student, temperature):
@@ -167,11 +178,15 @@ def tv_rows(target, student, temperature):
 
 
 def loss_rows(model, batch, embed, embed_norm, head, head_fp32, full, unary_weight,
-              *, loss_mode="tv_accept", ce_weight=0.0, grad_checkpoint=False):
+              *, loss_mode="tv_accept", temps=DEFAULT_TEMPS, ce_weight=0.0, grad_checkpoint=False,
+              teacher_bf16=False):
     ctx, mask, positions, ids, block_positions, predecessors, teacher = batch
     with torch.no_grad():
         embeds = embed_tokens(ids, embed, embed_norm)
-        target = softcap(F.linear(teacher.float(), head_fp32))
+        if teacher_bf16:
+            target = softcap(F.linear(teacher, head).float())
+        else:
+            target = softcap(F.linear(teacher.float(), head_fp32))
     with torch.set_grad_enabled(full and torch.is_grad_enabled()):
         backbone_inputs = (ctx, mask, positions, embeds, block_positions)
         if grad_checkpoint and torch.is_grad_enabled():
@@ -183,8 +198,9 @@ def loss_rows(model, batch, embed, embed_norm, head, head_fp32, full, unary_weig
     top_ids, scores = model.score_selector_reached(hidden, unary, predecessors, top_k=TOP_K)
     t_top = target.gather(-1, top_ids)
     if tv_accept:
-        selector_loss = 0.5 * (tv_accept_rows(target, top_ids, scores, 0.8)
-                               + tv_accept_rows(target, top_ids, scores, 1.0))
+        selector_loss = torch.stack([
+            tv_accept_rows(target, top_ids, scores, temperature) for temperature in temps
+        ]).mean(0)
     else:
         selector_loss = 0.5 * (0.8 ** 2) * kl_rows(t_top, scores, 0.8) + 0.5 * kl_rows(t_top, scores, 1.0)
     if ce_weight > 0:
@@ -194,7 +210,7 @@ def loss_rows(model, batch, embed, embed_norm, head, head_fp32, full, unary_weig
     if full:
         u_soft = softcap(unary)
         if tv_accept:
-            unary_loss = 0.5 * (tv_rows(target, u_soft, 0.8) + tv_rows(target, u_soft, 1.0))
+            unary_loss = tv_rows(target, u_soft, 0.8)
         else:
             unary_loss = 0.5 * 0.8 ** 2 * kl_rows(target, u_soft, 0.8) + 0.5 * kl_rows(target, u_soft, 1.0)
         selector_loss = selector_loss + unary_weight * unary_loss
@@ -209,7 +225,7 @@ def validate(model, anchors, indices, args, device, target_weights, weights):
         batch = anchors.batch(indices[start:start + args.batch_size], args.ctx_len, device)
         loss, target, top_ids, scores = loss_rows(
             model, batch, *target_weights, args.stage == "full", args.unary_weight,
-            loss_mode=args.loss_mode, ce_weight=args.ce_weight,
+            loss_mode=args.loss_mode, temps=args.temps, ce_weight=args.ce_weight, teacher_bf16=args.teacher_bf16,
         )
         tgt_greedy = target.argmax(-1)
         drafted = top_ids.gather(-1, scores.argmax(-1, keepdim=True)).squeeze(-1)
@@ -253,7 +269,17 @@ def lr_scale(step, steps, warmup):
     return min_lr_scale + (1 - min_lr_scale) * 0.5 * (1 + math.cos(math.pi * progress))
 
 
-def parse_args():
+def parse_temps(value):
+    try:
+        temps = tuple(float(part) for part in value.split(","))
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("expected comma-separated positive finite temperatures") from exc
+    if any(not math.isfinite(temp) or temp <= 0 for temp in temps):
+        raise argparse.ArgumentTypeError("expected comma-separated positive finite temperatures")
+    return temps
+
+
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-dir", type=Path, required=True)
     parser.add_argument("--model-dir", type=Path, required=True, help="Frozen target model")
@@ -265,8 +291,13 @@ def parse_args():
     parser.add_argument("--lr-backbone", type=float, default=2e-5)
     parser.add_argument("--warmup-frac", type=float, default=0.10, help="Fraction of training steps for LR warmup in either stage")
     parser.add_argument("--loss-mode", choices=("tv_accept", "kl"), default="tv_accept")
+    parser.add_argument("--temps", type=parse_temps, default=DEFAULT_TEMPS,
+                        help="Comma-separated temperatures for selector TV loss")
     parser.add_argument("--ce-weight", type=float, default=0.0, help="Weight of optional hard selector cross-entropy")
-    parser.add_argument("--freeze-codebooks", action="store_true", help="Train with fixed selector codebooks")
+    codebooks = parser.add_mutually_exclusive_group()
+    codebooks.add_argument("--freeze-codebooks", action="store_true", help="Train with fixed selector codebooks")
+    codebooks.add_argument("--lr-codebook", type=float, help="Override selector learning rate for codebooks")
+    parser.add_argument("--teacher-bf16", action="store_true", help="Compute the teacher head projection in BF16")
     parser.add_argument("--grad-checkpoint", action="store_true", help="Recompute backbone activations during full-stage backward")
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--grad-accum", type=int, default=1)
@@ -278,7 +309,7 @@ def parse_args():
     parser.add_argument("--pos-decay", type=float, default=0.85)
     parser.add_argument("--unary-weight", type=float, default=1.0)
     parser.add_argument("--device", default="cuda")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     if args.lr_selector is None:
         args.lr_selector = 5e-5 if args.stage == "selector" else 2e-5
     if (min(args.batch_size, args.grad_accum, args.eval_every) < 1
@@ -288,6 +319,8 @@ def parse_args():
     if (not all(map(math.isfinite, floats)) or not 0 < args.val_frac < 1 or not 0 < args.pos_decay <= 1
             or min(args.lr_selector, args.lr_backbone) <= 0 or args.unary_weight < 0):
         parser.error("Invalid validation fraction, learning rate, position decay or unary weight")
+    if args.lr_codebook is not None and (not math.isfinite(args.lr_codebook) or args.lr_codebook <= 0):
+        parser.error("--lr-codebook must be finite and positive")
     if not math.isfinite(args.ce_weight) or args.ce_weight < 0:
         parser.error("--ce-weight must be finite and nonnegative")
     if not 0 <= args.warmup_frac <= 1:
@@ -297,8 +330,12 @@ def parse_args():
 
 def main():
     args = parse_args()
-    if args.out_dir.resolve() == args.dflash2_dir.resolve():
+    source = args.dflash2_dir.resolve()
+    latest = args.out_dir / "latest"
+    if args.out_dir.resolve() == source:
         raise ValueError("--out-dir must differ from --dflash2-dir to preserve the initial checkpoint")
+    if args.steps > 0 and latest.resolve() == source:
+        raise ValueError("--out-dir/latest must differ from --dflash2-dir to preserve the initial checkpoint")
     device = torch.device(args.device)
     torch.manual_seed(args.seed)
     torch.set_float32_matmul_precision("highest")
@@ -313,13 +350,13 @@ def main():
           f"{len(val_indices)}/{len(val)} anchors", flush=True)
     model = DFlash2DraftModel.from_checkpoint(args.dflash2_dir, device)
     embed, norm, head = load_target_head_and_embed(args.model_dir, device)
-    target_weights = (embed, norm, head, head.float())
+    target_weights = (embed, norm, head, None if args.teacher_bf16 else head.float())
     position_weights = args.pos_decay ** torch.arange(GAMMA, device=device, dtype=torch.float32)
     position_weights /= position_weights.mean()
     full = args.stage == "full"
-    groups = configure_stage(model, args.stage, freeze_codebooks=args.freeze_codebooks)
+    groups = configure_stage(model, args.stage, freeze_codebooks=args.freeze_codebooks, lr_codebook=args.lr_codebook)
     for group in groups:
-        group["lr"] = args.lr_backbone if group["name"] == "backbone" else args.lr_selector
+        group.setdefault("lr", args.lr_backbone if group["name"] == "backbone" else args.lr_selector)
     optimizer = torch.optim.AdamW(groups, foreach=False)
     base_rates = [g["lr"] for g in optimizer.param_groups]
     warmup = round(args.steps * args.warmup_frac)
@@ -343,7 +380,8 @@ def main():
                     batch = train.batch(indices, args.ctx_len, device)
                     loss = loss_rows(
                         model, batch, *target_weights, full, args.unary_weight,
-                        loss_mode=args.loss_mode, ce_weight=args.ce_weight, grad_checkpoint=args.grad_checkpoint,
+                        loss_mode=args.loss_mode, temps=args.temps, ce_weight=args.ce_weight,
+                        grad_checkpoint=args.grad_checkpoint, teacher_bf16=args.teacher_bf16,
                     )[0]
                     batch_loss = (loss * position_weights).mean() / args.grad_accum
                     batch_loss.backward()
@@ -364,13 +402,15 @@ def main():
             if step % args.eval_every == 0 or step == args.steps:
                 optimizer.zero_grad(set_to_none=True)
                 metrics = validate(model, val, val_indices, args, device, target_weights, position_weights)
-                score = metrics["pred_alpha_p1_t08"] + metrics["pred_alpha_p1_t0"]
+                score = metrics["pred_alpha_p1_t0"] + metrics["pred_alpha_p1_t08"] + metrics["pred_alpha_p1_t10"]
                 if score > best:
                     model.save_checkpoint(args.out_dir, args.dflash2_dir)
                     best = score
                     improved = True
                 else:
                     improved = False
+                if step == args.steps and args.steps > 0:
+                    model.save_checkpoint(latest, args.dflash2_dir)
                 row = {"stage": args.stage, "step": step, "val_anchors": len(val_indices),
                        "score": score, "best": improved, "elapsed_s": time.monotonic() - start, **metrics}
                 line = json.dumps(row, allow_nan=False)
