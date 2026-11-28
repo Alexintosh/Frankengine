@@ -128,28 +128,31 @@ nlohmann::ordered_json to_json(const Totals& t, const Totals& all, const std::ve
 struct Item {
   std::string name;
   std::vector<std::int32_t> prompt, output;
+  int limit;
+  bool thinking_enabled = true;
+  bool stop_at_eot = false;
 };
 
-// Free generation from every item's prompt for len(output) tokens (no stop tokens) at the temperature, with
-// the sampler seeded by `seed`: decode tokens/s and tokens/verify of sampled decoding. A forced replay at
-// T > 0 under-counts sampled acceptance (a draft counts only if it equals the recorded token, where the loop
-// accepts it with min(1, p/q)), so sampled A/B needs these runs; the texts differ between builds, compare
-// several seeds.
-std::string run_free(model::Generator& gen, const std::string& path, const std::vector<Item>& list, double temperature,
-                     int seed, const std::string& trace_path) {
+// Free generation from every item's prompt for len(output) tokens (no stop tokens for legacy
+// {prompt, output} suites; stop_ids enforced for prompt-only items to avoid post-EOT contamination)
+// at the temperature, with the sampler seeded by `seed`.
+std::string run_free(model::Generator& gen, const std::string& path, const std::vector<Item>& list,
+                     model::Sampling sampling, int seed, const std::string& trace_path, std::ostream* audit,
+                     std::span<const std::int32_t> stop_ids) {
   long items = 0, tokens = 0, rounds = 0, accepted = 0;
   double seconds = 0;
+  sampling.seed = std::uint64_t(seed);
   for (const Item& it : list) {
-    if (it.output.size() < 2) continue;
-    model::Sampling sampling;
-    sampling.temperature = float(temperature);
-    sampling.seed = std::uint64_t(seed);
+    if (it.limit < 2) continue;
+    sampling.thinking_enabled = it.thinking_enabled;
     std::vector<int32_t> output;
-    const model::GenerateStats st = gen.generate(it.prompt, int(it.output.size()), sampling, {},
+    const auto stops = it.stop_at_eot ? stop_ids : std::span<const std::int32_t>{};
+    const model::GenerateStats st = gen.generate(it.prompt, it.limit, sampling, stops,
         [&](std::span<const int32_t> ids) {
           if (!trace_path.empty()) output.insert(output.end(), ids.begin(), ids.end());
           return true;
         });
+    if (audit) write_spec_audit(*audit, it.name, sampling, st);
     const long tok = st.generated_tokens - 1;  // the first token comes with the prefill
     std::printf("%-28s %6ld tok  %7.1f tok/s", it.name.c_str(), tok, st.decode_seconds > 0 ? tok / st.decode_seconds : 0.0);
     const double prefill_rate = st.prefill_seconds > 0 ? (st.prompt_tokens - st.reused_tokens) / st.prefill_seconds : 0.0;
@@ -199,7 +202,7 @@ std::string run_free(model::Generator& gen, const std::string& path, const std::
   j["file"] = path;
   j["items"] = items;
   j["free_seed"] = seed;
-  j["temperature"] = temperature;
+  j["temperature"] = sampling.temperature;
   j["total"]["tokens"] = tokens;
   j["total"]["tok_s"] = seconds > 0 ? double(tokens) / seconds : 0;
   if (rounds) {
@@ -215,8 +218,25 @@ std::string run_free(model::Generator& gen, const std::string& path, const std::
 
 }  // namespace
 
-std::string run_forced(model::Generator& gen, const std::string& path, double temperature, int skip, int items,
-                       const std::string& trace_path, int free_seed, model::SpecWidths widths) {
+void write_spec_audit(std::ostream& out, const std::string& prompt, const model::Sampling& sampling,
+                      const model::GenerateStats& stats) {
+  for (const auto& r : stats.spec_audit) {
+    const nlohmann::ordered_json row = {
+        {"prompt", prompt}, {"seed", sampling.seed.value_or(0)}, {"top_p", sampling.top_p}, {"top_k", sampling.top_k},
+        {"round_index", r.round_index}, {"position", r.position}, {"width", r.width}, {"eligible", r.eligible},
+        {"accepted", r.accepted}, {"emitted", r.emitted}, {"trimmed", r.trimmed}, {"probed_m8", r.probed_m8},
+        {"sampled", r.sampled}, {"temperature", r.temperature}, {"teacher_forced", r.teacher_forced},
+        {"cumulative_confidence", r.cumulative_confidence}, {"conf", r.conf}, {"in_support", r.in_support},
+        {"target_mass", r.target_mass}, {"overlap", r.overlap}, {"picked_p", r.picked_p}, {"picked_q", r.picked_q}};
+    out << row.dump() << '\n';
+  }
+  out.flush();
+  if (!out) throw std::runtime_error("failed to write spec audit");
+}
+
+std::string run_forced(model::Generator& gen, const std::string& path, model::Sampling sampling, int skip, int items,
+                       const std::string& trace_path, int free_seed, model::SpecWidths widths,
+                       std::ostream* audit, const PromptSuite& suite) {
   std::ifstream in(path);
   if (!in) throw std::runtime_error("cannot open " + path);
   std::vector<Item> list;
@@ -224,11 +244,29 @@ std::string run_forced(model::Generator& gen, const std::string& path, double te
   for (std::string line; std::getline(in, line);) {
     if (line.empty() || index++ < skip) continue;
     const auto j = nlohmann::json::parse(line);
-    list.push_back({j.at("name").get<std::string>(), j.at("prompt").get<std::vector<std::int32_t>>(),
-                    j.at("output").get<std::vector<std::int32_t>>()});
+    Item item;
+    if (free_seed >= 0) {
+      const auto& prompt = j.is_string() ? j : j.at("prompt");
+      item.name = j.is_object() ? j.value("name", "item-" + std::to_string(index)) : "item-" + std::to_string(index);
+      if (prompt.is_string()) {
+        item.prompt = suite.render(prompt.get<std::string>());
+        item.thinking_enabled = suite.thinking_enabled;
+      } else {
+        item.prompt = prompt.get<std::vector<int32_t>>();
+      }
+      item.stop_at_eot = !j.contains("output");
+      item.limit = j.contains("output") ? int(j.at("output").get_ref<const nlohmann::json::array_t&>().size())
+                                        : suite.default_tokens;
+    } else {
+      item.name = j.at("name").get<std::string>();
+      item.prompt = j.at("prompt").get<std::vector<int32_t>>();
+      item.output = j.at("output").get<std::vector<int32_t>>();
+      item.limit = int(item.output.size());
+    }
+    list.push_back(std::move(item));
     if (items > 0 && int(list.size()) == items) break;
   }
-  if (free_seed >= 0) return run_free(gen, path, list, temperature, free_seed, trace_path);
+  if (free_seed >= 0) return run_free(gen, path, list, sampling, free_seed, trace_path, audit, suite.stop_ids);
 
   Totals total, kinds[NKINDS];
   std::vector<model::SpecRoundRecord> trace_all, trace_kind[NKINDS];
@@ -240,12 +278,11 @@ std::string run_forced(model::Generator& gen, const std::string& path, double te
   std::vector<Done> done;
   for (const Item& it : list) {
     if (it.output.size() < 2) continue;
-    model::Sampling sampling;
-    sampling.temperature = float(temperature);
     sampling.seed = 0;
     sampling.forced = it.output;
     const model::GenerateStats st = gen.generate(it.prompt, int(it.output.size()), sampling, {},
                                                  [](std::span<const std::int32_t>) { return true; });
+    if (audit) write_spec_audit(*audit, it.name, sampling, st);
     Totals t;
     t.items = 1;
     t.tokens = st.generated_tokens - 1;  // the first token comes with the prefill

@@ -270,7 +270,7 @@ struct Generation {
 };
 
 std::vector<Generation> generate(const std::filesystem::path& target, const std::filesystem::path& draft,
-                                 bool device) {
+                                 bool device, bool audit = false) {
   INGINE_CHECK(setenv("INGINE_DFLASH2_DEVICE_LOOP", device ? "1" : "0", 1) == 0);
   RuntimeOptions options;
   options.model_dir = target;
@@ -278,6 +278,7 @@ std::vector<Generation> generate(const std::filesystem::path& target, const std:
   options.draft_type = "dflash2";
   options.spec = options.head_nvfp4 = options.kv_fp8 = true;
   options.spec_widths = SpecWidths::Fine;
+  options.spec_audit = audit;
   options.max_ctx = 512;
   options.prefill_chunk = 128;
   options.park_mb = 0;
@@ -290,6 +291,28 @@ std::vector<Generation> generate(const std::filesystem::path& target, const std:
       return true;
     });
     INGINE_CHECK(stats.used_dflash2 && stats.generated_tokens == limit && stats.spec_trace.empty());
+    INGINE_CHECK(stats.spec_audit.size() == (audit ? std::size_t(stats.spec_rounds) : 0));
+    int position = int(prompt.size());
+    for (std::size_t i = 0; i < stats.spec_audit.size(); ++i) {
+      const auto& r = stats.spec_audit[i];
+      INGINE_CHECK(r.round_index == int(i) && r.position == position && r.eligible == r.width - 1);
+      INGINE_CHECK(r.emitted == result.batches.at(i + 1) && r.trimmed == (r.emitted < r.accepted + 1));
+      INGINE_CHECK(!r.probed_m8 && !r.teacher_forced && r.temperature == sampling.temperature);
+      INGINE_CHECK(r.sampled == (sampling.temperature > 0));
+      for (int j = 0; j < G; ++j) {
+        INGINE_CHECK(r.conf[j] >= 0 && r.conf[j] <= 1);
+        if (j >= r.eligible || r.sampled) INGINE_CHECK(r.in_support[j] == -1);
+        else INGINE_CHECK(r.in_support[j] == 0 || r.in_support[j] == 1);
+        if (j >= r.eligible || !r.sampled) {
+          INGINE_CHECK(r.target_mass[j] == -1 && r.overlap[j] == -1 && r.picked_p[j] == -1 && r.picked_q[j] == -1);
+        } else {
+          INGINE_CHECK(r.target_mass[j] >= 0 && r.target_mass[j] <= 1.00001f);
+          INGINE_CHECK(r.overlap[j] >= 0 && r.overlap[j] <= r.target_mass[j] + 1e-6f);
+          INGINE_CHECK(r.picked_p[j] >= 0 && r.picked_q[j] > 0);
+        }
+      }
+      position += r.emitted;
+    }
     result.rounds = stats.spec_rounds;
     result.accepted = stats.spec_accepted;
     result.reused = stats.reused_tokens;
@@ -347,6 +370,8 @@ void device_loop_parity(const std::filesystem::path& checkpoint) {
   const auto host = generate(target, checkpoint, false);
   const auto device = generate(target, checkpoint, true);
   INGINE_CHECK(host == device);
+  const auto audited = generate(target, checkpoint, true, true);
+  INGINE_CHECK(audited == device);
   std::puts("PASS solo DFlash2 device loop greedy and sampled generation, early stop and live prefix");
 }
 }  // namespace

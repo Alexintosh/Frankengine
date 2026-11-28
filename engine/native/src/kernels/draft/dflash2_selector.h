@@ -44,6 +44,20 @@ void dflash2_lattice_selector(const std::int32_t* ids, const float* unary,
                              const float* temperature, const std::uint64_t* seed,
                              DFlash2Support support, cudaStream_t stream);
 
+// A single mapped host record, published before the existing round-completion event.
+struct DFlash2Audit {
+  float conf[7];
+  int in_support[7];
+  float target_mass[7], overlap[7], picked_p[7], picked_q[7];
+};
+static_assert(sizeof(DFlash2Audit) < 1024);
+
+// target is the greedy argmax, or null. p is the filtered target distribution for exact
+// sampling, or null. When p is null neither q nor picked is read.
+void dflash2_audit(const float* confidence, const std::int32_t* ids, int eligible, int vocab,
+                   const std::int32_t* target, const float* p, const float* q,
+                   const std::int32_t* picked, DFlash2Audit* out, cudaStream_t stream);
+
 // p is [eligible+1, vocab], support_ids/probs are [7,16], and picked and uniforms
 // are [7]. ws holds dflash2_accept_workspace_floats(vocab) floats. Writes the
 // accepted prefix length and the distribution for its correction or bonus token.

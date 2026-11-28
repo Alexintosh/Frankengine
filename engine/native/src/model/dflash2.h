@@ -44,6 +44,8 @@ class DFlash2 {
   const int* propose(int anchor);
   const int* propose(int anchor, float temperature, std::uint64_t seed);
   const float* confidence() const;
+  const std::int32_t* candidate_ids() const;  // top-16 input to the selector, also valid for greedy
+  bool cumulative_confidence() const;
   // Device support of the last sampled proposal, owned by rank 0.
   const std::int32_t* support_ids() const;
   const float* support_probs() const;

@@ -2,6 +2,7 @@
 // scheduler, the HTTP layer and their tests build without the model; ingine_model implements make_generator.
 #pragma once
 
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <filesystem>
@@ -75,6 +76,17 @@ struct SpecRoundRecord {
   float verify_ms = 0, draft_ms = 0, control_ms = 0;
 };
 
+// One host-verified DFlash2 proposal. The prefill token is outside these rounds.
+struct SpecAuditRound {
+  int round_index, position, width, eligible, accepted, emitted;
+  bool trimmed, probed_m8, sampled, teacher_forced, cumulative_confidence;
+  float temperature;
+  std::array<float, 7> conf;
+  // Unavailable or unverified entries are -1. Sampled metrics use the filtered target.
+  std::array<int, 7> in_support;
+  std::array<float, 7> target_mass, overlap, picked_p, picked_q;
+};
+
 struct DecodeTiming {
   double step_ms = 0, reduce_ms = 0, head_exchange_ms = 0;
   int steps = 0;
@@ -93,6 +105,7 @@ struct GenerateStats {
   // not inside the reused prefix) and its time (part of prefill_seconds).
   int image_tokens = 0, images_encoded = 0;
   double vision_seconds = 0;
+  std::vector<SpecAuditRound> spec_audit;
 };
 
 enum class SpecWidths { Coarse, Fine, Fine2 };
@@ -176,6 +189,8 @@ struct RuntimeOptions {
   float loopcd_omega = 0.0f;
   int loopcd_ref = 1;  // 1-indexed loop pass
   bool cert_head = false;  // TP=1 exact greedy head; auto-enabled for PICO12; INGINE_CERT_HEAD overrides
+  bool spec_audit = false;
+  float spec_audit_probe_m8 = 0.f;
 };
 
 inline void set_loopcd_options(RuntimeOptions& options, std::string_view mode,

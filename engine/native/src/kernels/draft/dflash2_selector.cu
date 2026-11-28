@@ -146,6 +146,44 @@ __global__ void fused_walk(const std::int32_t* ids, const float* unary,
   }
 }
 
+// One warp per depth. Each distinct token contributes p and min(p, total q) once.
+__global__ void gather_audit(const float* confidence, const int* ids, int eligible, int vocab,
+                             const int* target, const float* p, const float* q, const int* picked,
+                             DFlash2Audit* out) {
+  const int row = threadIdx.x / 32, lane = threadIdx.x % 32;
+  const bool valid = row < eligible && lane < kCandidates;
+  const int slot = row * kCandidates + lane;
+  const int id = valid ? ids[slot] : -1;
+  const bool inside = id >= 0 && id < vocab;
+  const unsigned hits = __ballot_sync(0xffffffffu, inside && target && target[row] == id);
+  const unsigned peers = __match_any_sync(0xffffffffu, id);
+  const float prob = inside && p ? p[std::size_t(row) * vocab + id] : 0.f;
+  float mass = 0.f, overlap = 0.f;
+  if (inside && p && lane == __ffs(peers) - 1) {
+    float total_q = 0.f;
+    for (unsigned mask = peers; mask; mask &= mask - 1)
+      total_q += q[row * kCandidates + __ffs(mask) - 1];
+    mass = prob;
+    overlap = fminf(prob, total_q);
+  }
+  for (int offset = 16; offset; offset /= 2) {
+    mass += __shfl_down_sync(0xffffffffu, mass, offset);
+    overlap += __shfl_down_sync(0xffffffffu, overlap, offset);
+  }
+  const bool exact = p && row < eligible;
+  const int pick = exact ? picked[row] : -1;
+  const bool has_pick = pick >= 0 && pick < kCandidates;
+  const float selected_p = __shfl_sync(0xffffffffu, prob, has_pick ? pick : 0);
+  if (lane == 0) {
+    out->conf[row] = confidence[row];
+    out->in_support[row] = row < eligible && target ? int(hits != 0) : -1;
+    out->target_mass[row] = exact ? mass : -1.f;
+    out->overlap[row] = exact ? overlap : -1.f;
+    out->picked_p[row] = has_pick ? selected_p : -1.f;
+    out->picked_q[row] = has_pick ? q[row * kCandidates + pick] : -1.f;
+  }
+}
+
 constexpr int kResidualThreads = 256;
 constexpr int kResidualSpan = 4 * kResidualThreads;
 
@@ -247,6 +285,15 @@ void dflash2_lattice_selector(const std::int32_t* ids, const float* unary,
   score_edges<<<dim3(kSlots, kCandidates, kCandidates), 32, 0, stream>>>(
       ids, unary, projected, predecessors, successors, anchor, lattice);
   walk<<<1, 1, 0, stream>>>(ids, lattice, tokens, confidence, cumulative, temperature, seed, support);
+  CUDA_CHECK(cudaGetLastError());
+}
+
+void dflash2_audit(const float* confidence, const std::int32_t* ids, int eligible, int vocab,
+                   const std::int32_t* target, const float* p, const float* q,
+                   const std::int32_t* picked, DFlash2Audit* out, cudaStream_t stream) {
+  if (eligible < 0 || eligible > kSlots || vocab < 1)
+    throw std::invalid_argument("dflash2_audit: invalid verify shape");
+  gather_audit<<<1, kSlots * 32, 0, stream>>>(confidence, ids, eligible, vocab, target, p, q, picked, out);
   CUDA_CHECK(cudaGetLastError());
 }
 

@@ -56,6 +56,7 @@ class SpecLoop {
  private:
   // The accept graph (width_select -> switch { accept + rollback + publish }) for this sampling setup.
   void prepare_accept(const Sampling& sampling);
+  template <bool Audit>
   void generate_host_verified(std::int32_t token, int max_new_tokens, const Sampling& sampling, kernels::head::SamplerRng& rng,
                    std::span<const std::int32_t> stop_ids,
                    const std::function<bool(std::span<const std::int32_t>)>& on_tokens,
@@ -77,6 +78,7 @@ class SpecLoop {
   DeviceBuffer proposal_, host_accept_;
   DeviceBuffer target_tokens_;
   DeviceBuffer dflash2_accept_;  // lazily allocated target probabilities, residual, uniforms, and reduction workspace
+  MappedHostBuffer audit_record_;  // allocated only on the auditing DFlash2 rank
   PinnedHostBuffer proposal_host_{sizeof(VerifyProposal)};
   Drafter::Draft draft_{};             // the drafter's fixed output buffers
   DeviceBuffer width_;                 // int32: the verify width chosen on the device

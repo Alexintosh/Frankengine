@@ -2098,6 +2098,10 @@ void DFlash2::propose_sharded_head(const Bf* hidden, bool replicated) {
 }
 
 const float* DFlash2::confidence() const { return impl_->confidence; }
+const std::int32_t* DFlash2::candidate_ids() const {
+  return impl_->sharded_head ? impl_->sharded_head->ids() : impl_->top_ids;
+}
+bool DFlash2::cumulative_confidence() const { return impl_->cumulative; }
 const std::int32_t* DFlash2::support_ids() const { return impl_->support.ids; }
 const float* DFlash2::support_probs() const { return impl_->support.probs; }
 const std::int32_t* DFlash2::support_picked() const { return impl_->support.picked; }

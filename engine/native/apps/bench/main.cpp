@@ -153,6 +153,9 @@ int main(int argc, char** argv) {
   int dflash2_max_ctx = 1536;
   bool dflash2_adaptive = false;
   std::string draft_type = "dspark", dflash2_dir;
+  std::string audit_path;
+  double probe_m8 = 0.0, top_p = 1.0;
+  int top_k = 0;
   double spec_threshold = 0.8, temperature = 0.0;
 
   ingine::serve::ArgParser ap("ingine-bench",
@@ -194,6 +197,10 @@ int main(int argc, char** argv) {
   ap.option("--spec-threshold", "", "verify the leading drafts whose draft probability exceeds this (0 = always all 7)",
             &spec_threshold);
   ap.option("--spec-verify-width", "", "Force a width from the selected grid for DFlash2 or TP=2 teacher replay", &spec_verify_width);
+  ap.option("--spec-audit", "<path.jsonl>", "Append DFlash2 verification rounds to FILE", &audit_path);
+  ap.option("--spec-audit-probe-m8", "<float>", "Independent probability of verifying all seven drafts", &probe_m8);
+  ap.option("--top-p", "<float>", "Target nucleus probability (default 1)", &top_p);
+  ap.option("--top-k", "<int>", "Target top-k cutoff (0 disables)", &top_k);
   ap.option("--temperature", "", "", &temperature);
   ap.option("--long-prompt", "", "also time prefill of a synthetic prompt of N tokens", &long_prompt);
   ap.option("--forced", "", "teacher-forced replay of the outputs in FILE (JSON lines {name, prompt, output})",
@@ -201,7 +208,7 @@ int main(int argc, char** argv) {
   ap.option("--forced-items", "", "replay at most N items of --forced", &forced_items);
   ap.option("--forced-skip", "", "skip the first N items of --forced", &forced_skip);
   ap.option("--forced-trace", "", "append every replayed item and round to FILE (JSON lines)", &forced_trace);
-  ap.option("--forced-free", "", "with --forced: sample freely from each item's prompt with this seed (no replay)", &forced_free);
+  ap.option("--forced-free", "", "Free generation from JSONL prompts with this seed (prompt-only items use --tokens)", &forced_free);
   ap.parse(argc, argv);
 
   try {
@@ -211,6 +218,16 @@ int main(int argc, char** argv) {
     ingine::model::set_loopcd_options(options, loopcd,
                                      ap.given("--loopcd-omega") ? std::optional(loopcd_omega) : std::nullopt,
                                      loopcd_ref);
+    if (!(temperature >= 0) || !std::isfinite(temperature))
+      throw std::invalid_argument("--temperature must be finite and nonnegative");
+    if (!(probe_m8 >= 0 && probe_m8 <= 1)) throw std::invalid_argument("--spec-audit-probe-m8 must be in [0, 1]");
+    if (probe_m8 && audit_path.empty()) throw std::invalid_argument("--spec-audit-probe-m8 requires --spec-audit");
+    if (!(top_p > 0 && top_p <= 1) || top_k < 0)
+      throw std::invalid_argument("--top-p must be in (0, 1] and --top-k must be nonnegative");
+    options.spec_audit = !audit_path.empty();
+    options.spec_audit_probe_m8 = float(probe_m8);
+    if (options.spec_audit && (!spec || draft_type == "dspark"))
+      throw std::invalid_argument("--spec-audit requires --spec and --draft-type dflash2 or hybrid");
     using Clock = std::chrono::steady_clock;
     cudaFree(nullptr);  // create the context before measuring the model's memory
     size_t free0 = 0, total = 0;
@@ -248,40 +265,56 @@ int main(int argc, char** argv) {
     options.spec_verify_width = spec_verify_width;
     if (spec_verify_width && draft_type != "dflash2" && (forced.empty() || forced_free >= 0))
       throw std::invalid_argument("--spec-verify-width requires teacher-forced replay");
+    std::ofstream audit_file;
+    std::ostream* audit = nullptr;
+    if (options.spec_audit && options.tp.rank == 0) {
+      audit_file.open(audit_path, std::ios::app);
+      if (!audit_file) throw std::runtime_error("cannot open spec audit " + audit_path);
+      audit = &audit_file;
+    }
+    ingine::model::Sampling base_sampling;
+    base_sampling.temperature = float(temperature);
+    base_sampling.top_p = float(top_p);
+    base_sampling.top_k = top_k;
     auto gen = ingine::model::make_generator(options);
     const double load_s = std::chrono::duration<double>(Clock::now() - t0).count();
     size_t free1 = 0;
     cudaMemGetInfo(&free1, &total);
     std::printf("load+capture %.1fs, GPU %.2f GB\n", load_s, double(free0 > free1 ? free0 - free1 : 0) / 1e9);
     std::fflush(stdout);
+    ingine::text::ChatOptions chat;
+    chat.reasoning_effort = effort;
+    std::optional<ingine::text::ChatFormat> format;
+    auto render_prompt = [&](const std::string& prompt) {
+      if (!format) format = ingine::text::ChatFormat::load(model_dir);
+      const auto messages = nlohmann::ordered_json::array({{{"role", "user"}, {"content", prompt}}});
+      return format->render(messages, nlohmann::ordered_json(), chat).ids;
+    };
+    const auto normalized_effort = ingine::text::normalize_effort(chat.reasoning_effort);
+    const bool thinking = normalized_effort != "none" && normalized_effort != 0.0;
+    format = ingine::text::ChatFormat::load(model_dir);
+    const auto& tok = format->tokenizer();
+    const std::vector<int32_t> stop = {*tok.token_id("<|content_model_end_sampling|>")};
     if (!forced.empty()) {
-      const auto result = ingine::bench::run_forced(*gen, forced, temperature, forced_skip, forced_items,
+      const ingine::bench::PromptSuite suite{tokens, render_prompt, thinking, stop};
+      const auto result = ingine::bench::run_forced(*gen, forced, base_sampling, forced_skip, forced_items,
                                                     options.tp.rank == 0 ? forced_trace : "", forced_free,
-                                                    options.spec_widths);
+                                                    options.spec_widths, audit, suite);
       std::printf("%s\n", result.c_str());
       return 0;
     }
 
-    const auto fmt = ingine::text::ChatFormat::load(model_dir);
-    const auto& tok = fmt.tokenizer();
-    const std::vector<int32_t> stop = {*tok.token_id("<|content_model_end_sampling|>")};
-
     std::string json = "{";
     for (const auto& [name, prompt] : kPrompts) {
-      ingine::text::ChatOptions chat;
-      chat.reasoning_effort = effort;
-      const nlohmann::ordered_json messages = nlohmann::ordered_json::array({{{"role", "user"}, {"content", prompt}}});
-      const std::vector<int32_t> ids = fmt.render(messages, nlohmann::ordered_json(), chat).ids;
-      const auto normalized_effort = ingine::text::normalize_effort(chat.reasoning_effort);
+      const auto ids = render_prompt(prompt);
       std::vector<double> rates, prefill_seconds, prefill_rates;
       ingine::model::GenerateStats st;
       ingine::model::DecodeTiming timing;
       for (int r = 0; r < runs; ++r) {
         std::vector<int32_t> out;
-        ingine::model::Sampling sampling;
-        sampling.temperature = float(temperature);
+        auto sampling = base_sampling;
         sampling.seed = uint64_t(r);
-        sampling.thinking_enabled = normalized_effort != "none" && normalized_effort != 0.0;
+        sampling.thinking_enabled = thinking;
         // every run stops at the end-of-turn token: tokens after it are not what a request generates (and
         // speculative decoding accepts few drafts there, which made later runs look slow)
         st = gen->generate(ids, tokens, sampling, std::span<const int32_t>(stop),
@@ -289,6 +322,7 @@ int main(int argc, char** argv) {
                              out.insert(out.end(), t.begin(), t.end());
                              return true;
                            });
+        if (audit) ingine::bench::write_spec_audit(*audit, name, sampling, st);
         timing.steps += st.decode_timing.steps;
         timing.step_ms += st.decode_timing.step_ms;
         timing.reduce_ms += st.decode_timing.reduce_ms;

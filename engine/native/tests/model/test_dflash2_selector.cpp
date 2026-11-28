@@ -355,6 +355,73 @@ void acceptance_edges() {
   INGINE_CHECK(run(G, 0)[V - 1] == 1.f);
 }
 
+void audit_gather() {
+  constexpr int V = 23;
+  std::array<int, G * K> ids;
+  std::array<float, G * K> q;
+  std::array<float, G * V> p;
+  std::array<int, G> greedy, picked;
+  std::array<float, G> conf;
+  for (int i = 0; i < G; ++i) {
+    for (int j = 0; j < K; ++j) {
+      ids[i * K + j] = j + i;
+      q[i * K + j] = float(j + 1) / (K * (K + 1) / 2);
+    }
+    ids[i * K + 1] = ids[i * K];  // fold two positive weights for overlap
+    ids[i * K + 2] = -1;
+    ids[i * K + 3] = V;
+    picked[i] = i == 5 ? K : i;
+    greedy[i] = i % 2 ? V - 1 : ids[i * K];
+    conf[i] = float(i + 1) / 8;
+    for (int v = 0; v < V; ++v) p[i * V + v] = float((v + i) % V + 1) / (V * (V + 1) / 2);
+  }
+  DeviceArray<int> d_ids(G * K), d_target(G), d_pick(G);
+  DeviceArray<float> d_p(G * V), d_q(G * K), d_conf(G);
+  DeviceArray<kd::DFlash2Audit> output(1);
+  d_ids.upload(ids);
+  d_target.upload(greedy);
+  d_pick.upload(picked);
+  d_p.upload(p);
+  d_q.upload(q);
+  d_conf.upload(conf);
+  for (int eligible : {0, 3, G}) {
+    for (bool sampled : {false, true}) {
+      kd::dflash2_audit(d_conf.data, d_ids.data, eligible, V, sampled ? nullptr : d_target.data,
+                        sampled ? d_p.data : nullptr, sampled ? d_q.data : nullptr, sampled ? d_pick.data : nullptr,
+                        output.data, nullptr);
+      INGINE_TEST_CUDA(cudaStreamSynchronize(nullptr));
+      const auto result = output.download().front();
+      for (int i = 0; i < G; ++i) {
+        std::array<double, V> weights{};
+        std::array<bool, V> present{};
+        for (int j = 0; j < K; ++j) {
+          const int id = ids[i * K + j];
+          if (id >= 0 && id < V) {
+            weights[id] += q[i * K + j];
+            present[id] = true;
+          }
+        }
+        double mass = 0, overlap = 0;
+        for (int v = 0; v < V; ++v) {
+          if (present[v]) mass += p[i * V + v];
+          overlap += std::min(double(p[i * V + v]), weights[v]);
+        }
+        const bool exact = sampled && i < eligible;
+        const int slot = picked[i];
+        const bool valid_pick = exact && slot < K;
+        const int id = valid_pick ? ids[i * K + slot] : -1;
+        const float expected_p = id >= 0 && id < V ? p[i * V + id] : 0.f;
+        INGINE_CHECK(result.conf[i] == conf[i]);
+        INGINE_CHECK(result.in_support[i] == (!sampled && i < eligible ? int(present[greedy[i]]) : -1));
+        INGINE_CHECK(std::abs(result.target_mass[i] - (exact ? mass : -1.0)) < 1e-7);
+        INGINE_CHECK(std::abs(result.overlap[i] - (exact ? overlap : -1.0)) < 1e-7);
+        INGINE_CHECK(result.picked_p[i] == (valid_pick ? expected_p : -1.f));
+        INGINE_CHECK(result.picked_q[i] == (valid_pick ? q[i * K + slot] : -1.f));
+      }
+    }
+  }
+}
+
 void statistical_acceptance() {
   constexpr int V = 24, draws = 50000;
   const kh::SamplingParams params{0.85f, 20, 0.92f};
@@ -437,6 +504,7 @@ int main() {
   selector_parity();
   batch_selector_parity();
   acceptance_edges();
+  audit_gather();
   statistical_acceptance();
   std::puts("PASS model_dflash2_selector");
 }
