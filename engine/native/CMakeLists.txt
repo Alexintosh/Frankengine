@@ -90,7 +90,7 @@ ingine_add_component(src/engine)
 ingine_add_component(src/serve)
 
 if(INGINE_BUILD_APPS)
-  foreach(app serve bench validate batch)
+  foreach(app serve bench validate batch distill)
     ingine_add_component(apps/${app})
   endforeach()
 endif()

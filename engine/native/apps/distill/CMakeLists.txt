@@ -1,0 +1,7 @@
+if(TARGET ingine_model)
+  add_executable(ingine-dump-taps main.cpp)
+  ingine_internal_includes(ingine-dump-taps)
+  target_link_libraries(ingine-dump-taps PRIVATE ingine_model ingine_serve ingine_text CUDA::cudart)
+else()
+  message(STATUS "ingine-dump-taps: ingine_model not in this tree; skipped")
+endif()
