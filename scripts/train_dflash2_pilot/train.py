@@ -12,6 +12,7 @@ from pathlib import Path
 import numpy as np
 import torch
 from torch.nn import functional as F
+from torch.utils.checkpoint import checkpoint
 
 if __package__:
     from .model import (
@@ -115,7 +116,7 @@ class Anchors:
         )
 
 
-def configure_stage(model, stage):
+def configure_stage(model, stage, freeze_codebooks=False):
     full = stage == "full"
     model.requires_grad_(full)
     # Keep FP32 master parameters and Adam moments while the model casts
@@ -124,6 +125,9 @@ def configure_stage(model, stage):
         model.float()
     else:
         model.candidate_selector.float().requires_grad_(True)
+    if freeze_codebooks:
+        model.candidate_selector.predecessor_codebook.requires_grad_(False)
+        model.candidate_selector.successor_codebook.requires_grad_(False)
 
     groups = {}
     for name, parameter in model.named_parameters():
@@ -143,19 +147,26 @@ def kl_rows(target, student, temperature):
     return (p.exp() * (p - q)).sum(dim=-1)
 
 
-def loss_rows(model, batch, embed, embed_norm, head, head_fp32, full, unary_weight):
+def loss_rows(model, batch, embed, embed_norm, head, head_fp32, full, unary_weight,
+              *, ce_weight=0.0, grad_checkpoint=False):
     ctx, mask, positions, ids, block_positions, predecessors, teacher = batch
     with torch.no_grad():
         embeds = embed_tokens(ids, embed, embed_norm)
         target = softcap(F.linear(teacher.float(), head_fp32))
     with torch.set_grad_enabled(full and torch.is_grad_enabled()):
-        hidden = model.forward_backbone(ctx, mask, positions, embeds, block_positions)
+        backbone_inputs = (ctx, mask, positions, embeds, block_positions)
+        if grad_checkpoint and torch.is_grad_enabled():
+            hidden = checkpoint(model.forward_backbone, *backbone_inputs, use_reentrant=False)
+        else:
+            hidden = model.forward_backbone(*backbone_inputs)
         unary = F.linear(hidden, head).float()
     top_ids, scores = model.score_selector_reached(hidden, unary, predecessors)
     t_top = target.gather(-1, top_ids)
-    selector_loss = (0.5 * 0.8 ** 2 * kl_rows(t_top, scores, 0.8)
-                     + 0.3 * kl_rows(t_top, scores, 1.0)
-                     + 0.2 * F.cross_entropy(scores.transpose(1, 2), t_top.argmax(-1), reduction="none"))
+    selector_loss = 0.5 * (0.8 ** 2) * kl_rows(t_top, scores, 0.8) + 0.5 * kl_rows(t_top, scores, 1.0)
+    if ce_weight > 0:
+        selector_loss = selector_loss + ce_weight * F.cross_entropy(
+            scores.transpose(1, 2), t_top.argmax(-1), reduction="none",
+        )
     if full:
         u_soft = softcap(unary)
         unary_loss = 0.5 * 0.8 ** 2 * kl_rows(target, u_soft, 0.8) + 0.5 * kl_rows(target, u_soft, 1.0)
@@ -170,7 +181,7 @@ def validate(model, anchors, indices, args, device, target_weights, weights):
     for start in range(0, len(indices), args.batch_size):
         batch = anchors.batch(indices[start:start + args.batch_size], args.ctx_len, device)
         loss, target, top_ids, scores = loss_rows(
-            model, batch, *target_weights, args.stage == "full", args.unary_weight,
+            model, batch, *target_weights, args.stage == "full", args.unary_weight, ce_weight=args.ce_weight,
         )
         tgt_greedy = target.argmax(-1)
         drafted = top_ids.gather(-1, scores.argmax(-1, keepdim=True)).squeeze(-1)
@@ -216,8 +227,12 @@ def parse_args():
     parser.add_argument("--out-dir", type=Path, required=True)
     parser.add_argument("--stage", choices=("selector", "full"), required=True)
     parser.add_argument("--steps", type=int, default=1500)
-    parser.add_argument("--lr-selector", type=float, help="Defaults to 3e-4 for selector and 2e-4 for full")
-    parser.add_argument("--lr-backbone", type=float, default=5e-5)
+    parser.add_argument("--lr-selector", type=float, help="Defaults to 5e-5 for selector and 2e-5 for full")
+    parser.add_argument("--lr-backbone", type=float, default=2e-5)
+    parser.add_argument("--warmup-frac", type=float, default=0.10, help="Fraction of full-stage steps for LR warmup")
+    parser.add_argument("--ce-weight", type=float, default=0.0, help="Weight of optional hard selector cross-entropy")
+    parser.add_argument("--freeze-codebooks", action="store_true", help="Train with fixed selector codebooks")
+    parser.add_argument("--grad-checkpoint", action="store_true", help="Recompute backbone activations during full-stage backward")
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--grad-accum", type=int, default=1)
     parser.add_argument("--val-frac", type=float, default=0.05)
@@ -230,7 +245,7 @@ def parse_args():
     parser.add_argument("--device", default="cuda")
     args = parser.parse_args()
     if args.lr_selector is None:
-        args.lr_selector = 3e-4 if args.stage == "selector" else 2e-4
+        args.lr_selector = 5e-5 if args.stage == "selector" else 2e-5
     if (min(args.batch_size, args.grad_accum, args.eval_every) < 1
             or min(args.steps, args.val_anchors, args.ctx_len, args.seed) < 0 or args.ctx_len > WINDOW):
         parser.error("Invalid step, batch, evaluation, context or seed argument")
@@ -238,6 +253,10 @@ def parse_args():
     if (not all(map(math.isfinite, floats)) or not 0 < args.val_frac < 1 or not 0 < args.pos_decay <= 1
             or min(args.lr_selector, args.lr_backbone) <= 0 or args.unary_weight < 0):
         parser.error("Invalid validation fraction, learning rate, position decay or unary weight")
+    if not math.isfinite(args.ce_weight) or args.ce_weight < 0:
+        parser.error("--ce-weight must be finite and nonnegative")
+    if not 0 <= args.warmup_frac <= 1:
+        parser.error("--warmup-frac must be in [0, 1]")
     return args
 
 
@@ -263,19 +282,23 @@ def main():
     position_weights = args.pos_decay ** torch.arange(GAMMA, device=device, dtype=torch.float32)
     position_weights /= position_weights.mean()
     full = args.stage == "full"
-    groups = configure_stage(model, args.stage)
+    groups = configure_stage(model, args.stage, freeze_codebooks=args.freeze_codebooks)
     for group in groups:
         group["lr"] = args.lr_backbone if group["name"] == "backbone" else args.lr_selector
     optimizer = torch.optim.AdamW(groups, foreach=False)
     base_rates = [g["lr"] for g in optimizer.param_groups]
-    warmup = max(1, round(args.steps * 0.05))
+    warmup = round(args.steps * args.warmup_frac)
     params = [p for group in groups for p in group["params"]]
     best = -math.inf
     args.out_dir.mkdir(parents=True, exist_ok=True)
     start = time.monotonic()
+    window_loss = torch.zeros((), device=device)
+    window_seconds = 0.0
+    last_progress = 0
     with (args.out_dir / "metrics.jsonl").open("w") as log:
         for step in range(args.steps + 1):
             if step:
+                step_start = time.monotonic()
                 optimizer.zero_grad(set_to_none=True)
                 if full:
                     scale = (step / warmup if step <= warmup else
@@ -285,10 +308,26 @@ def main():
                 for _ in range(args.grad_accum):
                     indices = rng.integers(len(train), size=args.batch_size)
                     batch = train.batch(indices, args.ctx_len, device)
-                    loss, *_ = loss_rows(model, batch, *target_weights, full, args.unary_weight)
-                    ((loss * position_weights).mean() / args.grad_accum).backward()
+                    loss = loss_rows(
+                        model, batch, *target_weights, full, args.unary_weight,
+                        ce_weight=args.ce_weight, grad_checkpoint=args.grad_checkpoint,
+                    )[0]
+                    batch_loss = (loss * position_weights).mean() / args.grad_accum
+                    batch_loss.backward()
+                    window_loss.add_(batch_loss.detach())
                 torch.nn.utils.clip_grad_norm_(params, 1.0, error_if_nonfinite=True)
                 optimizer.step()
+                report_progress = step % 50 == 0 or step == args.steps
+                if report_progress:
+                    window_steps = step - last_progress
+                    train_loss = window_loss.item() / window_steps
+                window_seconds += time.monotonic() - step_start
+                if report_progress:
+                    print(json.dumps({"stage": args.stage, "step": step, "train_loss": train_loss,
+                                      "step/s": window_steps / window_seconds}, allow_nan=False), flush=True)
+                    window_loss.zero_()
+                    window_seconds = 0.0
+                    last_progress = step
             if step % args.eval_every == 0 or step == args.steps:
                 optimizer.zero_grad(set_to_none=True)
                 metrics = validate(model, val, val_indices, args, device, target_weights, position_weights)

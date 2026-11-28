@@ -168,7 +168,8 @@ class DFlash2Parity(unittest.TestCase):
                 model = model_with(self.weights)
                 groups = configure_stage(model, stage)
                 rows, *_ = loss_rows(model, (ctx, mask, pos, ids, block_pos, pred, teacher),
-                                     embed, torch.ones(2304), head, head.float(), stage == "full", 1.0)
+                                     embed, torch.ones(2304), head, head.float(), stage == "full", 1.0,
+                                     grad_checkpoint=stage == "full")
                 rows.mean().backward()
                 group_for = {id(parameter): (group["name"], group["weight_decay"])
                              for group in groups for parameter in group["params"]}
@@ -249,6 +250,28 @@ class AnchorAlignment(unittest.TestCase):
 
 
 class CalibrationMetrics(unittest.TestCase):
+    def test_selector_kl_and_optional_cross_entropy(self):
+        ids = torch.zeros(1, 8, dtype=torch.long)
+        head = torch.tensor([[1.0, 0.0], [0.0, 1.0]], dtype=torch.bfloat16)
+        teacher = torch.tensor([1.0, 2.0], dtype=torch.bfloat16).expand(1, 7, 2)
+        top_ids = torch.arange(2).expand(1, 7, 2)
+        scores = torch.tensor([0.25, -0.5]).expand(1, 7, 2)
+        model = SimpleNamespace(forward_backbone=lambda *_: torch.zeros_like(teacher),
+                                score_selector_reached=lambda *_: (top_ids, scores))
+        batch = (None, None, None, ids, None, None, teacher)
+        weights = (head, torch.ones(2), head, head.float())
+        loss, target, *_ = loss_rows(model, batch, *weights, False, 1.0)
+        expected = torch.zeros_like(loss)
+        for temperature, coefficient in ((0.8, 0.5 * 0.8 ** 2), (1.0, 0.5)):
+            expected += coefficient * F.kl_div(
+                (scores / temperature).log_softmax(-1),
+                (target / temperature).softmax(-1), reduction="none",
+            ).sum(-1)
+        torch.testing.assert_close(loss, expected)
+        with_ce, *_ = loss_rows(model, batch, *weights, False, 1.0, ce_weight=0.2)
+        ce = F.cross_entropy(scores.transpose(1, 2), target.argmax(-1), reduction="none")
+        torch.testing.assert_close(with_ce, expected + 0.2 * ce)
+
     def test_survival_and_greedy_miss_denominator(self):
         # The teacher is uniform on four tokens; the proposal has two candidates.
         # At T=0.8 the proposal is uniform there, giving an overlap of 0.5 on every edge.
@@ -256,7 +279,7 @@ class CalibrationMetrics(unittest.TestCase):
         top_ids = torch.tensor([[[0, 1], [1, 0]] + [[2, 3]] * 5])
         scores = torch.zeros(1, 7, 2)
         loss = torch.arange(7, dtype=torch.float32)[None]
-        args = SimpleNamespace(batch_size=1, ctx_len=0, stage="selector", unary_weight=1.0)
+        args = SimpleNamespace(batch_size=1, ctx_len=0, stage="selector", unary_weight=1.0, ce_weight=0.0)
         anchors = SimpleNamespace(batch=lambda *_: None)
         with patch.object(train, "loss_rows", return_value=(loss, target, top_ids, scores)):
             metrics = train.validate(torch.nn.Module(), anchors, [0], args, "cpu", (), torch.ones(7))
@@ -326,13 +349,34 @@ class RolloutExclusions(unittest.TestCase):
 
 
 class TrainingArguments(unittest.TestCase):
-    def test_default_context_and_checkpoint_path_guard(self):
+    def test_freeze_codebooks(self):
+        for stage in ("selector", "full"):
+            with self.subTest(stage=stage):
+                model = DFlash2DraftModel(device="meta")
+                groups = configure_stage(model, stage, freeze_codebooks=True)
+                optimized = {id(p) for group in groups for p in group["params"]}
+                for codebook in (model.candidate_selector.predecessor_codebook,
+                                 model.candidate_selector.successor_codebook):
+                    self.assertFalse(codebook.requires_grad)
+                    self.assertNotIn(id(codebook), optimized)
+                self.assertIn(id(model.candidate_selector.hidden_projection.weight), optimized)
+
+    def test_defaults_and_checkpoint_path_guard(self):
         argv = ["train.py", "--stage", "selector", "--data-dir", "unused", "--model-dir", "unused",
                 "--dflash2-dir", "draft", "--out-dir", "draft/stage/.."]
         with patch.object(sys, "argv", argv):
-            self.assertEqual(train.parse_args().ctx_len, 2048)
+            args = train.parse_args()
+            self.assertEqual(args.ctx_len, 2048)
+            self.assertEqual(args.lr_selector, 5e-5)
+            self.assertEqual(args.lr_backbone, 2e-5)
+            self.assertEqual(args.warmup_frac, 0.10)
+            self.assertEqual(args.ce_weight, 0.0)
+            self.assertFalse(args.freeze_codebooks)
+            self.assertFalse(args.grad_checkpoint)
             with self.assertRaisesRegex(ValueError, "--out-dir must differ from --dflash2-dir"):
                 train.main()
+        with patch.object(sys, "argv", [*argv, "--stage", "full"]):
+            self.assertEqual(train.parse_args().lr_selector, 2e-5)
 
 
 if __name__ == "__main__":
