@@ -12,19 +12,19 @@ Same-harness measurement using [`knapcio/inkling-2-mini-spark-bench`](https://gi
 
 | Metric (`spark-bench`, Vision ON) | `1× DGX Spark` (`231 GB/s`) | **`1× RTX PRO 6000 96 GB` (`1,792 GB/s`)** | Speedup |
 |---|---:|---:|---:|
-| **Startup (`Vision ON`)** | `8 s` | **`3 s`** | **`2.7×`** |
-| **VRAM Used (`256K` + `32×32K` batch)** | `~55 GiB` (`56.8 GiB` free) | **`54.6 / 97.9 GiB`** | — |
-| **`speedbench full` ALL 73 (`c1`, reasoning on)** | `82.1 tok/s` *(geo `86.0`, TTFT `49.7 ms`)* | **`398.4 tok/s`** *(geo `410.4`, TTFT `9.7 ms`)* | **`4.85×`** |
-| **Prose / Code (`c1`)** | `78.8 / 96.3 tok/s` | **`379.2 / 416.2 tok/s`** | **`4.81× / 4.32×`** |
-| **Thinking `c1` (`T=0.8`, high)** | `88.7 tok/s` (`90.6/req`, TTFT `0.16 s`) | **`412.2 tok/s`** (`422.5/req`, TTFT `0.04 s`) | **`4.65×`** |
-| **Thinking `c8` (`16×4096`, `T=0.8`)** | `269.9 tok/s` (`40.1/req`, TTFT `0.36 s`) | **`1,020.1 tok/s`** (`152.8/req`, TTFT `0.27 s`) | **`3.78×`** |
-| **Thinking `c24` (`48×4096`, `T=0.8`)** | `522.7 tok/s` (`26.6/req`, TTFT `0.69 s`) | **`2,339.9 tok/s`** (`119.3/req`, TTFT `0.45 s`) | **`4.48×`** |
-| **Decode Table Prose `c8 / c24`** | `191.3 / 380.9 tok/s` | **`750.5 / 1,586.2 tok/s`** | **`3.92× / 4.16×`** |
-| **Decode Table Code `c8 / c24`** | `195.8 / 391.2 tok/s` | **`761.5 / 1,501.7 tok/s`** | **`3.89× / 3.84×`** |
-| **Cold Prefill `8K / 32K / 128K`** | `4,787 / 4,811 / 3,930 tok/s` | **`25,041 / 24,559 / 18,743 tok/s`** | **`5.23× / 5.10× / 4.77×`** |
-| **Warm Decode `@32K / @128K`** | `89.1 / 60.6 tok/s` | **`438.1 / 317.6 tok/s`** | **`4.92× / 5.24×`** |
-| **Needle `128K` / `240K`** | `PASS` (`34.2 s` / `74.1 s`) | **`PASS` (`7.0 s` / `16.0 s`)** | **`4.89× / 4.63×`** |
-| **Quality Guard `30/30` / `inkqc` (`3×295`)** | `PASS` / `285.7 / 295` (`[283, 286, 288]`) | **`PASS`** (`417.6 tok/s`, drift `0.014%`) | ✓ |
+| **Startup (`Vision ON`)** | **`8 s`** | **`3 s`** | **`2.7×`** |
+| **VRAM Used (`256K` + `32×32K` batch)** | `~55 GiB` (`55.1 GiB` free) | **`54.6 / 97.9 GiB`** | — |
+| **`speedbench full` ALL 73 (`c1`, reasoning on)** | **`87.2 tok/s`** *(geo; med `82.5`, TTFT `49.2 ms`)* | **`398.4 tok/s`** *(geo `410.4`, TTFT `9.7 ms`)* | **`4.71×`** |
+| **Prose / Code (`c1`, geomean)** | `78.8 / 97.2 tok/s` *(code med `98.6`)* | **`379.2 / 416.2 tok/s`** | **`4.81× / 4.28×`** |
+| **Thinking `c1` (`T=0.8`, high)** | `86.4 tok/s` (`87.0/req`, TTFT `0.17 s`) | **`412.2 tok/s`** (`422.5/req`, TTFT `0.04 s`) | **`4.77×`** |
+| **Thinking `c8` (`16×4096`, `T=0.8`)** | `259.2 tok/s` (`38.3/req`, TTFT `0.51 s`) | **`1,020.1 tok/s`** (`152.8/req`, TTFT `0.27 s`) | **`3.94×`** |
+| **Thinking `c24` (`48×4096`, `T=0.8`)** | **`552.6 tok/s`** (`26.7/req`, TTFT `1.11 s`) | **`2,339.9 tok/s`** (`119.3/req`, TTFT `0.45 s`) | **`4.23×`** |
+| **Decode Table Prose `c8 / c24`** | `195.1 / 376.9 tok/s` | **`750.5 / 1,586.2 tok/s`** | **`3.85× / 4.21×`** |
+| **Decode Table Code `c8 / c24`** | `178.5 / 361.6 tok/s` | **`761.5 / 1,501.7 tok/s`** | **`4.27× / 4.15×`** |
+| **Cold Prefill `8K / 32K / 128K`** | `4,774 / 4,770 / 3,885 tok/s` | **`25,041 / 24,559 / 18,743 tok/s`** | **`5.25× / 5.15× / 4.82×`** |
+| **Warm Decode `@32K / @128K`** | `86.8 / 60.7 tok/s` | **`438.1 / 317.6 tok/s`** | **`5.05× / 5.23×`** |
+| **Needle `128K` / `240K`** | `PASS` (`34.6 s` / `75.2 s`) | **`PASS` (`7.0 s` / `16.0 s`)** | **`4.94× / 4.70×`** |
+| **Quality Guard `30/30` / `inkqc` (`3×295`)** | `PASS` (`88.9` geo) / `285.7 / 295` (`[285, 287, 285]`, `LC 60/60`) | **`PASS`** (`417.6 tok/s`, drift `0.014%`) | ✓ |
 
 ### B. 100% Bit-Exact Lossless Preset (`--dense-pico12 --cert-head --draft-nvfp4`, BF16 KV)
 
@@ -50,13 +50,16 @@ Same-harness measurement using [`knapcio/inkling-2-mini-spark-bench`](https://gi
 
 Same-harness comparison against public `1× DGX Spark` recipes (`knapcio/inkling-2-mini-spark-bench`):
 
-| Recipe (`1× DGX Spark`) | Lossy? | ALL 73 (`c1`) | Prose (`c1`) | Code (`c1`) | Thinking (`c24`) | Prefill `8K` | Prefill `128K` | Startup | Quality (`/295`) |
-|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| **Frankengine TP=1 (FP8, Vision ON)** | Yes (`FP8 KV/dense`) | **`82.1 tok/s`** *(geo `86.0`)* | **`78.8`** | **`96.3`** | **`523`** *(c8 `270`)* | `4,787` | **`3,930`** | **`8 s`** | `285.7` |
-| **Frankengine TP=1 exact (`PICO12 + CERT_HEAD`, Vision ON)** | **No (bit-exact)** | **`76.7 tok/s`** *(geo `77.1`)* | **`69.7`** | **`84.8`** | **`449`** *(c8 `219`)* | `4,442` | `3,146` | **`10 s`** | **`286.0`** |
-| `knapcio v2.9.7` (SGLang + overlays, Vision OFF) | No | `73.5 tok/s` | `65.6` | `82.2` | `538` | `5,720` | `3,860` | `128 s` | `287.3` |
+| Recipe (`1× DGX Spark`) | Lossy? | ALL 73 (`geomean`, `c1`) | Prose (`c1`) | Code (`c1`) | Thinking (`c24`) | Prefill `8K` | Prefill `128K` | Context | Startup | Quality (`/295`) |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| **Frankengine TP=1 (FP8, `DP_WIDTH=1`, Vision ON)** | Yes (`FP8 KV/dense`) | **`87.2 tok/s`** *(med `82.5`)* | `78.8` | `97.2` | **`553`** *(c8 `259`)* | `4,774` | **`3,885`** | `262K` | **`8 s`** | `285.7` |
+| `KindlingAI gr8 bit225 fast` (`EXLR8`) | Yes (`2.25 bpw`) | `86.9 tok/s` | **`80.4`** | **`101.3`** | *8 slots* | `3,233` | `2,004` | `147K` | `15 s` | `283.7` |
+| **Frankengine TP=1 exact (`PICO12 + CERT_HEAD`, Vision ON)** | **No (bit-exact)** | **`77.1 tok/s`** *(med `76.7`)* | `69.7` | `84.8` | `449` *(c8 `219`)* | `4,442` | `3,146` | `262K` | `10 s` | `286.0` |
+| `knapcio v2.9.8` (SGLang + overlays, Vision OFF) | No | `73.5 tok/s` | `65.6` | `82.2` | `538` | **`5,720`** | `3,860` | `262K` | `128 s` | `287.3` |
+| `MiaAI-Lab TensorFold` (FP8 KV + attn) | Yes (`FP8 KV+attn`) | `58.6 tok/s` | `54.5` | `66.8` | *8 slots* | `3,915` | `2,941` | `262K` | `66 s` | **`288.7`** |
+| `KindlingAI gr8 bit325` (`EXLR8`) | Yes (`3.25 bpw`) | `58.0 tok/s` | `52.3` | `68.1` | *8 slots* | `3,205` | `2,005` | `147K` | `15 s` | `287.0` |
 
-On steady-state 512-token full-24 bursts (no early-stop tail), FP8 reaches **`552.3 tok/s`** (`26.9 tok/s` per stream).
+All columns follow `knapcio/inkling-2-mini-spark-bench` `summarize.py` definitions (`geomean_tok_s` for ALL 73 / Prose / Code, `aggregate_tok_s` for Thinking `c=24`, cold single-request prefill, 3-run `inkqc 295` mean).
 
 ---
 

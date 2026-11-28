@@ -24,8 +24,8 @@ Measured with [`knapcio/inkling-2-mini-spark-bench`](https://github.com/knapcio/
 | **1× RTX PRO 6000 96 GB (FP8)** | Yes (`FP8`) | **`398.4 tok/s`** | **`412.2`** | **`1,020`** | **`2,340`** | **`3 s`** | `30/30 PASS` |
 | **1× RTX PRO 6000 96 GB (`PICO12 + CERT`)** | **No (bit-exact)** | **`365.9 tok/s`** | **`357.6`** | **`809`** | **`1,764`** | **`4 s`** | `30/30 PASS` |
 | **2× DGX Spark GB10 (`TP=2` RoCEv2, FP8)** | Yes (`FP8`) | **`136.4 tok/s`** *(guard)* | **`142.3`** | **`365`** | **`699`** *(c32 `799`)* | **`8 s`** | `30/30 PASS` |
-| **1× DGX Spark GB10 (FP8, Vision ON)** | Yes (`FP8`) | **`82.1 tok/s`** | **`88.7`** | **`270`** | **`523`** | **`8 s`** | `285.7` |
-| **1× DGX Spark GB10 (`PICO12 + CERT`, Vision ON)** | **No (bit-exact)** | **`76.7 tok/s`** | **`73.2`** | **`219`** | **`449`** | **`10 s`** | **`286.0`** |
+| **1× DGX Spark GB10 (FP8, Vision ON)** | Yes (`FP8`) | **`87.2 tok/s`** *(med `82.5`)* | **`86.4`** | **`259`** | **`553`** | **`8 s`** | `285.7` |
+| **1× DGX Spark GB10 (`PICO12 + CERT`, Vision ON)** | **No (bit-exact)** | **`77.1 tok/s`** *(med `76.7`)* | **`73.2`** | **`219`** | **`449`** | **`10 s`** | **`286.0`** |
 
 Full tables (including `2× DGX Spark TP=2` RoCEv2, `Decode Table`, `Decode @32K/@128K`, and Persistent Prefix Cache): [**Benchmarks**](docs/BENCHMARKS.md).
 
