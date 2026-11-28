@@ -16,6 +16,7 @@
 
 #include "kernels/head/head.h"
 #include "model/drafter.h"
+#include "model/model_kernels.h"
 #include "model/runtime.h"
 
 #include "ingine/generator.h"
@@ -31,6 +32,9 @@ namespace ingine::model {
 
 class DFlash2;
 class DFlash2Head;
+
+// Read the greedy width policy once, when constructing the speculative loop.
+DpWidthPolicy dflash2_dp_policy(const RuntimeOptions& options, bool cumulative);
 
 class SpecLoop {
  public:
@@ -74,6 +78,7 @@ class SpecLoop {
   Drafter* drafter_;
   DFlash2* dflash2_;
   DFlash2Head* dflash2_head_;
+  DpWidthPolicy dflash2_dp_{};
   bool host_verify_, dflash2_device_;
   DeviceBuffer proposal_, host_accept_;
   DeviceBuffer target_tokens_;

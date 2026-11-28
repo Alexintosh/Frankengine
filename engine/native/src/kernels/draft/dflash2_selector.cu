@@ -14,7 +14,7 @@ constexpr int kRank = 256;
 
 __device__ __forceinline__ float score_edge(float unary, const __nv_bfloat16* projected,
                                             const __nv_bfloat16* predecessor,
-                                            const __nv_bfloat16* successor, int lane) {
+                                            const __nv_bfloat16* successor, int lane, float edge_scale) {
   float dot = 0.0f;
   for (int r = lane; r < kRank; r += 32) {
     const auto weighted = __float2bfloat16_rn(__bfloat162float(predecessor[r]) * __bfloat162float(projected[r]));
@@ -23,13 +23,15 @@ __device__ __forceinline__ float score_edge(float unary, const __nv_bfloat16* pr
   for (int offset = 16; offset > 0; offset /= 2) {
     dot += __shfl_down_sync(0xffffffffu, dot, offset);
   }
-  return lane == 0 ? 30.0f * tanhf((unary + __bfloat162float(__float2bfloat16_rn(dot))) / 30.0f) : 0.f;
+  const float corr = __bfloat162float(__float2bfloat16_rn(dot));
+  const float combined = edge_scale == 1.0f ? unary + corr : unary + edge_scale * corr;
+  return lane == 0 ? 30.0f * tanhf(combined / 30.0f) : 0.f;
 }
 
 __global__ void score_edges(const std::int32_t* ids, const float* unary,
                             const __nv_bfloat16* projected, const __nv_bfloat16* predecessors,
                             const __nv_bfloat16* successors, const std::int32_t* anchor,
-                            float* lattice) {
+                            float* lattice, float edge_scale) {
   const int edge = blockIdx.x;
   const int previous = blockIdx.y;
   const int next = blockIdx.z;
@@ -37,7 +39,7 @@ __global__ void score_edges(const std::int32_t* ids, const float* unary,
   const int predecessor = edge == 0 ? *anchor : ids[(edge - 1) * kCandidates + previous];
   const int candidate = ids[edge * kCandidates + next];
   const float score = score_edge(unary[edge * kCandidates + next], projected + edge * kRank,
-                                 predecessors + predecessor * kRank, successors + candidate * kRank, lane);
+                                 predecessors + predecessor * kRank, successors + candidate * kRank, lane, edge_scale);
   if (lane == 0) lattice[(edge * kCandidates + previous) * kCandidates + next] = score;
 }
 
@@ -117,7 +119,7 @@ __global__ void fused_walk(const std::int32_t* ids, const float* unary,
                            const __nv_bfloat16* projected, const __nv_bfloat16* predecessors,
                            const __nv_bfloat16* successors, const std::int32_t* anchor,
                            std::int32_t* tokens, float* confidence, bool cumulative,
-                           const float* temperature, const std::uint64_t* seed, DFlash2Support support) {
+                           const float* temperature, const std::uint64_t* seed, DFlash2Support support, float edge_scale) {
   __shared__ float scores[kCandidates];
   __shared__ int predecessor;
   const int next = threadIdx.x / 32;
@@ -130,7 +132,7 @@ __global__ void fused_walk(const std::int32_t* ids, const float* unary,
   for (int edge = 0; edge < kSlots; ++edge) {
     const auto* row = ids + edge * kCandidates;
     const float score = score_edge(unary[edge * kCandidates + next], projected + edge * kRank,
-                                   predecessors + predecessor * kRank, successors + row[next] * kRank, lane);
+                                   predecessors + predecessor * kRank, successors + row[next] * kRank, lane, edge_scale);
     if (lane == 0) scores[next] = score;
     __syncthreads();
     if (threadIdx.x == 0) {
@@ -270,9 +272,9 @@ void dflash2_fused_selector(const std::int32_t* ids, const float* unary,
                            const __nv_bfloat16* successors, const std::int32_t* anchor,
                            std::int32_t* tokens, float* confidence, bool cumulative,
                            const float* temperature, const std::uint64_t* seed,
-                           DFlash2Support support, cudaStream_t stream) {
+                           DFlash2Support support, cudaStream_t stream, float edge_scale) {
   fused_walk<<<1, kCandidates * 32, 0, stream>>>(ids, unary, projected, predecessors, successors, anchor,
-                                                tokens, confidence, cumulative, temperature, seed, support);
+                                                tokens, confidence, cumulative, temperature, seed, support, edge_scale);
   CUDA_CHECK(cudaGetLastError());
 }
 
@@ -281,9 +283,9 @@ void dflash2_lattice_selector(const std::int32_t* ids, const float* unary,
                              const __nv_bfloat16* successors, const std::int32_t* anchor,
                              float* lattice, std::int32_t* tokens, float* confidence, bool cumulative,
                              const float* temperature, const std::uint64_t* seed,
-                             DFlash2Support support, cudaStream_t stream) {
+                             DFlash2Support support, cudaStream_t stream, float edge_scale) {
   score_edges<<<dim3(kSlots, kCandidates, kCandidates), 32, 0, stream>>>(
-      ids, unary, projected, predecessors, successors, anchor, lattice);
+      ids, unary, projected, predecessors, successors, anchor, lattice, edge_scale);
   walk<<<1, 1, 0, stream>>>(ids, lattice, tokens, confidence, cumulative, temperature, seed, support);
   CUDA_CHECK(cudaGetLastError());
 }

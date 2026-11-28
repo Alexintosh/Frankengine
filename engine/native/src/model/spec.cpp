@@ -4,9 +4,12 @@
 #include "kernels/draft/dflash2_selector.h"
 #include "kernels/draft/draft.h"
 #include "model/dflash2.h"
+#include "model/dflash2_env.h"
 #include "model/model_kernels.h"
 
 #include <algorithm>
+#include <array>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <stdexcept>
@@ -82,8 +85,57 @@ Widths verify_widths(const Runtime& rt) {
 
 }  // namespace
 
+DpWidthPolicy dflash2_dp_policy(const RuntimeOptions& options, bool cumulative) {
+  DpWidthPolicy dp;
+  dp.cumulative = cumulative;
+  if (const char* flag = std::getenv("INGINE_DFLASH2_DP_WIDTH")) {
+    const std::string_view value(flag);
+    if (value != "0" && value != "1")
+      throw std::invalid_argument("INGINE_DFLASH2_DP_WIDTH must be 0 or 1");
+    dp.enabled = value == "1" && dflash2_threshold(options) > 0.f;
+  } else {
+    dp.enabled = dflash2_threshold(options) > 0.f;
+  }
+
+  int dev = 0, sms = 0;
+  if (dp.enabled && (cudaGetDevice(&dev) != cudaSuccess ||
+                     cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev) != cudaSuccess)) {
+    sms = 0;
+    (void)cudaGetLastError();
+  }
+  constexpr std::array<float, 8> high_sm{5.1f, 5.6f, 6.1f, 6.6f, 7.1f, 7.7f, 8.3f, 8.9f};
+  constexpr std::array<float, 8> low_sm{21.5f, 25.9f, 30.3f, 34.0f, 37.2f, 39.9f, 43.3f, 45.4f};
+  const auto& costs = sms >= 96 ? high_sm : low_sm;
+  std::copy(costs.begin(), costs.end(), dp.cost_ms + 1);
+  dp.rate = dflash2_env::read_float("INGINE_DFLASH2_DP_RATE", sms >= 96 ? 0.563f : 0.112f);
+  dp.gamma = dflash2_env::read_float("INGINE_DFLASH2_DP_GAMMA", dp.gamma);
+
+  constexpr char name[] = "INGINE_DFLASH2_DP_COSTS";
+  if (const char* csv = std::getenv(name)) {
+    std::string_view rest(csv);
+    std::array<float, 8> parsed{};
+    std::size_t count = 0;
+    for (;;) {
+      if (count == parsed.size()) throw std::invalid_argument("INGINE_DFLASH2_DP_COSTS requires 7 or 8 costs");
+      const auto comma = rest.find(',');
+      parsed[count++] = dflash2_env::parse_float(name, rest.substr(0, comma));
+      if (comma == std::string_view::npos) break;
+      rest.remove_prefix(comma + 1);
+    }
+    if (count < 7) throw std::invalid_argument("INGINE_DFLASH2_DP_COSTS requires 7 or 8 costs");
+    std::copy_n(parsed.begin(), count, dp.cost_ms + (count == 7 ? 2 : 1));
+    if (count == 7) {
+      const float floor = std::min(0.1f, dp.cost_ms[2]);
+      dp.cost_ms[1] = std::max(floor, dp.cost_ms[2] - (dp.cost_ms[3] - dp.cost_ms[2]));
+      if (!std::isfinite(dp.cost_ms[1])) throw std::invalid_argument("INGINE_DFLASH2_DP_COSTS extrapolation overflow");
+    }
+  }
+  return dp;
+}
+
 SpecLoop::SpecLoop(Runtime& rt, Drafter* drafter, DFlash2* dflash2, DFlash2Head* dflash2_head)
     : rt_(rt), drafter_(drafter), dflash2_(dflash2), dflash2_head_(dflash2_head),
+      dflash2_dp_(dflash2 ? dflash2_dp_policy(rt.options(), dflash2->cumulative_confidence()) : DpWidthPolicy{}),
       host_verify_(rt.tp() || dflash2 || rt.options().draft_type == "hybrid"),
       dflash2_device_(!rt.tp() && !drafter && dflash2 && dflash2->supports_device_loop() &&
                       !rt.options().spec_trace && !rt.options().spec_audit &&
@@ -142,7 +194,7 @@ SpecLoop::SpecLoop(Runtime& rt, Drafter* drafter, DFlash2* dflash2, DFlash2Head*
     verify_ = rt_.capture_switch(
         [&](cudaStream_t s, cudaGraphConditionalHandle h) {
           verify_select_dflash2(conf, drafts, dflash2_threshold(rt_.options()), widths, dflash2_width(rt_.options()),
-                               rt_.tokens(), width, h, s);
+                               rt_.tokens(), width, h, s, dflash2_dp_);
         },
         [&](cudaStream_t s, int m) {
           rt_.record_save_verify(m, s);
@@ -552,8 +604,8 @@ void SpecLoop::generate_host_verified(std::int32_t token, int max_new_tokens, co
         if (probed_m8) width = kd::BLOCK;
       }
       const float threshold = dflash2_threshold(rt_.options());
-      verify_proposal(dflash2_->confidence(), draft_.tokens, threshold, widths,
-                      stop ? -1 : width, proposal, stream);
+      verify_proposal(dflash2_->confidence(), draft_.tokens, threshold, widths, stop ? -1 : width, proposal, stream,
+                      (!sampled && !exact_reject) ? dflash2_dp_ : DpWidthPolicy{});
     }
     if (tp) tp->broadcast_proposal(proposal, sizeof(VerifyProposal), stream);
     CUDA_CHECK(cudaMemcpyAsync(proposal_host_.data(), proposal, sizeof(VerifyProposal), cudaMemcpyDeviceToHost,

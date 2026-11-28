@@ -8,6 +8,7 @@ add_test(NAME model_runtime_batch COMMAND model_runtime --batch)
 set_tests_properties(model_runtime_batch PROPERTIES LABELS gpu RESOURCE_LOCK gpu SKIP_RETURN_CODE 77 TIMEOUT 120)
 ingine_add_test(NAME model_dflash2_selector SOURCES test_dflash2_selector.cpp LIBS ingine_model
                 GPU TIMEOUT 300)
+add_test(NAME model_dflash2_env COMMAND model_dflash2_selector --env)
 ingine_add_test(NAME model_dflash2_fused SOURCES test_dflash2_fused.cpp LIBS ingine_model
                 GPU MODEL TIMEOUT 900)
 # prompt checkpoints with speculative decoding on the full model (~22 GB of GPU memory)

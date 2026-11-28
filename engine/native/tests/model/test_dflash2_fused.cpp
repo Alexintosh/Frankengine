@@ -1,4 +1,5 @@
 #include "common/test_util.h"
+#include "common/scoped_env.h"
 #include "core/arena.h"
 #include "ingine/generator.h"
 #include "kernels/batch/dense.h"
@@ -13,7 +14,9 @@
 #include <bit>
 #include <numeric>
 #include <filesystem>
+#include <initializer_list>
 #include <memory>
+#include <string>
 #include <string_view>
 
 namespace {
@@ -263,15 +266,86 @@ std::vector<Outcome> collect(const std::filesystem::path& checkpoint, const Inpu
   }
   return outcomes;
 }
+void selector_temperature_parity(const std::filesystem::path& checkpoint, const Inputs& in, cudaStream_t stream) {
+  const ScopedEnv precision("INKLING_DFLASH2_PRECISION", "fp8");
+  const ScopedEnv sampled("INGINE_DFLASH2_SAMPLED", "1");
+  struct Proposal {
+    std::vector<int> tokens, ids, picked;
+    std::vector<float> probs, confidence;
+    bool operator==(const Proposal&) const = default;
+  };
+  auto load = [&] {
+    auto draft = std::make_unique<DFlash2>(checkpoint, stream, false, nullptr, 1, 0);
+    draft->bind_head(in.head, static_cast<const Bf*>(in.embed.p), static_cast<const float*>(in.norms.p));
+    draft->commit(static_cast<const Bf*>(in.taps.p), 3, 0);
+    return draft;
+  };
+  auto propose = [&](DFlash2& draft, float temperature) {
+    Proposal out;
+    out.tokens = copy_device<int>(draft.propose(1, temperature, 97), G, stream);
+    out.confidence = copy_device<float>(draft.confidence(), G, stream);
+    if (temperature == 0.f) return out;  // Greedy proposals do not publish sampled support.
+    out.ids = copy_device<int>(draft.support_ids(), G * S, stream);
+    out.picked = copy_device<int>(draft.support_picked(), G, stream);
+    out.probs = copy_device<float>(draft.support_probs(), G * S, stream);
+    for (int row = 0; row < G; ++row) {
+      float mass = 0.f;
+      for (int j = 0; j < S; ++j) {
+        const float q = out.probs[row * S + j];
+        INGINE_CHECK(q >= 0.f && q <= 1.f);
+        mass += q;
+      }
+      const int pick = out.picked[row];
+      INGINE_CHECK(pick >= 0 && pick < S && out.ids[row * S + pick] == out.tokens[row]);
+      INGINE_CHECK(out.probs[row * S + pick] > 0.f && std::abs(mass - 1.f) < 2e-6f);
+    }
+    return out;
+  };
+  std::array<Proposal, 2> expected;
+  Proposal greedy, with_edges;
+  {
+    const ScopedEnv unscaled("INGINE_DFLASH2_SELECTOR_TEMP", "1");
+    auto draft = load();
+    expected[0] = propose(*draft, 0.8f * 0.7f);
+    expected[1] = propose(*draft, 0.8f * 1.3f);
+    greedy = propose(*draft, 0.f);
+    with_edges = propose(*draft, 0.8f);
+  }
+  INGINE_CHECK(expected[0].probs != expected[1].probs);
+  for (int i = 0; i < 2; ++i) {
+    const ScopedEnv scaled("INGINE_DFLASH2_SELECTOR_TEMP", i ? "1.3" : "0.7");
+    auto draft = load();
+    INGINE_CHECK(draft->supports_device_loop());
+    INGINE_CHECK(propose(*draft, 0.8f) == expected[i]);  // Eager warmup.
+    INGINE_CHECK(propose(*draft, 0.8f) == expected[i]);  // Captured graph.
+    INGINE_CHECK(propose(*draft, 0.f) == greedy);
+  }
+
+  // Each row of the fixture's head has 16 equal top logits. Disabling the edge
+  // correction at construction must give uniform q, even after the env changes.
+  const ScopedEnv no_edges("INGINE_DFLASH2_EDGE_SCALE", "0");
+  auto draft = load();
+  const ScopedEnv restore_edges("INGINE_DFLASH2_EDGE_SCALE", "1");
+  const auto unary = propose(*draft, 0.8f);
+  for (float q : unary.probs) INGINE_CHECK(q == 1.f / S);
+  INGINE_CHECK(unary.probs != with_edges.probs);
+}
+
 struct Generation {
   std::vector<int> tokens, batches;
   int rounds = 0, accepted = 0, reused = 0;
   bool operator==(const Generation&) const = default;
 };
 
-std::vector<Generation> generate(const std::filesystem::path& target, const std::filesystem::path& draft,
-                                 bool device, bool audit = false) {
-  INGINE_CHECK(setenv("INGINE_DFLASH2_DEVICE_LOOP", device ? "1" : "0", 1) == 0);
+struct GenerationRuns {
+  Generation full, early, continuation;
+  bool operator==(const GenerationRuns&) const = default;
+};
+
+std::vector<GenerationRuns> generate(const std::filesystem::path& target, const std::filesystem::path& draft,
+                                 bool device, bool audit = false, bool adaptive = false,
+                                 std::initializer_list<float> temperatures = {0.f, 0.83f}) {
+  const ScopedEnv loop("INGINE_DFLASH2_DEVICE_LOOP", device ? "1" : "0");
   RuntimeOptions options;
   options.model_dir = target;
   options.dflash2_dir = draft;
@@ -279,6 +353,7 @@ std::vector<Generation> generate(const std::filesystem::path& target, const std:
   options.spec = options.head_nvfp4 = options.kv_fp8 = true;
   options.spec_widths = SpecWidths::Fine;
   options.spec_audit = audit;
+  options.dflash2_adaptive = adaptive;
   options.max_ctx = 512;
   options.prefill_chunk = 128;
   options.park_mb = 0;
@@ -318,14 +393,15 @@ std::vector<Generation> generate(const std::filesystem::path& target, const std:
     result.reused = stats.reused_tokens;
     return result;
   };
-  std::vector<Generation> results;
-  for (float temperature : {0.f, 0.83f}) {
+  std::vector<GenerationRuns> results;
+  for (float temperature : temperatures) {
     Sampling sampling;
     sampling.temperature = temperature;
     sampling.seed = 97;
     // Repeated in-vocabulary IDs give the model a predictable continuation.
     std::vector<int> prompt(116, 198);
-    prompt.front() = temperature > 0.f ? 17 : 23;
+    // Distinct prompts keep each temperature's first prefill independent.
+    prompt.front() = temperature == 0.8f ? 19 : temperature > 0.f ? 17 : 23;
 
     auto full = run(prompt, 32, sampling);
     INGINE_CHECK(full.rounds > 1);
@@ -346,9 +422,7 @@ std::vector<Generation> generate(const std::filesystem::path& target, const std:
     follow.push_back(209);
     auto continuation = run(follow, 12, sampling);
     INGINE_CHECK(continuation.reused == int(prompt.size() + early.tokens.size()) - 1);
-    results.push_back(std::move(full));
-    results.push_back(std::move(early));
-    results.push_back(std::move(continuation));
+    results.push_back({std::move(full), std::move(early), std::move(continuation)});
   }
   return results;
 }
@@ -360,18 +434,37 @@ void device_loop_parity(const std::filesystem::path& checkpoint) {
     std::printf("skip: target checkpoint missing at %s\n", target.c_str());
     return;
   }
-  INGINE_CHECK(setenv("INKLING_DFLASH2_PRECISION", "fp8", 1) == 0);
-  INGINE_CHECK(setenv("INGINE_DFLASH2_FUSED_HEAD", "0", 1) == 0);
-  INGINE_CHECK(setenv("INGINE_DFLASH2_GEMV_TOPK", "1", 1) == 0);
-  INGINE_CHECK(setenv("INGINE_DFLASH2_EXACT_REJECT", "1", 1) == 0);
-  INGINE_CHECK(setenv("INGINE_DFLASH2_ADAPTIVE_EMA", "1", 1) == 0);
-  INGINE_CHECK(setenv("INGINE_DFLASH2_SAMPLED", "1", 1) == 0);
-  INGINE_CHECK(setenv("INGINE_DFLASH2_SHORTLIST", "8192", 1) == 0);
+  const ScopedEnv precision("INKLING_DFLASH2_PRECISION", "fp8");
+  const ScopedEnv fused_head("INGINE_DFLASH2_FUSED_HEAD", "0");
+  const ScopedEnv gemv_topk("INGINE_DFLASH2_GEMV_TOPK", "1");
+  const ScopedEnv exact_reject("INGINE_DFLASH2_EXACT_REJECT", "1");
+  const ScopedEnv adaptive_ema("INGINE_DFLASH2_ADAPTIVE_EMA", "1");
+  const ScopedEnv sampled("INGINE_DFLASH2_SAMPLED", "1");
+  const ScopedEnv shortlist("INGINE_DFLASH2_SHORTLIST", "8192");
   const auto host = generate(target, checkpoint, false);
   const auto device = generate(target, checkpoint, true);
   INGINE_CHECK(host == device);
   const auto audited = generate(target, checkpoint, true, true);
   INGINE_CHECK(audited == device);
+  auto check_scaled = [&](const char* multiplier, std::initializer_list<float> temperatures) {
+    const ScopedEnv scale("INGINE_DFLASH2_SELECTOR_TEMP", multiplier);
+    auto run = [&](const char* width_flag, bool device_loop) {
+      const ScopedEnv dp("INGINE_DFLASH2_DP_WIDTH", width_flag);
+      return generate(target, checkpoint, device_loop, false, true, temperatures);
+    };
+    const auto disabled = run("0", false);
+    INGINE_CHECK(run("0", true) == disabled);
+    const auto enabled = run("1", false);
+    INGINE_CHECK(run("1", true) == enabled);
+    std::size_t i = 0;
+    for (float temperature : temperatures) {
+      if (temperature > 0.f) INGINE_CHECK(enabled[i] == disabled[i]);
+      else INGINE_CHECK(enabled[i].full.tokens == host.front().full.tokens);
+      ++i;
+    }
+  };
+  check_scaled("0.7", {0.f, 0.8f});
+  check_scaled("1.3", {0.8f, 0.83f});
   std::puts("PASS solo DFlash2 device loop greedy and sampled generation, early stop and live prefix");
 }
 }  // namespace
@@ -466,6 +559,9 @@ void fast_kernels_crossing_parity(const std::filesystem::path& checkpoint, const
 }
 
 int main() {
+  const ScopedEnv selector_temp("INGINE_DFLASH2_SELECTOR_TEMP"), edge_scale("INGINE_DFLASH2_EDGE_SCALE");
+  const ScopedEnv dp_width("INGINE_DFLASH2_DP_WIDTH"), dp_rate("INGINE_DFLASH2_DP_RATE");
+  const ScopedEnv dp_gamma("INGINE_DFLASH2_DP_GAMMA"), dp_costs("INGINE_DFLASH2_DP_COSTS");
   if (skip_without_gpu()) return kSkip;
   const char* dir = std::getenv("INKLING_DFLASH2_DIR");
   const auto checkpoint = dir && *dir ? std::filesystem::path(dir) :
@@ -484,6 +580,7 @@ int main() {
     const Inputs inputs(stream);
     sharded_head_offset(inputs, stream);
     fast_kernels_crossing_parity(checkpoint, inputs, stream);
+    selector_temperature_parity(checkpoint, inputs, stream);
     for (const char* precision : {"fp8", "hybrid", "nvfp4", "bf16"}) {
       const bool nvfp4 = std::string_view(precision) == "nvfp4";
       if (nvfp4) unsetenv("INKLING_DFLASH2_PRECISION");

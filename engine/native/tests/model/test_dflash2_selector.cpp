@@ -1,17 +1,23 @@
 #include "common/test_util.h"
+#include "common/scoped_env.h"
 #include "core/arena.h"
 #include "core/decode_graph.h"
 #include "kernels/draft/dflash2_selector.h"
 #include "kernels/draft/draft.h"
 #include "kernels/head/head.h"
 #include "model/batch_dflash2.h"
+#include "model/dflash2_env.h"
+#include "model/spec.h"
 
 #include <algorithm>
 #include <array>
 #include <bit>
 #include <cstring>
+#include <limits>
 #include <numeric>
+#include <tuple>
 #include <span>
+#include <string_view>
 
 // Internal BatchDFlash2 selector entry points. Synthetic rows let this test
 // inject missing candidates without loading the draft or target checkpoints.
@@ -146,6 +152,297 @@ void selector_parity() {
       INGINE_CHECK(confidence[edge] == product);
     }
   }
+}
+
+void selector_edge_scale_parity() {
+  constexpr int R = 256;
+  std::array<int, G * K> candidates;
+  std::array<float, G * K> logits;
+  std::array<Bf, G * R> projected{};
+  std::array<Bf, K * R> predecessors{}, successors{};
+  for (int edge = 0; edge < G; ++edge) {
+    projected[edge * R] = float_to_bf16(1.f);
+    for (int j = 0; j < K; ++j) {
+      candidates[edge * K + j] = j;
+      logits[edge * K + j] = float((edge + j) % 5 - 2);
+    }
+  }
+  for (int j = 0; j < K; ++j) {
+    predecessors[j * R] = float_to_bf16(float(1 + j % 3));
+    successors[j * R] = float_to_bf16(0.5f * (j - 8));
+  }
+  DeviceArray<int> ids(G * K), anchor(1), tokens(G), support_ids(G * K), picked(G);
+  DeviceArray<float> unary(G * K), lattice(G * K * K), confidence(G), probs(G * K), temp(1);
+  DeviceArray<Bf> proj(G * R), pred(K * R), succ(K * R);
+  DeviceArray<std::uint64_t> seed(1);
+  ids.upload(candidates);
+  unary.upload(logits);
+  proj.upload(projected);
+  pred.upload(predecessors);
+  succ.upload(successors);
+  anchor.upload(std::array{0});
+  seed.upload(std::array<std::uint64_t, 1>{97});
+  const kd::DFlash2Support support{support_ids.data, probs.data, picked.data};
+
+  for (float temperature : {0.f, 0.8f}) {
+    temp.upload(std::span(&temperature, 1));
+    auto run = [&](bool fused, auto... scale) {
+      for (auto* buffer : {&tokens.storage, &confidence.storage, &support_ids.storage, &probs.storage, &picked.storage})
+        buffer->fill(0x5a);
+      if (fused)
+        kd::dflash2_fused_selector(ids.data, unary.data, proj.data, pred.data, succ.data, anchor.data,
+                                   tokens.data, confidence.data, false, temp.data, seed.data, support, nullptr, scale...);
+      else
+        kd::dflash2_lattice_selector(ids.data, unary.data, proj.data, pred.data, succ.data, anchor.data,
+                                     lattice.data, tokens.data, confidence.data, false,
+                                     temp.data, seed.data, support, nullptr, scale...);
+      INGINE_TEST_CUDA(cudaStreamSynchronize(nullptr));
+      // Compare the floating-point outputs as bit patterns (including unused greedy support).
+      auto bits = [](const DeviceArray<float>& values) {
+        auto floats = values.download();
+        std::vector<std::uint32_t> result(floats.size());
+        std::memcpy(result.data(), floats.data(), floats.size() * sizeof(float));
+        return result;
+      };
+      return std::tuple{tokens.download(), bits(confidence), support_ids.download(), bits(probs), picked.download()};
+    };
+    const auto defaults = run(false);
+    const auto default_scores = lattice.download();
+    INGINE_CHECK(run(true) == defaults);
+    for (float scale : {0.f, 0.5f, 1.f, 1.5f}) {
+      const auto materialized = run(false, scale);
+      const auto scores = lattice.download();
+      INGINE_CHECK(run(true, scale) == materialized);
+      if (scale == 1.f) {
+        INGINE_CHECK(materialized == defaults);
+        INGINE_CHECK(std::memcmp(scores.data(), default_scores.data(), lattice.storage.bytes) == 0);
+      }
+      for (int edge = 0; edge < G; ++edge)
+        for (int prev = 0; prev < K; ++prev)
+          for (int j = 0; j < K; ++j) {
+            const float corr = (edge ? 1 + prev % 3 : 1) * (0.5f * (j - 8));
+            const float expected = 30.f * std::tanh((logits[edge * K + j] + scale * corr) / 30.f);
+            INGINE_CHECK(std::abs(scores[(edge * K + prev) * K + j] - expected) < 4e-6f);
+          }
+    }
+  }
+}
+
+void dflash2_env_policy() {
+  using namespace ingine::model;
+  auto rejects = [](const char* name, auto read) {
+    try {
+      read();
+    } catch (const std::invalid_argument& error) {
+      INGINE_CHECK(std::string_view(error.what()).find(name) != std::string_view::npos);
+      return;
+    }
+    INGINE_CHECK(false);
+  };
+
+  constexpr char scalar[] = "INGINE_DFLASH2_DP_RATE";
+  const ScopedEnv rate(scalar);
+  INGINE_CHECK(dflash2_env::read_float(scalar, 2.f) == 2.f);
+  for (bool allow_zero : {false, true}) {
+    for (const char* invalid : {"", " 1", "1 ", "1x", "+1", "-1", "-0", "-0.0", "nan", "inf", "-inf", "1e100", "1e-100"}) {
+      const ScopedEnv set(scalar, invalid);
+      rejects(scalar, [&] { dflash2_env::parse_float(scalar, invalid, allow_zero); });
+      rejects(scalar, [&] { dflash2_env::read_float(scalar, 2.f, allow_zero); });
+    }
+    const ScopedEnv positive(scalar, "1.25e-1");
+    INGINE_CHECK(dflash2_env::parse_float(scalar, "1.25e-1", allow_zero) == 0.125f);
+    INGINE_CHECK(dflash2_env::read_float(scalar, 2.f, allow_zero) == 0.125f);
+  }
+  {
+    const ScopedEnv zero(scalar, "0");
+    rejects(scalar, [&] { dflash2_env::parse_float(scalar, "0"); });
+    rejects(scalar, [&] { dflash2_env::read_float(scalar, 2.f); });
+    INGINE_CHECK(dflash2_env::parse_float(scalar, "0", true) == 0.f);
+    INGINE_CHECK(dflash2_env::read_float(scalar, 2.f, true) == 0.f);
+  }
+
+  constexpr char width[] = "INGINE_DFLASH2_DP_WIDTH", costs[] = "INGINE_DFLASH2_DP_COSTS";
+  constexpr char gamma[] = "INGINE_DFLASH2_DP_GAMMA";
+  const ScopedEnv clear_width(width), clear_costs(costs), clear_gamma(gamma);
+  RuntimeOptions options;
+  options.spec_threshold = 0.8f;
+  auto policy = [&] { return dflash2_dp_policy(options, true); };
+  INGINE_CHECK(policy().enabled);
+  for (const char* invalid : {"", "yes", "2", "01", "+1", "1 "}) {
+    const ScopedEnv set(width, invalid);
+    rejects(width, policy);
+  }
+  {
+    const ScopedEnv off(width, "0");
+    INGINE_CHECK(!policy().enabled);
+  }
+  const ScopedEnv on(width, "1");
+  const auto defaults = policy();
+  INGINE_CHECK(defaults.enabled && defaults.cumulative && defaults.gamma == 1.0f);
+  INGINE_CHECK(!dflash2_dp_policy(options, false).cumulative);
+  options.spec_threshold = 0.f;
+  INGINE_CHECK(!policy().enabled);
+  options.spec_threshold = 0.8f;
+  options.draft_type = "hybrid";
+  options.hybrid_dflash2_threshold = 0.f;
+  INGINE_CHECK(!policy().enabled);
+  options.hybrid_dflash2_threshold = 0.8f;
+
+  for (const char* name : {scalar, gamma}) {
+    for (const char* invalid : {"", "0", "-1", "1x", "nan", "inf"}) {
+      const ScopedEnv set(name, invalid);
+      rejects(name, policy);
+    }
+  }
+  const ScopedEnv custom_rate(scalar, "0.25"), custom_gamma(gamma, "1.75");
+  {
+    const ScopedEnv seven(costs, "3,5,6,7,8,9,10");
+    const auto dp = policy();
+    constexpr std::array<float, 8> expected{1, 3, 5, 6, 7, 8, 9, 10};
+    INGINE_CHECK(std::equal(expected.begin(), expected.end(), dp.cost_ms + 1));
+    INGINE_CHECK(dp.enabled && dp.rate == 0.25f && dp.gamma == 1.75f);
+  }
+  {
+    const ScopedEnv normalized(costs, "1e-5,1,2,3,4,5,6");
+    const auto dp = policy();
+    INGINE_CHECK(dp.cost_ms[1] == dp.cost_ms[2] && dp.cost_ms[2] == 1e-5f);
+  }
+  {
+    const ScopedEnv eight(costs, "1,2,3,4,5,6,7,8");
+    const auto dp = policy();
+    for (int m = 1; m <= 8; ++m) INGINE_CHECK(dp.cost_ms[m] == float(m));
+  }
+  for (const char* invalid : {"", "1,2,3,4,5,6", "1,2,3,4,5,6,7,8,9", "1,2,3,4,5,6,7,",
+                              "1,2,,4,5,6,7", "1,2,0,4,5,6,7", "3e38,1,2,3,4,5,6"}) {
+    const ScopedEnv set(costs, invalid);
+    rejects(costs, policy);
+  }
+}
+
+void dp_width_policy_reference() {
+  using namespace ingine::model;
+  constexpr float threshold = 0.7f;
+  const float nan = std::numeric_limits<float>::quiet_NaN();
+  const std::array<float, G> cases[] = {
+      {1, 1, 1, 1, 1, 1, 1}, {0, 0, 0, 0, 0, 0, 0}, {1.5f, 0.85f, 0.72f, 0.65f, 0.52f, 0.44f, 0.38f},
+      {1, nan, 2, -1, 1, 1, 1}, {-1, 1, 1, 1, 1, 1, 1}, {0.7f, 0.8f, 0.6f, 0.3f, 0.2f, 0.1f, nan}};
+  const std::array<int, G> drafts{3, 1, 4, 1, 5, 9, 2};
+  DeviceArray<int> ids(G), width(1), branch(1);
+  DeviceArray<std::int64_t> tokens(G + 1);
+  DeviceArray<float> conf(G);
+  DeviceArray<VerifyProposal> proposal(1);
+  ids.upload(drafts);
+  cudaStream_t stream;
+  INGINE_TEST_CUDA(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+
+  auto check = [&](Widths widths, DpWidthPolicy dp, int fixed) {
+    cudaGraph_t graph;
+    cudaGraphConditionalHandle handle;
+    INGINE_TEST_CUDA(cudaGraphCreate(&graph, 0));
+    INGINE_TEST_CUDA(cudaGraphConditionalHandleCreate(&handle, graph, 0, 0));
+    INGINE_TEST_CUDA(cudaStreamBeginCaptureToGraph(stream, graph, nullptr, nullptr, 0, cudaStreamCaptureModeThreadLocal));
+    verify_select_dflash2(conf.data, ids.data, threshold, widths, fixed, tokens.data, width.data, handle, stream, dp);
+    cudaGraph_t captured;
+    INGINE_TEST_CUDA(cudaStreamEndCapture(stream, &captured));
+    cudaGraphNode_t head;
+    std::size_t count = 1;
+    INGINE_TEST_CUDA(cudaGraphGetRootNodes(graph, &head, &count));
+    INGINE_CHECK(captured == graph && count == 1);
+    cudaGraphNodeParams sw{};
+    sw.type = cudaGraphNodeTypeConditional;
+    sw.conditional.handle = handle;
+    sw.conditional.type = cudaGraphCondTypeSwitch;
+    sw.conditional.size = std::max(1, widths.n);
+    cudaGraphNode_t node;
+    INGINE_TEST_CUDA(cudaGraphAddNode(&node, graph, &head, nullptr, 1, &sw));
+    for (int i = 0; i < widths.n; ++i) {
+      cudaMemsetParams marker{};
+      marker.dst = branch.data;
+      marker.value = i + 1;
+      marker.elementSize = sizeof(int);
+      marker.width = marker.height = 1;
+      INGINE_TEST_CUDA(cudaGraphAddMemsetNode(&node, sw.conditional.phGraph_out[i], nullptr, 0, &marker));
+    }
+    cudaGraphExec_t exec;
+    INGINE_TEST_CUDA(cudaGraphInstantiate(&exec, graph, 0));
+    for (const auto& values : cases) {
+      int expected = widths.w[0];
+      if (fixed) {
+        expected = fixed;
+      } else if (!dp.enabled) {
+        int lead = 0;
+        while (lead < G && values[lead] > threshold) ++lead;
+        expected = *std::lower_bound(widths.w, widths.w + widths.n, lead + 1);
+      } else {
+        std::array<double, 9> emitted{};
+        emitted[1] = 1.0;
+        double product = 1.0;
+        for (int k = 0; k < G; ++k) {
+          const double c = std::fmin(1.0, std::fmax(0.0, double(values[k])));
+          product *= c;
+          emitted[k + 2] = emitted[k + 1] + std::pow(dp.cumulative ? c : product, dp.gamma);
+        }
+        double best = -std::numeric_limits<double>::infinity();
+        for (int i = 0; i < widths.n; ++i) {
+          const int m = widths.w[i];
+          if (m < 1 || m > 8) continue;
+          const double score = emitted[m] - double(dp.rate) * dp.cost_ms[m];
+          if (score > best || (score == best && m < expected)) {
+            best = score;
+            expected = m;
+          }
+        }
+      }
+      conf.upload(values);
+      INGINE_TEST_CUDA(cudaMemsetAsync(branch.data, 0, sizeof(int), stream));
+      verify_proposal(conf.data, ids.data, threshold, widths, fixed, proposal.data, stream, dp);
+      INGINE_TEST_CUDA(cudaGraphLaunch(exec, stream));
+      INGINE_TEST_CUDA(cudaStreamSynchronize(stream));
+      const auto packet = proposal.download().front();
+      INGINE_CHECK(packet.width == expected && width.download().front() == expected);
+      INGINE_CHECK(std::equal(drafts.begin(), drafts.end(), packet.drafts));
+      const auto graph_tokens = tokens.download();
+      INGINE_CHECK(std::equal(drafts.begin(), drafts.end(), graph_tokens.begin() + 1));
+      if (widths.n) {
+        const auto index = std::find(widths.w, widths.w + widths.n, expected) - widths.w;
+        INGINE_CHECK(branch.download().front() == index + 1);
+      }
+    }
+    INGINE_TEST_CUDA(cudaGraphExecDestroy(exec));
+    INGINE_TEST_CUDA(cudaGraphDestroy(graph));
+  };
+
+  DpWidthPolicy dp;
+  dp.enabled = true;
+  for (int m = 1; m <= 8; ++m) dp.cost_ms[m] = float(m);
+  for (Widths widths : {Widths{3, {2, 4, 8}}, Widths{8, {1, 2, 3, 4, 5, 6, 7, 8}}, Widths{7, {2, 3, 4, 5, 6, 7, 8}}}) {
+    for (bool cumulative : {false, true}) {
+      dp.cumulative = cumulative;
+      for (float gamma : {1.f, 1.4f}) {
+        dp.gamma = gamma;
+        dp.rate = 0.375f;
+        check(widths, dp, 0);
+      }
+    }
+    dp.rate = 1.f;  // With confidence one, every width scores exactly zero.
+    check(widths, dp, 0);
+    check(widths, dp, 4);
+    check(widths, {}, 0);
+  }
+  check({5, {8, -1, 4, 9, 2}}, dp, 0);  // Ties and invalid entries in an unsorted grid.
+  dp.rate = 0.375f;
+  check({8, {8, 4, 1, 6, 2, 7, 5, 3}}, dp, 0);
+  check({4, {-1, 2, 8, 9}}, dp, 0);
+  check({2, {-1, 9}}, dp, 0);
+  check({}, dp, 0);
+  verify_proposal(nullptr, ids.data, threshold, {9, {2}}, 0, proposal.data, stream, dp);
+  INGINE_TEST_CUDA(cudaStreamSynchronize(stream));
+  INGINE_CHECK(proposal.download().front().width == 2);
+  // Cancellation must also work before any drafts or confidence are available.
+  verify_proposal(nullptr, nullptr, threshold, {}, -1, proposal.data, stream, dp);
+  INGINE_TEST_CUDA(cudaStreamSynchronize(stream));
+  INGINE_CHECK(proposal.download().front().width == 0);
+  INGINE_TEST_CUDA(cudaStreamDestroy(stream));
 }
 
 void batch_selector_parity() {
@@ -499,9 +796,16 @@ void statistical_acceptance() {
 }
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+  if (argc == 2 && std::string_view(argv[1]) == "--env") {
+    dflash2_env_policy();
+    std::puts("PASS model_dflash2_env");
+    return 0;
+  }
   if (skip_without_gpu()) return kSkip;
   selector_parity();
+  selector_edge_scale_parity();
+  dp_width_policy_reference();
   batch_selector_parity();
   acceptance_edges();
   audit_gather();

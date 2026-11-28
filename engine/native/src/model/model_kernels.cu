@@ -2,6 +2,7 @@
 
 #include "core/device.h"
 
+#include <math_constants.h>
 #include <stdexcept>
 
 namespace ingine::model {
@@ -214,22 +215,61 @@ __device__ int choose_width(const float* conf, float threshold, const Widths& wi
   return widths.w[widths.n - 1];
 }
 
-__global__ void verify_proposal_kernel(const float* conf, const int* drafts, float threshold, Widths widths,
-                                       int fixed_width, VerifyProposal* proposal) {
+__device__ int choose_width_dp(const float* conf, const Widths& widths, const DpWidthPolicy& dp) {
+  if (widths.n < 1 || widths.n > kMaxRows) return widths.w[0];
+  float expected[kMaxRows + 1];
+  expected[1] = 1.f;
+  float survival = 1.f;
+#pragma unroll
+  for (int m = 2; m <= kMaxRows; ++m) {
+    const float v = conf[m - 2];
+    const float c = v > 0.f ? fminf(v, 1.f) : 0.f;
+    survival = dp.cumulative ? c : survival * c;
+    expected[m] = expected[m - 1] + (dp.gamma == 1.f ? survival : powf(survival, dp.gamma));
+  }
+
+  // Score the configured widths in ascending order. Constant array indices keep
+  // expectations in registers and strict improvement breaks ties toward smaller widths.
+  unsigned configured = 0;
+  for (int i = 0; i < widths.n; ++i) {
+    const int m = widths.w[i];
+    if (m >= 1 && m <= kMaxRows) configured |= 1u << m;
+  }
+  int best = 0;
+  float best_score = -CUDART_INF_F;
+#pragma unroll
+  for (int m = 1; m <= kMaxRows; ++m) {
+    if (!(configured & (1u << m))) continue;
+    const float score = expected[m] - dp.rate * dp.cost_ms[m];
+    if (!best || score > best_score) {
+      best = m;
+      best_score = score;
+    }
+  }
+  return best ? best : widths.w[0];
+}
+
+__global__ void verify_proposal_kernel(const float* conf, const int* drafts, float threshold,
+                                       const __grid_constant__ Widths widths, int fixed_width, VerifyProposal* proposal,
+                                       const __grid_constant__ DpWidthPolicy dp) {
   const int i = threadIdx.x;
   if (i < 7 && fixed_width >= 0) proposal->drafts[i] = drafts[i];
-  if (i == 7)
-    proposal->width = fixed_width < 0 ? 0 : (fixed_width ? fixed_width : choose_width(conf, threshold, widths));
+  if (i == 7) {
+    int m = fixed_width;
+    if (m == 0) m = dp.enabled ? choose_width_dp(conf, widths, dp) : choose_width(conf, threshold, widths);
+    proposal->width = fixed_width < 0 ? 0 : m;
+  }
 }
 
 __global__ void verify_select_kernel(const float* __restrict__ conf, const int* __restrict__ drafts, float threshold,
-                                     Widths widths, int fixed_width, long long* __restrict__ token,
-                                     int* __restrict__ m_out,
-                                     cudaGraphConditionalHandle handle) {
+                                     const __grid_constant__ Widths widths, int fixed_width, long long* __restrict__ token,
+                                     int* __restrict__ m_out, cudaGraphConditionalHandle handle,
+                                     const __grid_constant__ DpWidthPolicy dp) {
   const int i = threadIdx.x;
   if (i < 7) token[1 + i] = drafts[i];
   if (i == 0) {
-    const int m = fixed_width ? fixed_width : choose_width(conf, threshold, widths);
+    int m = fixed_width;
+    if (m == 0) m = dp.enabled ? choose_width_dp(conf, widths, dp) : choose_width(conf, threshold, widths);
     *m_out = m;
     cudaGraphSetConditional(handle, width_index(widths, m));
   }
@@ -352,15 +392,15 @@ void verify_select(const float* conf, const std::int32_t* drafts, float threshol
 
 void verify_select_dflash2(const float* conf, const std::int32_t* drafts, float threshold, const Widths& widths,
                            int fixed_width, std::int64_t* tokens, std::int32_t* width,
-                           cudaGraphConditionalHandle handle, cudaStream_t stream) {
+                           cudaGraphConditionalHandle handle, cudaStream_t stream, DpWidthPolicy dp) {
   verify_select_kernel<<<1, 32, 0, stream>>>(conf, drafts, threshold, widths, fixed_width,
-                                             reinterpret_cast<long long*>(tokens), width, handle);
+                                             reinterpret_cast<long long*>(tokens), width, handle, dp);
   CUDA_CHECK(cudaGetLastError());
 }
 
 void verify_proposal(const float* conf, const std::int32_t* drafts, float threshold, const Widths& widths,
-                     int fixed_width, VerifyProposal* proposal, cudaStream_t stream) {
-  verify_proposal_kernel<<<1, 32, 0, stream>>>(conf, drafts, threshold, widths, fixed_width, proposal);
+                     int fixed_width, VerifyProposal* proposal, cudaStream_t stream, DpWidthPolicy dp) {
+  verify_proposal_kernel<<<1, 32, 0, stream>>>(conf, drafts, threshold, widths, fixed_width, proposal, dp);
   CUDA_CHECK(cudaGetLastError());
 }
 

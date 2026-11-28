@@ -34,7 +34,7 @@ void dflash2_fused_selector(const std::int32_t* ids, const float* unary,
                            const __nv_bfloat16* successors, const std::int32_t* anchor,
                            std::int32_t* tokens, float* confidence, bool cumulative,
                            const float* temperature, const std::uint64_t* seed,
-                           DFlash2Support support, cudaStream_t stream);
+                           DFlash2Support support, cudaStream_t stream, float edge_scale = 1.0f);
 
 // Same walk with a materialized edge lattice for the legacy and oracle paths.
 void dflash2_lattice_selector(const std::int32_t* ids, const float* unary,
@@ -42,7 +42,7 @@ void dflash2_lattice_selector(const std::int32_t* ids, const float* unary,
                              const __nv_bfloat16* successors, const std::int32_t* anchor,
                              float* lattice, std::int32_t* tokens, float* confidence, bool cumulative,
                              const float* temperature, const std::uint64_t* seed,
-                             DFlash2Support support, cudaStream_t stream);
+                             DFlash2Support support, cudaStream_t stream, float edge_scale = 1.0f);
 
 // A single mapped host record, published before the existing round-completion event.
 struct DFlash2Audit {

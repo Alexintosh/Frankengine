@@ -1,4 +1,5 @@
 #include "model/dflash2.h"
+#include "model/dflash2_env.h"
 #include "model/tp_runtime.h"
 
 #include "core/arena.h"
@@ -21,6 +22,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <initializer_list>
+#include <limits>
 #include <stdexcept>
 #include <string_view>
 #include <vector>
@@ -1040,6 +1042,8 @@ struct DFlash2::Impl {
   int64_t* ids = nullptr;
   float* embed_output = nullptr;
   std::filesystem::path dump_dir;
+  const float selector_temp = dflash2_env::read_float("INGINE_DFLASH2_SELECTOR_TEMP", 1.f);
+  const float edge_scale = dflash2_env::read_float("INGINE_DFLASH2_EDGE_SCALE", 1.f, true);
   const bool cumulative = std::getenv("INKLING_DFLASH2_CUMULATIVE_CONFIDENCE") != nullptr;
   const bool fused_selector = enabled_by_default("INGINE_DFLASH2_FUSED_SELECTOR");
   const bool fast_kernels = enabled_by_default("INGINE_DFLASH2_FAST_KERNELS");
@@ -1703,15 +1707,22 @@ struct DFlash2::Impl {
     best16<<<Proposals, Threads, 0, s>>>(pool_values, pool_ids, top_values, top_ids);
   }
 
+  float draft_temperature(float target_temp) const {
+    if (!(target_temp > 0.f)) return 0.f;
+    if (selector_temp == 1.f) return target_temp;
+    return std::clamp(target_temp * selector_temp, std::numeric_limits<float>::min(),
+                      std::numeric_limits<float>::max());
+  }
+
   const int* select(const int* candidates, const float* logits, const int* anchor, bool proposal) {
     linear(normed + H, Proposals, selector, projected);
     const auto* temp = proposal ? temperature : nullptr;
     if (fused_selector && dump_dir.empty()) {
       draft::dflash2_fused_selector(candidates, logits, projected, pred, succ, anchor, tokens,
-                                    confidence, cumulative, temp, seed, support, s);
+                                    confidence, cumulative, temp, seed, support, s, edge_scale);
     } else {
       draft::dflash2_lattice_selector(candidates, logits, projected, pred, succ, anchor, lattice, tokens,
-                                      confidence, cumulative, temp, seed, support, s);
+                                      confidence, cumulative, temp, seed, support, s, edge_scale);
     }
     return tokens;
   }
@@ -1938,8 +1949,9 @@ const int* DFlash2::propose(int anchor, float temperature, std::uint64_t seed, b
     d.profile.begin(DraftProfile::Commit);
     d.profile.end();
   }
+  const float draft_temp = d.draft_temperature(temperature);
   input_ids<<<1, Block, 0, d.s>>>(d.ids, d.anchor_dev, anchor, d.device_position, d.length,
-                                   d.temperature, temperature, d.seed, seed);
+                                 d.temperature, draft_temp, d.seed, seed);
   launch_proposal(d.length);
   const bool in_graph_sharded_head = d.sharded_head && d.tp != nullptr;
   const auto* hidden = d.normed + H;
@@ -2062,8 +2074,9 @@ bool DFlash2::advance(int position, bool propose_next, float temperature, std::u
   // A proposal crossing the short attention cutoff captures both paths.
   // Their device guards select the attention path at the actual position.
   const bool may_be_short = !Impl::attention_splits(earliest) && Impl::attention_splits(latest);
+  const float draft_temp = d.draft_temperature(temperature);
   input_ids<<<1, Block, 0, d.s>>>(d.ids, d.anchor_dev, 0, d.device_position, position,
-                                 d.temperature, temperature, d.seed, seed, d.round.next_greedy, d.round.accepted);
+                                 d.temperature, draft_temp, d.seed, seed, d.round.next_greedy, d.round.accepted);
   launch_proposal(latest, may_be_short);
   return true;
 }
